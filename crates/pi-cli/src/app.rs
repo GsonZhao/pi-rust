@@ -176,7 +176,11 @@ pub async fn run() -> i32 {
     // Update checks are interactive-only and best-effort. They write to
     // stderr so print/JSON modes remain machine-readable, and the checker
     // itself uses a short timeout plus a cache.
-    if !parsed.print && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+    if !parsed.offline
+        && !parsed.print
+        && std::io::stdin().is_terminal()
+        && std::io::stdout().is_terminal()
+    {
         let report = crate::updates::check_startup_with_packages(
             &cwd,
             crate::session::should_load_js_packages(&parsed),

@@ -12,7 +12,7 @@
 //! Divergences from the TS parser (all deliberate v1 scope cuts, documented in
 //! `docs/m6-cli-open-questions.md`):
 //! - `--mode rpc`, `--tui-mode`, `--export`,
-//!   `--fork`, `--offline`, `--approve`/`-na`,
+//!   `--fork`, `--approve`/`-na`,
 //!   `--extension`/`-e`, `--skill`, and `--prompt-template` are recognized but
 //!   not all wired into the full TS package manager. The supported resource
 //!   flags are handled by the Rust loader; remaining compatibility flags are
@@ -60,6 +60,8 @@ pub struct Args {
     /// `--list-models [search]`: list the merged model catalog and exit.
     /// `Some("")` represents the bare flag; `None` means absent.
     pub list_models: Option<String>,
+    /// `--offline`: disable best-effort startup network checks.
+    pub offline: bool,
 
     pub continue_session: bool,
     pub resume: bool,
@@ -356,6 +358,7 @@ pub fn parse_args(args: &[String]) -> Args {
                 }
                 result.list_models = Some(search);
             }
+            "--offline" => result.offline = true,
             // ---- Recognized-but-ignored v1 scope cuts (warn, don't error) ----
             // `flag_key` has already had any `=value` peeled, so these match the
             // bare flag name even when the user wrote `--offline=1`.
@@ -370,7 +373,6 @@ pub fn parse_args(args: &[String]) -> Args {
                 if matches!(
                     other,
                     "--models"
-                        | "--offline"
                         | "--export"
                         | "--tui-mode"
                         | "--approve"
@@ -490,6 +492,7 @@ pub fn print_help() {
   --thinking <level>             off, minimal, low, medium, high, xhigh, max
   --mode <mode>                  Output mode: text (default), json, or rpc
   --list-models [search]         List available models (with optional fuzzy search)
+  --offline                      Disable startup network checks
   --print, -p                    Non-interactive: process prompt(s) and exit
   --continue, -c                 Continue the most recent session
   --resume, -r                   Browse and select a session to resume
@@ -683,6 +686,13 @@ mod tests {
 
         let inline = parse_args(&s(&["--list-models=gpt"]));
         assert_eq!(inline.list_models.as_deref(), Some("gpt"));
+    }
+
+    #[test]
+    fn offline_flag_is_honored_without_warning() {
+        let args = parse_args(&s(&["--offline"]));
+        assert!(args.offline);
+        assert!(args.ignored.is_empty());
     }
 
     #[test]
