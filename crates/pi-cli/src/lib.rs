@@ -49,6 +49,7 @@ pub mod config;
 pub mod dev_extension;
 pub mod docs_tool;
 pub mod extension_api;
+pub mod export;
 pub mod extensions_actions;
 pub mod extras;
 pub mod install;

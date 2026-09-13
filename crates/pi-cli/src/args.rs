@@ -11,7 +11,7 @@
 //!
 //! Divergences from the TS parser (all deliberate v1 scope cuts, documented in
 //! `docs/m6-cli-open-questions.md`):
-//! - `--mode rpc`, `--tui-mode`, `--export`,
+//! - `--mode rpc`, `--tui-mode`,
 //!   `--fork`, `--approve`/`-na`,
 //!   `--extension`/`-e`, `--skill`, and `--prompt-template` are recognized but
 //!   not all wired into the full TS package manager. The supported resource
@@ -62,6 +62,9 @@ pub struct Args {
     pub list_models: Option<String>,
     /// `--offline`: disable best-effort startup network checks.
     pub offline: bool,
+    /// `--export <session-file>`: export a JSONL session to HTML (or copy it
+    /// when the destination ends in `.jsonl`).
+    pub export: Option<PathBuf>,
     /// Explicit project trust override. `--approve` trusts the current
     /// project; `--no-approve` keeps project-local resources disabled.
     pub trust_override: Option<bool>,
@@ -362,6 +365,11 @@ pub fn parse_args(args: &[String]) -> Args {
                 result.list_models = Some(search);
             }
             "--offline" => result.offline = true,
+            "--export" => {
+                if let Some(value) = take_value(&mut result, &flag_key) {
+                    result.export = Some(PathBuf::from(value));
+                }
+            }
             "--approve" | "-a" => result.trust_override = Some(true),
             "--no-approve" | "-na" => result.trust_override = Some(false),
             // ---- Recognized-but-ignored v1 scope cuts (warn, don't error) ----
@@ -378,7 +386,6 @@ pub fn parse_args(args: &[String]) -> Args {
                 if matches!(
                     other,
                     "--models"
-                        | "--export"
                         | "--tui-mode"
                         | "--no-themes"
                 ) =>
@@ -494,6 +501,7 @@ pub fn print_help() {
   --mode <mode>                  Output mode: text (default), json, or rpc
   --list-models [search]         List available models (with optional fuzzy search)
   --offline                      Disable startup network checks
+  --export <file>                Export a JSONL session to HTML and exit
   --approve, -a                  Trust the current project for local resources
   --no-approve, -na              Do not trust the current project
   --print, -p                    Non-interactive: process prompt(s) and exit
@@ -706,6 +714,14 @@ mod tests {
         let denied = parse_args(&s(&["--no-approve"]));
         assert_eq!(denied.trust_override, Some(false));
         assert!(denied.ignored.is_empty());
+    }
+
+    #[test]
+    fn export_flag_captures_input_and_output_position() {
+        let args = parse_args(&s(&["--export", "session.jsonl", "transcript.html"]));
+        assert_eq!(args.export, Some(PathBuf::from("session.jsonl")));
+        assert_eq!(args.messages, vec!["transcript.html".to_string()]);
+        assert!(args.ignored.is_empty());
     }
 
     #[test]

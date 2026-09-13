@@ -142,6 +142,31 @@ pub async fn run() -> i32 {
     // set (an explicit override is its own layout).
     let _ = crate::config::migrate_legacy_layout();
 
+    if let Some(input) = parsed.export.as_deref() {
+        let output = parsed
+            .messages
+            .first()
+            .map(Path::new)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| {
+                let stem = input
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("session");
+                Path::new(&format!("rpi-session-{stem}.html")).to_path_buf()
+            });
+        match crate::export::export_file(input, &output) {
+            Ok(()) => {
+                println!("Exported to: {}", output.display());
+                return 0;
+            }
+            Err(error) => {
+                eprintln!("error: {error}");
+                return EXIT_RUNTIME;
+            }
+        }
+    }
+
     // `--list-models` is intentionally handled before credentials, session
     // restoration, and harness construction. Native Pi exposes this as a
     // catalog inspection command, so it must work for a newly installed user
