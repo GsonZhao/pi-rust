@@ -2482,6 +2482,18 @@ mod tests {
             .unwrap();
         let value = session.invoke_command("confirm", "").unwrap();
         assert_eq!(value["result"]["text"], "false");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let complete = {
+                let actions = actions.lock().unwrap();
+                actions.iter().any(|action| action == "ui.dialog")
+                    && actions.iter().any(|action| action == "ui.dialog.cancel")
+            };
+            if complete {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let actions = actions.lock().unwrap();
         assert!(actions.iter().any(|action| action == "ui.dialog"));
         assert!(actions.iter().any(|action| action == "ui.dialog.cancel"));

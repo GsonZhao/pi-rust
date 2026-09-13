@@ -212,10 +212,8 @@ impl Default for ExtensionRegistry {
 impl ExtensionRegistry {
     /// Build an empty, active registry.
     pub fn new() -> Self {
-        // `EVENT_TAG_COUNT` is 33; construct the array via `[const { Vec::new() };
-        // N]` (stable since 1.63).
         let handlers: [Vec<RegisteredHandler>; EVENT_TAG_COUNT] =
-            [const { Vec::new() }; EVENT_TAG_COUNT];
+            std::array::from_fn(|_| Vec::new());
         Self {
             tools: Vec::new(),
             commands: Vec::new(),

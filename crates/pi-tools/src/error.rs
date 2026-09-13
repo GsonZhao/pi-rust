@@ -202,12 +202,22 @@ pub fn io_to_file_code(err: &std::io::Error) -> FileErrorCode {
         ErrorKind::NotFound => FileErrorCode::NotFound,
         ErrorKind::PermissionDenied => FileErrorCode::PermissionDenied,
         ErrorKind::AlreadyExists => FileErrorCode::Invalid,
-        ErrorKind::IsADirectory => FileErrorCode::IsDirectory,
-        ErrorKind::NotADirectory => FileErrorCode::NotDirectory,
         ErrorKind::TimedOut => FileErrorCode::Aborted,
         ErrorKind::Unsupported => FileErrorCode::NotSupported,
         ErrorKind::Interrupted => FileErrorCode::Aborted,
-        _ => FileErrorCode::Unknown,
+        _ => match err.raw_os_error() {
+            // POSIX EISDIR / ENOTDIR. These ErrorKind variants stabilized
+            // after the workspace MSRV, so retain the classification through
+            // their portable Unix errno values.
+            #[cfg(unix)]
+            Some(21) => FileErrorCode::IsDirectory,
+            #[cfg(unix)]
+            Some(20) => FileErrorCode::NotDirectory,
+            // Windows ERROR_DIRECTORY.
+            #[cfg(windows)]
+            Some(267) => FileErrorCode::NotDirectory,
+            _ => FileErrorCode::Unknown,
+        },
     }
 }
 
@@ -261,6 +271,26 @@ mod tests {
     fn io_error_classifies_not_found() {
         let err = std::io::Error::from(std::io::ErrorKind::NotFound);
         assert_eq!(io_to_file_code(&err), FileErrorCode::NotFound);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn io_error_classifies_windows_not_directory() {
+        let err = std::io::Error::from_raw_os_error(267);
+        assert_eq!(io_to_file_code(&err), FileErrorCode::NotDirectory);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn io_error_classifies_posix_directory_kinds() {
+        assert_eq!(
+            io_to_file_code(&std::io::Error::from_raw_os_error(21)),
+            FileErrorCode::IsDirectory
+        );
+        assert_eq!(
+            io_to_file_code(&std::io::Error::from_raw_os_error(20)),
+            FileErrorCode::NotDirectory
+        );
     }
 
     #[test]
