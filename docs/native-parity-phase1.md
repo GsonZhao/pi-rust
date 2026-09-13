@@ -9,6 +9,7 @@
 - `--offline`：跳过启动更新检查；
 - `--approve/-a` 与 `--no-approve/-na`：控制项目级资源和扩展是否加载；
 - JSON mode：输出 agent/turn/message/delta/tool execution 事件；
+- `--export <session.jsonl> [output.html]`：导出独立 HTML；`.jsonl` 目标保留 JSONL；
 - 相关 parser、图片处理和 trust gate 单元测试。
 
 Trust 行为：
@@ -27,4 +28,4 @@ cargo test -p rpi-cli app::tests::process_file_args_attaches_supported_images
 cargo test -p rpi-cli session::tests::project_trust_override_fails_closed_by_default
 ```
 
-仍待后续阶段：HTML/JSONL export、核心 TUI 快捷键和完整多 provider/OAuth/RPC parity。
+仍待后续阶段：核心 TUI 快捷键和完整多 provider/OAuth/RPC parity。
