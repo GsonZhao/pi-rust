@@ -11,7 +11,7 @@
 //!
 //! Divergences from the TS parser (all deliberate v1 scope cuts, documented in
 //! `docs/m6-cli-open-questions.md`):
-//! - `--mode rpc`, `--tui-mode`,
+//! - `--mode rpc`,
 //!   `--fork`, `--approve`/`-na`,
 //!   `--extension`/`-e`, `--skill`, and `--prompt-template` are recognized but
 //!   not all wired into the full TS package manager. The supported resource
@@ -37,6 +37,15 @@ pub enum Mode {
     Rpc,
 }
 
+/// Interactive TUI presentation mode. `fullscreen` uses the alternate screen
+/// buffer; `regular` renders into the terminal's normal scrollback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TuiMode {
+    #[default]
+    Fullscreen,
+    Regular,
+}
+
 /// The parsed argument set. Mirrors TS `Args`. Fields absent in v1
 /// (`unknownFlags`, extension/resource discovery) are omitted; everything here
 /// is either honored or explicitly ignored-with-warning.
@@ -56,6 +65,9 @@ pub struct Args {
 
     pub print: bool,
     pub mode: Mode,
+    /// `--tui-mode regular|fullscreen` controls the interactive terminal
+    /// buffer. The default remains fullscreen for compatibility with rpi.
+    pub tui_mode: TuiMode,
 
     /// `--list-models [search]`: list the merged model catalog and exit.
     /// `Some("")` represents the bare flag; `None` means absent.
@@ -276,6 +288,20 @@ pub fn parse_args(args: &[String]) -> Args {
                     };
                 }
             }
+            "--tui-mode" => {
+                if let Some(v) = take_value(&mut result, "--tui-mode") {
+                    result.tui_mode = match v.to_ascii_lowercase().as_str() {
+                        "regular" => TuiMode::Regular,
+                        "fullscreen" => TuiMode::Fullscreen,
+                        other => {
+                            result.errors.push(format!(
+                                "Invalid --tui-mode \"{other}\". Valid: regular, fullscreen"
+                            ));
+                            TuiMode::Fullscreen
+                        }
+                    };
+                }
+            }
             "--continue" | "-c" => result.continue_session = true,
             "--resume" | "-r" => result.resume = true,
             "--no-session" => result.no_session = true,
@@ -385,7 +411,7 @@ pub fn parse_args(args: &[String]) -> Args {
             // into real fields above), so they no longer reach this arm. The
             // resource flags gate discovery in `session.rs`; package loading
             // is separately opt-in.
-            other if matches!(other, "--models" | "--tui-mode") => {
+            other if matches!(other, "--models") => {
                 // Consume a value if the next token isn't a flag (so
                 // `--models sonnet` doesn't swallow `sonnet` as a message).
                 if inline.is_none()
@@ -496,6 +522,7 @@ pub fn print_help() {
   --append-system-prompt <text>  Append text to the system prompt (repeatable)
   --thinking <level>             off, minimal, low, medium, high, xhigh, max
   --mode <mode>                  Output mode: text (default), json, or rpc
+  --tui-mode <mode>              Interactive TUI buffer: regular or fullscreen
   --list-models [search]         List available models (with optional fuzzy search)
   --offline                      Disable startup network checks
   --export <file>                Export a JSONL session to HTML and exit
@@ -841,6 +868,20 @@ mod tests {
         let a = parse_args(&s(&["--no-themes"]));
         assert!(a.no_themes);
         assert!(a.ignored.is_empty());
+    }
+
+    #[test]
+    fn tui_mode_parses_and_validates() {
+        assert_eq!(
+            parse_args(&s(&["--tui-mode", "regular"])).tui_mode,
+            TuiMode::Regular
+        );
+        assert_eq!(
+            parse_args(&s(&["--tui-mode=fullscreen"])).tui_mode,
+            TuiMode::Fullscreen
+        );
+        let invalid = parse_args(&s(&["--tui-mode", "split"]));
+        assert!(!invalid.errors.is_empty());
     }
 
     #[test]

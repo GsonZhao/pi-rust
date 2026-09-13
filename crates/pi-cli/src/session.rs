@@ -1312,6 +1312,24 @@ fn build_models_with_extensions(
     models
 }
 
+/// Whether the cwd contains project-owned resources that warrant a trust
+/// decision prompt. Session storage alone is intentionally excluded so a
+/// normal launch does not repeatedly ask after creating `.rpi/sessions`.
+pub fn project_has_local_resources(cwd: &Path) -> bool {
+    const FILES: &[&str] = &[
+        "settings.json",
+        "SYSTEM.md",
+        "APPEND_SYSTEM.md",
+        "packages.json",
+    ];
+    const DIRS: &[&str] = &["skills", "prompts", "themes", "extensions", "packages"];
+    [".rpi", ".pi"].iter().any(|layout| {
+        let root = cwd.join(layout);
+        FILES.iter().any(|name| root.join(name).is_file())
+            || DIRS.iter().any(|name| root.join(name).is_dir())
+    })
+}
+
 /// Resolve the project trust gate without prompting. Explicit CLI overrides
 /// win; otherwise a stored `trust.json` decision is honored. An absent or
 /// malformed decision fails closed so untrusted project files cannot execute
@@ -2014,6 +2032,16 @@ mod tests {
             &approved,
             Path::new("C:/definitely-not-a-project")
         ));
+    }
+
+    #[test]
+    fn project_resource_probe_ignores_session_directory_but_detects_config() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path();
+        std::fs::create_dir_all(cwd.join(".rpi/sessions")).unwrap();
+        assert!(!project_has_local_resources(cwd));
+        std::fs::write(cwd.join(".rpi/settings.json"), "{}").unwrap();
+        assert!(project_has_local_resources(cwd));
     }
 
     #[test]

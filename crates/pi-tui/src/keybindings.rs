@@ -79,6 +79,7 @@ pub struct KeybindingConflict {
 }
 
 /// Keybindings manager.
+#[derive(Clone)]
 pub struct Keybindings {
     definitions: HashMap<KeybindingId, KeybindingDefinition>,
     user_bindings: HashMap<KeybindingId, Vec<KeyCombo>>,
@@ -108,6 +109,73 @@ impl Keybindings {
         use KeyModifiers as M;
 
         let mut map = HashMap::new();
+
+        // Application-level actions. These IDs intentionally match native Pi
+        // so a copied settings.json can override them; rpi keeps its existing
+        // Ctrl+M model-cycle default for backward compatibility.
+        map.insert(
+            "app.interrupt",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Esc, M::NONE)],
+                description: Some("Cancel or abort"),
+            },
+        );
+        map.insert(
+            "app.clear",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Char('c'), M::CONTROL)],
+                description: Some("Clear editor"),
+            },
+        );
+        map.insert(
+            "app.exit",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Char('d'), M::CONTROL)],
+                description: Some("Exit when editor is empty"),
+            },
+        );
+        map.insert(
+            "app.model.select",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Char('l'), M::CONTROL)],
+                description: Some("Open model selector"),
+            },
+        );
+        map.insert(
+            "app.model.cycleForward",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Char('m'), M::CONTROL)],
+                description: Some("Cycle to next model"),
+            },
+        );
+        map.insert(
+            "app.tools.expand",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Char('o'), M::CONTROL)],
+                description: Some("Toggle tool output"),
+            },
+        );
+        map.insert(
+            "app.thinking.toggle",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Char('t'), M::CONTROL)],
+                description: Some("Toggle thinking blocks"),
+            },
+        );
+        map.insert(
+            "app.editor.external",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Char('g'), M::CONTROL)],
+                description: Some("Open external editor"),
+            },
+        );
+        map.insert(
+            "app.thinking.cycle",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Tab, M::SHIFT)],
+                description: Some("Cycle thinking level"),
+            },
+        );
 
         // Editor navigation and editing
         map.insert(
@@ -592,10 +660,9 @@ static GLOBAL_KEYBINDINGS: std::sync::OnceLock<std::sync::Mutex<Keybindings>> =
 
 /// Set global keybindings.
 pub fn set_keybindings(keybindings: Keybindings) {
-    if let Some(guard) = GLOBAL_KEYBINDINGS.get() {
-        if let Ok(mut kb) = guard.lock() {
-            *kb = keybindings;
-        }
+    let guard = GLOBAL_KEYBINDINGS.get_or_init(|| std::sync::Mutex::new(Keybindings::new()));
+    if let Ok(mut kb) = guard.lock() {
+        *kb = keybindings;
     }
 }
 
@@ -608,6 +675,16 @@ pub fn get_keybindings() -> std::sync::MutexGuard<'static, Keybindings> {
 /// Predefined keybinding IDs.
 pub mod keys {
     use super::KeybindingId;
+
+    pub const INTERRUPT: KeybindingId = "app.interrupt";
+    pub const CLEAR: KeybindingId = "app.clear";
+    pub const EXIT: KeybindingId = "app.exit";
+    pub const MODEL_SELECT: KeybindingId = "app.model.select";
+    pub const MODEL_CYCLE_FORWARD: KeybindingId = "app.model.cycleForward";
+    pub const TOOLS_EXPAND: KeybindingId = "app.tools.expand";
+    pub const THINKING_TOGGLE: KeybindingId = "app.thinking.toggle";
+    pub const EXTERNAL_EDITOR: KeybindingId = "app.editor.external";
+    pub const THINKING_CYCLE: KeybindingId = "app.thinking.cycle";
 
     // Editor
     pub const CURSOR_UP: KeybindingId = "tui.editor.cursorUp";

@@ -1701,6 +1701,20 @@ impl SlashCommand for VersionCommand {
     }
 }
 
+struct ChangelogCommand;
+impl SlashCommand for ChangelogCommand {
+    fn name(&self) -> &'static str {
+        "/changelog"
+    }
+    fn description(&self) -> &'static str {
+        "Show recent release changes"
+    }
+    fn execute(&self, ctx: &CommandContext, _args: &str) {
+        add_changelog_message(&ctx.chat);
+        ctx.tui.request_render(false);
+    }
+}
+
 struct HotkeysCommand;
 impl SlashCommand for HotkeysCommand {
     fn name(&self) -> &'static str {
@@ -2275,6 +2289,7 @@ fn build_builtin_registry() -> CommandRegistry {
     r.register(Arc::new(ClearChatCommand));
     r.register(Arc::new(ExitCommand));
     r.register(Arc::new(VersionCommand));
+    r.register(Arc::new(ChangelogCommand));
     r.register(Arc::new(ModelCommand));
     r.register(Arc::new(ThinkingCommand));
     r.register(Arc::new(ToolsCommand));
@@ -3764,6 +3779,143 @@ const PAGE_SCROLL_OVERLAP: usize = 4;
 /// avoiding the sluggish feel of the previous implementation.
 const MOUSE_WHEEL_SCROLL_LINES: i32 = 3;
 
+/// Parse the compact key notation used by native Pi settings (for example
+/// `ctrl+g`, `shift+tab`, or `escape`) into crossterm's representation.
+fn parse_configured_key(value: &str) -> Option<rpi_tui::KeyCombo> {
+    let mut modifiers = KeyModifiers::NONE;
+    let mut key = None;
+    for part in value.trim().to_ascii_lowercase().split('+') {
+        match part {
+            "ctrl" | "control" => modifiers |= KeyModifiers::CONTROL,
+            "shift" => modifiers |= KeyModifiers::SHIFT,
+            "alt" | "option" => modifiers |= KeyModifiers::ALT,
+            "super" | "cmd" | "command" | "meta" => modifiers |= KeyModifiers::SUPER,
+            part if !part.is_empty() => key = Some(part.to_string()),
+            _ => {}
+        }
+    }
+    let key = key?;
+    let code = match key.as_str() {
+        "esc" | "escape" => KeyCode::Esc,
+        "enter" | "return" => KeyCode::Enter,
+        "tab" => {
+            if modifiers.contains(KeyModifiers::SHIFT) {
+                return Some(rpi_tui::KeyCombo::new(
+                    KeyCode::BackTab,
+                    modifiers & !KeyModifiers::SHIFT,
+                ));
+            }
+            KeyCode::Tab
+        }
+        "backspace" | "back" => KeyCode::Backspace,
+        "delete" | "del" => KeyCode::Delete,
+        "up" | "arrowup" => KeyCode::Up,
+        "down" | "arrowdown" => KeyCode::Down,
+        "left" | "arrowleft" => KeyCode::Left,
+        "right" | "arrowright" => KeyCode::Right,
+        "home" => KeyCode::Home,
+        "end" => KeyCode::End,
+        "pageup" | "page-up" => KeyCode::PageUp,
+        "pagedown" | "page-down" => KeyCode::PageDown,
+        "space" => KeyCode::Char(' '),
+        "f1" => KeyCode::F(1),
+        "f2" => KeyCode::F(2),
+        "f3" => KeyCode::F(3),
+        "f4" => KeyCode::F(4),
+        "f5" => KeyCode::F(5),
+        "f6" => KeyCode::F(6),
+        "f7" => KeyCode::F(7),
+        "f8" => KeyCode::F(8),
+        "f9" => KeyCode::F(9),
+        "f10" => KeyCode::F(10),
+        "f11" => KeyCode::F(11),
+        "f12" => KeyCode::F(12),
+        value if value.chars().count() == 1 => KeyCode::Char(value.chars().next().unwrap()),
+        _ => return None,
+    };
+    Some(rpi_tui::KeyCombo::new(code, modifiers))
+}
+
+fn configured_keybindings() -> Arc<rpi_tui::Keybindings> {
+    let mut bindings = rpi_tui::Keybindings::new();
+    let settings = crate::settings::load_settings().unwrap_or_default();
+    let Some(overrides) = settings.keybindings else {
+        rpi_tui::set_keybindings(bindings.clone());
+        return Arc::new(bindings);
+    };
+    let known: &[(&str, rpi_tui::KeybindingId)] = &[
+        ("app.interrupt", rpi_tui::keybindings::keys::INTERRUPT),
+        ("app.clear", rpi_tui::keybindings::keys::CLEAR),
+        ("app.exit", rpi_tui::keybindings::keys::EXIT),
+        ("app.model.select", rpi_tui::keybindings::keys::MODEL_SELECT),
+        (
+            "app.model.cycleForward",
+            rpi_tui::keybindings::keys::MODEL_CYCLE_FORWARD,
+        ),
+        ("app.tools.expand", rpi_tui::keybindings::keys::TOOLS_EXPAND),
+        (
+            "app.thinking.toggle",
+            rpi_tui::keybindings::keys::THINKING_TOGGLE,
+        ),
+        (
+            "app.editor.external",
+            rpi_tui::keybindings::keys::EXTERNAL_EDITOR,
+        ),
+        (
+            "app.thinking.cycle",
+            rpi_tui::keybindings::keys::THINKING_CYCLE,
+        ),
+    ];
+    for (name, id) in known {
+        let Some(value) = overrides.get(*name) else {
+            continue;
+        };
+        let values: Vec<String> = match value {
+            serde_json::Value::String(value) => vec![value.clone()],
+            serde_json::Value::Array(values) => values
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect(),
+            serde_json::Value::Null => Vec::new(),
+            _ => continue,
+        };
+        let combos: Vec<_> = values
+            .iter()
+            .filter_map(|value| parse_configured_key(value))
+            .collect();
+        if values.is_empty() || !combos.is_empty() {
+            bindings.set(id, combos);
+        }
+    }
+    rpi_tui::set_keybindings(bindings.clone());
+    Arc::new(bindings)
+}
+
+fn keybinding_matches(
+    bindings: &rpi_tui::Keybindings,
+    event: &crossterm::event::KeyEvent,
+    id: rpi_tui::KeybindingId,
+) -> bool {
+    if bindings.matches(event, id) {
+        return true;
+    }
+    // crossterm reports Shift+Tab as BackTab on some terminals and as Tab
+    // plus Shift on others. Treat both forms as the same configured action.
+    if event.code == KeyCode::BackTab {
+        let normalized =
+            crossterm::event::KeyEvent::new(KeyCode::Tab, event.modifiers | KeyModifiers::SHIFT);
+        bindings.matches(&normalized, id)
+    } else {
+        false
+    }
+}
+
+fn double_escape_trigger(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last.is_some_and(|previous| {
+        now.duration_since(previous) <= std::time::Duration::from_millis(500)
+    })
+}
+
 fn transcript_page_size(viewport_height: usize) -> i32 {
     viewport_height
         .saturating_sub(PAGE_SCROLL_OVERLAP)
@@ -4105,6 +4257,7 @@ pub async fn interactive_tui(
     let terminal = Box::new(ProcessTerminal::new());
     let tui = Arc::new(TuiAltScreen::new(terminal, true, None));
     let js_dialog_bridge = Arc::new(JsDialogBridge::default());
+    tui.set_main_screen_mode(matches!(args.tui_mode, crate::args::TuiMode::Regular));
 
     if let Some(js) = &reload_context.js_extension_session {
         if let Err(error) = js.install_ui_runtime(tui.clone()) {
@@ -4215,13 +4368,14 @@ pub async fn interactive_tui(
     // Bordered box matching native pi: no `> ` prompt, no placeholder — the
     // editor renders full-width `─` top/bottom borders with padding-only lines
     // (see Editor::render). padding_x:1 gives a 1-col inset inside the box.
+    let keybindings = configured_keybindings();
     let editor = Arc::new(Editor::new(
         EditorOptions {
             padding_x: 1,
             ..Default::default()
         },
         EditorStyle::default(),
-        Arc::new(rpi_tui::Keybindings::new()),
+        keybindings.clone(),
     ));
 
     // ---- Footer + status ----
@@ -4548,8 +4702,15 @@ pub async fn interactive_tui(
     // handler uses. All fields are `Arc`/cheap, so this clone is free.
     let ctx_for_key = ctx.clone();
     let registry_for_key = registry.clone();
+    let keybindings_for_key = keybindings.clone();
+    let double_escape_action = crate::settings::load_settings()
+        .ok()
+        .and_then(|settings| settings.double_escape_action)
+        .unwrap_or_else(|| "tree".to_string())
+        .to_ascii_lowercase();
 
     let key_handle = tokio::task::spawn_blocking(move || {
+        let mut last_escape_time = None;
         loop {
             if !*running_key.lock().unwrap() {
                 break;
@@ -4729,7 +4890,11 @@ pub async fn interactive_tui(
             //    `tui.input.copy`); otherwise abort an active run, or exit
             //    when idle. Open selectors and extension dialogs are handled
             //    above so their cancellation callbacks get first chance.
-            if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('c') {
+            if keybinding_matches(
+                &keybindings_for_key,
+                &key,
+                rpi_tui::keybindings::keys::CLEAR,
+            ) {
                 if !state_for_key.selector_open() && editor_for_key.has_selection() {
                     editor_for_key.copy_selection();
                     continue;
@@ -4789,7 +4954,7 @@ pub async fn interactive_tui(
             //     `tui.editor.deleteCharForward`), and EOF-quit on an empty
             //     editor. With a run active, abort it first (same as Ctrl+C)
             //     so the key is never a no-op while a stuck command runs.
-            if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('d') {
+            if keybinding_matches(&keybindings_for_key, &key, rpi_tui::keybindings::keys::EXIT) {
                 let status = *state_for_key.status.lock().unwrap();
                 match status {
                     RunStatus::Working => {
@@ -4818,7 +4983,11 @@ pub async fn interactive_tui(
             //     selector is open Esc already cancelled it above; when idle,
             //     Esc falls through to the editor (no-op-ish). Only fire while
             //     Working so an idle Esc doesn't abort a non-existent run.
-            if key.modifiers == KeyModifiers::NONE && key.code == KeyCode::Esc {
+            if keybinding_matches(
+                &keybindings_for_key,
+                &key,
+                rpi_tui::keybindings::keys::INTERRUPT,
+            ) {
                 let status = *state_for_key.status.lock().unwrap();
                 if status == RunStatus::Working {
                     state_for_key.set_status(RunStatus::Aborting);
@@ -4828,25 +4997,58 @@ pub async fn interactive_tui(
                     });
                     continue;
                 }
+                if status == RunStatus::Idle
+                    && editor_for_key.get_text().trim().is_empty()
+                    && double_escape_action != "none"
+                {
+                    let now = std::time::Instant::now();
+                    if double_escape_trigger(last_escape_time, now) {
+                        last_escape_time = None;
+                        match double_escape_action.as_str() {
+                            "tree" => {
+                                let _ = tx_for_key.send(TuiMessage::OpenTree);
+                            }
+                            "fork" => {
+                                let _ = tx_for_key.send(TuiMessage::ForkSession);
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        last_escape_time = Some(now);
+                    }
+                }
+                continue;
             }
 
             // 2c. Ctrl+G: edit the current draft in the user's external
             // editor, matching native Pi's VISUAL/EDITOR fallback chain.
-            if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('g') {
+            if keybinding_matches(
+                &keybindings_for_key,
+                &key,
+                rpi_tui::keybindings::keys::EXTERNAL_EDITOR,
+            ) {
                 launch_external_editor(editor_for_key.get_text(), tx_for_key.clone());
                 continue;
             }
 
             // 2d. Ctrl+O: toggle all tool output panels between compact and
             // expanded rendering (native Pi's global output toggle).
-            if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('o') {
+            if keybinding_matches(
+                &keybindings_for_key,
+                &key,
+                rpi_tui::keybindings::keys::TOOLS_EXPAND,
+            ) {
                 state_for_key.toggle_tool_outputs();
                 tui_for_key.request_render(false);
                 continue;
             }
 
             // 2e. Ctrl+T: toggle visibility of reasoning/thinking blocks.
-            if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('t') {
+            if keybinding_matches(
+                &keybindings_for_key,
+                &key,
+                rpi_tui::keybindings::keys::THINKING_TOGGLE,
+            ) {
                 state_for_key.toggle_thinking();
                 tui_for_key.request_render(false);
                 continue;
@@ -4857,7 +5059,11 @@ pub async fn interactive_tui(
             //     `lane.set_model` (takes effect on the next user message — the
             //     in-flight run's config is already snapshotted), and update the
             //     footer. `set_model` is async so it runs on a spawned task.
-            if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('m') {
+            if keybinding_matches(
+                &keybindings_for_key,
+                &key,
+                rpi_tui::keybindings::keys::MODEL_CYCLE_FORWARD,
+            ) {
                 let current = state_for_key.current_model_id();
                 // Cycle within the `/scoped-models` set (settings.json) when
                 // configured; otherwise the full catalog.
@@ -4875,9 +5081,11 @@ pub async fn interactive_tui(
 
             // 2f. Shift+Tab / BackTab: cycle the current model's supported
             // thinking levels, matching native Pi's thinking-level shortcut.
-            if key.code == KeyCode::BackTab
-                || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
-            {
+            if keybinding_matches(
+                &keybindings_for_key,
+                &key,
+                rpi_tui::keybindings::keys::THINKING_CYCLE,
+            ) {
                 let lane = lane_for_key.clone();
                 let catalog = model_catalog_for_key.clone();
                 let state = state_for_key.clone();
@@ -4917,7 +5125,11 @@ pub async fn interactive_tui(
             // 3. Ctrl+L: open the model selector. Routed through the `/model`
             //    command so the hotkey and the slash command share one path
             //    (TS binds Ctrl+L to model-select).
-            if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('l') {
+            if keybinding_matches(
+                &keybindings_for_key,
+                &key,
+                rpi_tui::keybindings::keys::MODEL_SELECT,
+            ) {
                 if let Some(cmd) = registry_for_key.find("/model") {
                     cmd.execute(&ctx_for_key, "");
                 }
@@ -6999,6 +7211,7 @@ fn add_help_message(container: &Arc<Container>) {
         ("/clear, /new", "Clear the conversation"),
         ("/exit, /quit, /q", "Exit the application"),
         ("/version, /v", "Show version information"),
+        ("/changelog", "Show recent release changes"),
         ("/model, /m", "Choose a model (live switch)"),
         ("/thinking, /think", "Set reasoning depth (selector)"),
         ("/tools", "Toggle built-in tools on/off"),
@@ -7055,6 +7268,43 @@ fn add_version_message(container: &Arc<Container>) {
     container.add_child(Arc::new(Spacer::new(1)));
 }
 
+/// Add a compact `/changelog` block to the chat container. Keep this local to
+/// the binary so the command remains useful in installed builds without a
+/// source checkout or a network request.
+fn add_changelog_message(container: &Arc<Container>) {
+    let c = current_theme().colors;
+    container.add_child(Arc::new(Text::new(
+        c.md_heading.fg(&tui_bold("Recent Changes")),
+        1,
+        0,
+    )));
+    container.add_child(Arc::new(Spacer::new(1)));
+    let entries = [
+        (
+            "Native parity phase 1",
+            "models, images, trust, export, and JSON events",
+        ),
+        (
+            "TUI controls",
+            "external editor, thinking levels, and tool output toggles",
+        ),
+        (
+            "Provider auth",
+            "OpenAI-compatible API key aliases and gateway headers",
+        ),
+    ];
+    for (release, summary) in entries {
+        let row = format!("  {}  {}", c.accent.fg(release), c.muted.fg(summary));
+        container.add_child(Arc::new(Text::new(row, 1, 0)));
+    }
+    container.add_child(Arc::new(Text::new(
+        format!("  {} {}", c.dim.fg("Version"), c.text.fg(crate::VERSION)),
+        1,
+        0,
+    )));
+    container.add_child(Arc::new(Spacer::new(1)));
+}
+
 /// Add the `/hotkeys` block to the chat container.
 fn add_hotkeys_message(container: &Arc<Container>) {
     let c = current_theme().colors;
@@ -7080,7 +7330,8 @@ fn add_hotkeys_message(container: &Arc<Container>) {
         ("Esc", "Abort a running prompt"),
         ("Ctrl+L", "Open model selector"),
         ("Ctrl+M", "Cycle to the next model (live)"),
-        ("Ctrl+T", "Expand/collapse last tool result"),
+        ("Ctrl+O", "Expand/collapse all tool output"),
+        ("Ctrl+T", "Show/hide reasoning blocks"),
         ("PageUp/Down", "Scroll transcript by one page"),
         ("Home / End", "Jump to transcript start / latest output"),
     ];
@@ -7526,6 +7777,7 @@ mod tests {
         resolves_to("/quit", "/exit"); // alias
         resolves_to("/version", "/version");
         resolves_to("/v", "/version"); // alias
+        resolves_to("/changelog", "/changelog");
         resolves_to("/hotkeys", "/hotkeys");
         resolves_to("/model", "/model");
         resolves_to("/m", "/model"); // alias
@@ -7570,6 +7822,7 @@ mod tests {
             "/exit",
             "/quit",
             "/version",
+            "/changelog",
             "/model",
             "/session",
             "/theme",
@@ -8182,5 +8435,28 @@ mod tests {
             text.starts_with("/help"),
             "editor text should start with /help, got {text}"
         );
+    }
+
+    #[test]
+    fn configured_key_parser_supports_native_notation() {
+        let combo = parse_configured_key("Ctrl+G").expect("ctrl+g should parse");
+        assert_eq!(combo.code, KeyCode::Char('g'));
+        assert!(combo.modifiers.contains(KeyModifiers::CONTROL));
+        let combo = parse_configured_key("shift+tab").expect("shift+tab should parse");
+        assert_eq!(combo.code, KeyCode::BackTab);
+    }
+
+    #[test]
+    fn double_escape_trigger_has_half_second_window() {
+        let now = std::time::Instant::now();
+        assert!(!double_escape_trigger(None, now));
+        assert!(double_escape_trigger(
+            Some(now - std::time::Duration::from_millis(500)),
+            now
+        ));
+        assert!(!double_escape_trigger(
+            Some(now - std::time::Duration::from_millis(501)),
+            now
+        ));
     }
 }

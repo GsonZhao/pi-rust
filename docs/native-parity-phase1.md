@@ -16,6 +16,11 @@
 - `--no-themes`：禁用包/自定义主题加载；与 `--theme` 冲突时 fail-safe 使用内置默认主题；
 - Ctrl+O：在紧凑/展开之间切换所有工具输出面板；
 - Ctrl+T：切换 reasoning/thinking 区块的可见性，新消息继承该偏好；
+- `--tui-mode regular|fullscreen`：选择终端原生 scrollback 或 alternate-screen；
+- 双 Esc：空编辑器内 500ms 内连续按两次时按 `doubleEscapeAction` 打开 tree/fork；
+- settings `keybindings`：支持覆盖 interrupt、clear、exit、model、tool、thinking、
+  external editor 等 TUI action 的组合键；
+- `/changelog`：显示当前版本和本阶段已实现的变更；
 - OpenAI-compatible provider：`models.json` 支持显式 `apiKey`，并按 provider id
   查找 `<PROVIDER>_API_KEY` 与常见别名（如 `DEEPSEEK_API_KEY`、`GROQ_API_KEY`、
   `OPENROUTER_API_KEY`）；
@@ -37,4 +42,4 @@ cargo test -p rpi-cli app::tests::process_file_args_attaches_supported_images
 cargo test -p rpi-cli session::tests::project_trust_override_fails_closed_by_default
 ```
 
-仍待后续阶段：double Escape、可配置 keybindings、clipboard image/drag-and-drop，以及完整多 provider/OAuth/RPC parity。
+仍待后续阶段：clipboard image/drag-and-drop，以及完整多 provider/OAuth/RPC parity。

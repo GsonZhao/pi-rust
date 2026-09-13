@@ -605,7 +605,11 @@ impl Component for TuiAltScreen {
 
 impl TUI for TuiAltScreen {
     fn mode(&self) -> TuiMode {
-        TuiMode::Fullscreen
+        if self.uses_main_screen() {
+            TuiMode::Regular
+        } else {
+            TuiMode::Fullscreen
+        }
     }
 
     fn terminal(&self) -> &dyn Terminal {

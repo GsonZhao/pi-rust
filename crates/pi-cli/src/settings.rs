@@ -9,6 +9,7 @@
 //! rest (serde `default` ignores unknown fields), so a copied pi `settings.json`
 //! parses clean.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::config::{self, strip_line_comments, ConfigError};
@@ -53,6 +54,14 @@ pub struct Settings {
     /// as a compatibility shorthand.
     #[serde(default, alias = "extensions")]
     pub extension_dirs: Option<Vec<String>>,
+    /// Native Pi keybinding overrides. Values may be a key string, an array
+    /// of key strings, or an empty array to unbind an action.
+    #[serde(default)]
+    pub keybindings: Option<HashMap<String, serde_json::Value>>,
+    /// Action performed by two quick Escape presses while the editor is empty.
+    /// Native Pi defaults this to `tree`; `none` disables the gesture.
+    #[serde(default)]
+    pub double_escape_action: Option<String>,
 }
 
 /// Load `~/.rpi/agent/settings.json`. Missing file ⇒ `Settings::default()`
@@ -248,6 +257,28 @@ pub fn save_settings(settings: &Settings) -> Result<(), String> {
             _ => {
                 obj.remove(key);
             }
+        }
+    }
+    match &settings.keybindings {
+        Some(bindings) => {
+            obj.insert(
+                "keybindings".to_string(),
+                serde_json::to_value(bindings).map_err(|e| e.to_string())?,
+            );
+        }
+        None => {
+            obj.remove("keybindings");
+        }
+    }
+    match settings.double_escape_action.as_deref() {
+        Some(action) if !action.trim().is_empty() => {
+            obj.insert(
+                "doubleEscapeAction".to_string(),
+                serde_json::Value::String(action.to_string()),
+            );
+        }
+        _ => {
+            obj.remove("doubleEscapeAction");
         }
     }
     if let Some(parent) = path.parent() {
