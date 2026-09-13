@@ -44,9 +44,10 @@ use rpi_tui::{
     AssistantMessageOptions, AutocompleteManager, AutocompleteSuggestions, BashExecutionComponent,
     BashTruncation, CombinedAutocompleteProvider, Component, Container, DynamicBorder, Editor,
     EditorOptions, EditorStyle, FilePathAutocompleteProvider, Focusable, FollowMode,
-    FooterComponent, Input, Loader, ProcessTerminal, ScrollView, ScrollViewOptions, SelectItem,
-    SelectList, SlashCommand as SlashCommandEntry, SlashCommandAutocompleteProvider, Spacer,
-    StackChild, StackEntry, Text, ThemeManager, ThemePreset, ToolExecutionComponent, TuiAltScreen,
+    FooterComponent, Image, ImageOptions, Input, Loader, ProcessTerminal, ScrollView,
+    ScrollViewOptions, SelectItem, SelectList, SlashCommand as SlashCommandEntry,
+    SlashCommandAutocompleteProvider, Spacer, StackChild, StackEntry, Text, ThemeManager,
+    ThemePreset, ToolExecutionComponent, TuiAltScreen,
     UserMessageComponent, VStack, TUI,
 };
 use rpi_tui::{bold as tui_bold, theme as current_theme};
@@ -3682,6 +3683,8 @@ struct TuiState {
     hide_thinking: std::sync::Mutex<bool>,
     /// Global tool-output expansion preference toggled by Ctrl+O.
     tool_outputs_expanded: std::sync::Mutex<bool>,
+    /// Whether the native-style terminal progress indicator is enabled.
+    show_terminal_progress: bool,
     /// Run status for the status indicator + interrupt routing.
     status: std::sync::Mutex<RunStatus>,
     /// Cancellation signal for the short phase that starts the persistent JS
@@ -3716,6 +3719,10 @@ struct TuiState {
     /// The container rendered above the editor holding the live autocomplete
     /// suggestion list (cleared when there are no suggestions).
     autocomplete_container: Arc<Container>,
+    /// Maximum number of autocomplete rows rendered above the editor.
+    autocomplete_max_visible: usize,
+    /// Images queued from clipboard paste and attached to the next prompt.
+    pending_images: std::sync::Mutex<Vec<rpi_ai::types::ImageContent>>,
     /// The owned theme manager — `/theme` applies presets here. The global
     /// `theme()` is read-only after OnceLock init, so per-instance state is the
     /// only way to apply a preset at runtime.
@@ -3864,6 +3871,10 @@ fn configured_keybindings() -> Arc<rpi_tui::Keybindings> {
         (
             "app.thinking.cycle",
             rpi_tui::keybindings::keys::THINKING_CYCLE,
+        ),
+        (
+            "app.clipboard.pasteImage",
+            rpi_tui::keybindings::keys::PASTE_IMAGE,
         ),
     ];
     for (name, id) in known {
@@ -4052,8 +4063,10 @@ impl TuiState {
                     tui.set_title("rpi — working");
                 }
                 self.status_container.clear();
-                self.loader.start();
-                self.status_container.add_child(self.loader.clone());
+                if self.show_terminal_progress {
+                    self.loader.start();
+                    self.status_container.add_child(self.loader.clone());
+                }
             }
             RunStatus::Aborting => {
                 self.footer.set_status("Aborting…");
@@ -4082,7 +4095,7 @@ impl TuiState {
         }
 
         self.status_container.clear();
-        if self.bash_components.lock().unwrap().is_empty() {
+        if self.show_terminal_progress && self.bash_components.lock().unwrap().is_empty() {
             self.status_container.add_child(self.loader.clone());
         }
     }
@@ -4166,6 +4179,14 @@ impl TuiState {
             comp.set_markdown_transformer(transformer);
         }
     }
+
+    fn queue_image(&self, image: rpi_ai::types::ImageContent) {
+        self.pending_images.lock().unwrap().push(image);
+    }
+
+    fn take_pending_images(&self) -> Vec<rpi_ai::types::ImageContent> {
+        std::mem::take(&mut *self.pending_images.lock().unwrap())
+    }
 }
 
 // ===========================================================================
@@ -4198,6 +4219,14 @@ pub async fn interactive_tui(
     reload_context: &crate::session::ReloadContext,
 ) -> i32 {
     let lane: Arc<dyn AgentLane> = harness.lane("main");
+    let saved_settings = crate::settings::load_settings().unwrap_or_default();
+    let editor_padding_x = saved_settings.editor_padding_x.unwrap_or(1).min(16);
+    let autocomplete_max_visible = saved_settings
+        .autocomplete_max_visible
+        .unwrap_or(5)
+        .clamp(1, 20);
+    let hide_thinking = saved_settings.hide_thinking_block.unwrap_or(false);
+    let show_terminal_progress = saved_settings.show_terminal_progress.unwrap_or(true);
 
     // Resolve the active model once, up front. The full id feeds the TuiState
     // tracking field + the selectors/key loop (which run on a blocking thread
@@ -4371,7 +4400,8 @@ pub async fn interactive_tui(
     let keybindings = configured_keybindings();
     let editor = Arc::new(Editor::new(
         EditorOptions {
-            padding_x: 1,
+            padding_x: editor_padding_x,
+            autocomplete_max_visible,
             ..Default::default()
         },
         EditorStyle::default(),
@@ -4449,8 +4479,9 @@ pub async fn interactive_tui(
         tool_components: std::sync::Mutex::new(HashMap::new()),
         bash_components: std::sync::Mutex::new(HashMap::new()),
         themes_enabled: !no_themes,
-        hide_thinking: std::sync::Mutex::new(false),
+        hide_thinking: std::sync::Mutex::new(hide_thinking),
         tool_outputs_expanded: std::sync::Mutex::new(false),
+        show_terminal_progress,
         status: std::sync::Mutex::new(RunStatus::Idle),
         js_preparation_cancel: std::sync::Mutex::new(None),
         footer: footer.clone(),
@@ -4464,6 +4495,8 @@ pub async fn interactive_tui(
         active_extension_cancel: std::sync::Mutex::new(None),
         autocomplete,
         autocomplete_container: autocomplete_container.clone(),
+        autocomplete_max_visible,
+        pending_images: std::sync::Mutex::new(Vec::new()),
         theme_manager,
         tui: Some(tui.clone()),
         current_model_id: std::sync::Mutex::new(lane_model_id.clone()),
@@ -4777,6 +4810,25 @@ pub async fn interactive_tui(
                 continue;
             }
             let Event::Key(key) = ev else {
+                if let Event::Paste(text) = ev {
+                    let candidate = text.trim().trim_matches(['\"', '\'']);
+                    let path = std::path::PathBuf::from(candidate);
+                    if !candidate.chars().any(|c| c == '\n' || c == '\r') && path.is_file() {
+                        if let Ok(Some(image)) = crate::app::image_content_from_path(&path) {
+                            add_image_preview(&state_for_key.chat_container, &image);
+                            state_for_key.queue_image(image);
+                            add_note_message(
+                                &state_for_key.chat_container,
+                                "Dropped image attached to the next prompt.",
+                            );
+                            tui_for_key.request_render(false);
+                            continue;
+                        }
+                    }
+                    editor_for_key.insert(&text);
+                    refresh_autocomplete(&state_for_key, &editor_for_key);
+                    tui_for_key.request_render_reusing_scroll_content();
+                }
                 continue;
             };
             // Drop releases but preserve Repeat so holding arrows, Backspace,
@@ -5122,6 +5174,29 @@ pub async fn interactive_tui(
                 continue;
             }
 
+            // Ctrl+V (or a configured paste-image key) keeps normal text yank
+            // behavior when the clipboard has no bitmap, but queues an image
+            // for the next prompt when one is available.
+            if keybinding_matches(
+                &keybindings_for_key,
+                &key,
+                rpi_tui::keybindings::keys::PASTE_IMAGE,
+            ) {
+                match read_clipboard_image() {
+                    Ok(Some(image)) => {
+                        add_image_preview(&state_for_key.chat_container, &image);
+                        state_for_key.queue_image(image);
+                        add_note_message(
+                            &state_for_key.chat_container,
+                            "Clipboard image attached to the next prompt.",
+                        );
+                        tui_for_key.request_render(false);
+                        continue;
+                    }
+                    Ok(None) | Err(_) => {}
+                }
+            }
+
             // 3. Ctrl+L: open the model selector. Routed through the `/model`
             //    command so the hotkey and the slash command share one path
             //    (TS binds Ctrl+L to model-select).
@@ -5281,6 +5356,13 @@ pub async fn interactive_tui(
                 // editor state safely there; clearing here, on the async loop,
                 // keeps it on one thread).
                 editor.clear();
+                let prompt_images = state.take_pending_images();
+                if !prompt_images.is_empty() {
+                    add_note_message(
+                        &chat_container,
+                        &format!("Attached {} image(s) to this prompt.", prompt_images.len()),
+                    );
+                }
                 run_prompt_streaming(
                     &lane,
                     &prompt,
@@ -5290,7 +5372,7 @@ pub async fn interactive_tui(
                     reload_context.js_extension_session.as_ref(),
                     &js_dialog_bridge,
                     args,
-                    Vec::new(),
+                    prompt_images,
                 )
                 .await;
             }
@@ -5772,6 +5854,55 @@ fn copy_to_clipboard(text: &str) -> bool {
 #[cfg(not(feature = "clipboard"))]
 fn copy_to_clipboard(_text: &str) -> bool {
     false
+}
+
+/// Read a clipboard bitmap and normalize it to PNG for the provider-neutral
+/// `ImageContent` contract. The optional clipboard feature keeps headless
+/// builds free of platform clipboard dependencies.
+#[cfg(feature = "clipboard")]
+fn read_clipboard_image() -> Result<Option<rpi_ai::types::ImageContent>, String> {
+    let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    let image = match clipboard.get_image() {
+        Ok(image) => image,
+        Err(_) => return Ok(None),
+    };
+    let width =
+        u32::try_from(image.width).map_err(|_| "clipboard image is too wide".to_string())?;
+    let height =
+        u32::try_from(image.height).map_err(|_| "clipboard image is too tall".to_string())?;
+    if width == 0 || height == 0 || width > 16_384 || height > 16_384 {
+        return Err("clipboard image dimensions are outside the supported range".into());
+    }
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut bytes, width, height);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
+        writer
+            .write_image_data(&image.bytes)
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(Some(rpi_ai::types::ImageContent {
+        kind: rpi_ai::types::ImageContentType,
+        data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        mime_type: "image/png".into(),
+    }))
+}
+
+fn add_image_preview(chat: &Arc<Container>, image: &rpi_ai::types::ImageContent) {
+    if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(&image.data) {
+        let mut options = ImageOptions::default();
+        options.width = Some(48);
+        options.alt_text = Some("Attached image".into());
+        chat.add_child(Arc::new(Image::from_data(bytes, options)));
+        chat.add_child(Arc::new(Spacer::new(1)));
+    }
+}
+
+#[cfg(not(feature = "clipboard"))]
+fn read_clipboard_image() -> Result<Option<rpi_ai::types::ImageContent>, String> {
+    Ok(None)
 }
 
 /// Blocking fallback (no `event_rx`): render the final assistant text as a
@@ -7059,10 +7190,15 @@ fn render_autocomplete(state: &Arc<TuiState>, suggestions: Option<AutocompleteSu
         return;
     }
     // Build a compact list: top item marked with `→`, rest with `  `.
-    // Cap at 5 lines so the dock doesn't swallow the transcript.
+    // Cap the list so the dock doesn't swallow the transcript.
     let accent = state.theme_manager.get().colors.accent;
     let muted = state.theme_manager.get().colors.muted;
-    for (i, item) in sugg.items.iter().take(5).enumerate() {
+    for (i, item) in sugg
+        .items
+        .iter()
+        .take(state.autocomplete_max_visible)
+        .enumerate()
+    {
         let prefix = if i == 0 { "→ " } else { "  " };
         let label = item.display_text();
         let line = if i == 0 {
@@ -7865,6 +8001,7 @@ mod tests {
             themes_enabled: true,
             hide_thinking: std::sync::Mutex::new(false),
             tool_outputs_expanded: std::sync::Mutex::new(false),
+            show_terminal_progress: true,
             status: std::sync::Mutex::new(RunStatus::Idle),
             js_preparation_cancel: std::sync::Mutex::new(None),
             footer: Arc::new(FooterComponent::new()),
@@ -7878,6 +8015,8 @@ mod tests {
             active_extension_cancel: std::sync::Mutex::new(None),
             autocomplete: AutocompleteManager::new(),
             autocomplete_container: Arc::new(Container::new()),
+            autocomplete_max_visible: 5,
+            pending_images: std::sync::Mutex::new(Vec::new()),
             theme_manager: Arc::new(ThemeManager::new()),
             tui: None,
             current_model_id: std::sync::Mutex::new(String::new()),
@@ -8186,6 +8325,7 @@ mod tests {
             themes_enabled: true,
             hide_thinking: std::sync::Mutex::new(false),
             tool_outputs_expanded: std::sync::Mutex::new(false),
+            show_terminal_progress: true,
             status: std::sync::Mutex::new(RunStatus::Idle),
             js_preparation_cancel: std::sync::Mutex::new(None),
             footer: Arc::new(FooterComponent::new()),
@@ -8199,6 +8339,8 @@ mod tests {
             active_extension_cancel: std::sync::Mutex::new(None),
             autocomplete: AutocompleteManager::new(),
             autocomplete_container: Arc::new(Container::new()),
+            autocomplete_max_visible: 5,
+            pending_images: std::sync::Mutex::new(Vec::new()),
             theme_manager: Arc::new(ThemeManager::new()),
             tui: None,
             current_model_id: std::sync::Mutex::new(String::new()),
@@ -8251,6 +8393,7 @@ mod tests {
             themes_enabled: true,
             hide_thinking: std::sync::Mutex::new(false),
             tool_outputs_expanded: std::sync::Mutex::new(false),
+            show_terminal_progress: true,
             status: std::sync::Mutex::new(RunStatus::Idle),
             js_preparation_cancel: std::sync::Mutex::new(None),
             footer: Arc::new(FooterComponent::new()),
@@ -8264,6 +8407,8 @@ mod tests {
             active_extension_cancel: std::sync::Mutex::new(None),
             autocomplete: AutocompleteManager::new(),
             autocomplete_container: Arc::new(Container::new()),
+            autocomplete_max_visible: 5,
+            pending_images: std::sync::Mutex::new(Vec::new()),
             theme_manager: Arc::new(ThemeManager::new()),
             tui: None,
             current_model_id: std::sync::Mutex::new(String::new()),
@@ -8319,6 +8464,7 @@ mod tests {
             themes_enabled: true,
             hide_thinking: std::sync::Mutex::new(false),
             tool_outputs_expanded: std::sync::Mutex::new(false),
+            show_terminal_progress: true,
             status: std::sync::Mutex::new(RunStatus::Idle),
             js_preparation_cancel: std::sync::Mutex::new(None),
             footer: Arc::new(FooterComponent::new()),
@@ -8332,6 +8478,8 @@ mod tests {
             active_extension_cancel: std::sync::Mutex::new(None),
             autocomplete: AutocompleteManager::new(),
             autocomplete_container: Arc::new(Container::new()),
+            autocomplete_max_visible: 5,
+            pending_images: std::sync::Mutex::new(Vec::new()),
             theme_manager: Arc::new(ThemeManager::new()),
             tui: None,
             current_model_id: std::sync::Mutex::new(String::new()),
@@ -8390,6 +8538,7 @@ mod tests {
             themes_enabled: true,
             hide_thinking: std::sync::Mutex::new(false),
             tool_outputs_expanded: std::sync::Mutex::new(false),
+            show_terminal_progress: true,
             status: std::sync::Mutex::new(RunStatus::Idle),
             js_preparation_cancel: std::sync::Mutex::new(None),
             footer: Arc::new(FooterComponent::new()),
@@ -8403,6 +8552,8 @@ mod tests {
             active_extension_cancel: std::sync::Mutex::new(None),
             autocomplete: AutocompleteManager::new(),
             autocomplete_container: Arc::new(Container::new()),
+            autocomplete_max_visible: 5,
+            pending_images: std::sync::Mutex::new(Vec::new()),
             theme_manager: Arc::new(ThemeManager::new()),
             tui: None,
             current_model_id: std::sync::Mutex::new(String::new()),

@@ -58,6 +58,7 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4", "v7"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
 base64 = "0.22"
+png = "0.18"
 tempfile = "3"
 regex = "1"
 globset = "0.4"

@@ -62,6 +62,21 @@ pub struct Settings {
     /// Native Pi defaults this to `tree`; `none` disables the gesture.
     #[serde(default)]
     pub double_escape_action: Option<String>,
+    /// Hide the body of thinking blocks while retaining a compact label.
+    #[serde(default)]
+    pub hide_thinking_block: Option<bool>,
+    /// Suppress interactive startup notices and update checks.
+    #[serde(default)]
+    pub quiet_startup: Option<bool>,
+    /// Show the global terminal progress indicator while a run is active.
+    #[serde(default)]
+    pub show_terminal_progress: Option<bool>,
+    /// Horizontal editor padding in terminal columns.
+    #[serde(default)]
+    pub editor_padding_x: Option<usize>,
+    /// Maximum number of autocomplete rows shown above the editor.
+    #[serde(default)]
+    pub autocomplete_max_visible: Option<usize>,
 }
 
 /// Load `~/.rpi/agent/settings.json`. Missing file ⇒ `Settings::default()`
@@ -281,6 +296,41 @@ pub fn save_settings(settings: &Settings) -> Result<(), String> {
             obj.remove("doubleEscapeAction");
         }
     }
+    for (key, value) in [
+        (
+            "hideThinkingBlock",
+            settings.hide_thinking_block.map(serde_json::Value::Bool),
+        ),
+        (
+            "quietStartup",
+            settings.quiet_startup.map(serde_json::Value::Bool),
+        ),
+        (
+            "showTerminalProgress",
+            settings.show_terminal_progress.map(serde_json::Value::Bool),
+        ),
+        (
+            "editorPaddingX",
+            settings
+                .editor_padding_x
+                .map(|v| serde_json::Value::Number(v.into())),
+        ),
+        (
+            "autocompleteMaxVisible",
+            settings
+                .autocomplete_max_visible
+                .map(|v| serde_json::Value::Number(v.into())),
+        ),
+    ] {
+        match value {
+            Some(value) => {
+                obj.insert(key.to_string(), value);
+            }
+            None => {
+                obj.remove(key);
+            }
+        }
+    }
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -349,6 +399,10 @@ mod tests {
                 "defaultThinkingLevel": "high",
                 "theme": "dark",
                 "hideThinkingBlock": true,
+                "quietStartup": true,
+                "showTerminalProgress": false,
+                "editorPaddingX": 3,
+                "autocompleteMaxVisible": 7,
                 "compaction": { "threshold": 100 },
                 "packages": ["some-pkg"]
             }"#,
@@ -360,6 +414,11 @@ mod tests {
         assert_eq!(s.default_thinking_level.as_deref(), Some("high"));
         assert_eq!(s.theme.as_deref(), Some("dark"));
         assert_eq!(s.packages, Some(vec!["some-pkg".to_string()]));
+        assert_eq!(s.hide_thinking_block, Some(true));
+        assert_eq!(s.quiet_startup, Some(true));
+        assert_eq!(s.show_terminal_progress, Some(false));
+        assert_eq!(s.editor_padding_x, Some(3));
+        assert_eq!(s.autocomplete_max_visible, Some(7));
     }
 
     #[test]

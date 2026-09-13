@@ -176,6 +176,13 @@ impl Keybindings {
                 description: Some("Cycle thinking level"),
             },
         );
+        map.insert(
+            "app.clipboard.pasteImage",
+            KeybindingDefinition {
+                default_keys: vec![KeyCombo::new(Char('v'), M::CONTROL)],
+                description: Some("Paste image from clipboard"),
+            },
+        );
 
         // Editor navigation and editing
         map.insert(
@@ -685,6 +692,7 @@ pub mod keys {
     pub const THINKING_TOGGLE: KeybindingId = "app.thinking.toggle";
     pub const EXTERNAL_EDITOR: KeybindingId = "app.editor.external";
     pub const THINKING_CYCLE: KeybindingId = "app.thinking.cycle";
+    pub const PASTE_IMAGE: KeybindingId = "app.clipboard.pasteImage";
 
     // Editor
     pub const CURSOR_UP: KeybindingId = "tui.editor.cursorUp";

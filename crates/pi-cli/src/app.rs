@@ -220,7 +220,12 @@ pub async fn run() -> i32 {
     // Update checks are interactive-only and best-effort. They write to
     // stderr so print/JSON modes remain machine-readable, and the checker
     // itself uses a short timeout plus a cache.
-    if !parsed.offline
+    let quiet_startup = crate::settings::load_settings()
+        .ok()
+        .and_then(|settings| settings.quiet_startup)
+        .unwrap_or(false);
+    if !quiet_startup
+        && !parsed.offline
         && !parsed.print
         && std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal()
@@ -620,12 +625,8 @@ fn process_file_args(
         }
         let bytes = std::fs::read(&abs)
             .map_err(|e| format!("could not read file {}: {e}", abs.display()))?;
-        if let Some(mime_type) = rpi_tools::detect_supported_image_mime_type(&bytes) {
-            images.push(ImageContent {
-                kind: ImageContentType,
-                data: rpi_tools::encode_base64(&bytes),
-                mime_type: mime_type.to_string(),
-            });
+        if let Some(image) = image_content_from_bytes(&bytes) {
+            images.push(image);
         } else {
             let content = String::from_utf8(bytes).map_err(|_| {
                 format!(
@@ -641,6 +642,21 @@ fn process_file_args(
         }
     }
     Ok((text, images))
+}
+
+pub(crate) fn image_content_from_path(path: &Path) -> Result<Option<ImageContent>, String> {
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("could not read file {}: {e}", path.display()))?;
+    Ok(image_content_from_bytes(&bytes))
+}
+
+fn image_content_from_bytes(bytes: &[u8]) -> Option<ImageContent> {
+    let mime_type = rpi_tools::detect_supported_image_mime_type(bytes)?;
+    Some(ImageContent {
+        kind: ImageContentType,
+        data: rpi_tools::encode_base64(bytes),
+        mime_type: mime_type.to_string(),
+    })
 }
 
 /// Build the initial prompt + the remaining extra messages. Mirrors TS
@@ -757,5 +773,17 @@ mod tests {
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].mime_type, "image/png");
         assert!(!images[0].data.is_empty());
+    }
+
+    #[test]
+    fn image_content_from_path_reports_supported_mime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("drop.png");
+        let mut png = vec![137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13];
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&[0; 13]);
+        std::fs::write(&path, png).unwrap();
+        let image = image_content_from_path(&path).unwrap().unwrap();
+        assert_eq!(image.mime_type, "image/png");
     }
 }

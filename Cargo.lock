@@ -1725,6 +1725,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "futures",
+ "png",
  "reqwest",
  "rpassword",
  "rpi-agent",
