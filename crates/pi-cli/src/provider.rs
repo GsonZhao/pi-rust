@@ -58,15 +58,14 @@
 //!    source of "got the wrong model" bugs — documented as a divergence in
 //!    `docs/m6-cli-open-questions.md`).
 //! 5. No `--model` ⇒ [`pick_default_model`]:
-//!    (a) the built-in default ([`DEFAULT_MODEL_ID`] = `claude-sonnet-5`) if it
-//!    is already authenticated (has a folded Bearer, or the provider holds an
-//!    `x-api-key`); otherwise (b) the **first authenticated model** in the
-//!    catalog — mirroring the TS `findInitialModel` step-4 fallback
-//!    `availableModels[0]` over the auth-filtered snapshot. This lets a
+//!    (a) scan native Pi's `defaultModelPerProvider` entries in their declared
+//!    order and take the first authenticated match; otherwise (b) take the
+//!    **first authenticated model** in the catalog — mirroring the TS
+//!    `findInitialModel` fallback over `availableModels`. This lets a
 //!    `models.json`-only gateway config "just work": the built-in Anthropic
 //!    models carry no auth, so the gateway model (the only authenticated one)
 //!    is picked. The all-builtin/no-custom-code default (`ANTHROPIC_API_KEY`
-//!    path) still selects `claude-sonnet-5`. Last resort falls back to
+//!    path) selects `claude-opus-4-8`. Last resort falls back to
 //!    [`DEFAULT_MODEL_ID`] (or the catalog head) — unreachable in practice
 //!    because the auth gate refuses an unauthed catalog earlier.
 //!
@@ -86,10 +85,58 @@ use crate::args::parse_thinking_level;
 use crate::config::{self, Credential, DEFAULT_PROVIDER_ID};
 use crate::settings;
 
-/// The v1-default model id when `--model` is absent. Mirrors the TS
-/// `defaultModelPerProvider["anthropic"]` (the first current-generation
-/// reasoning model in the catalog).
-pub const DEFAULT_MODEL_ID: &str = "claude-sonnet-5";
+/// The default Anthropic model when `--model` is absent. Kept in sync with the
+/// current native Pi `defaultModelPerProvider.anthropic` entry.
+pub const DEFAULT_MODEL_ID: &str = "claude-opus-4-8";
+
+/// Native Pi checks these provider defaults in declaration order before it
+/// falls back to `availableModels[0]`. Configured providers using one of rpi's
+/// supported wire protocols participate too, even when they are not built in.
+const DEFAULT_MODELS_PER_PROVIDER: &[(&str, &str)] = &[
+    ("amazon-bedrock", "us.anthropic.claude-opus-4-6-v1"),
+    ("ant-ling", "Ring-2.6-1T"),
+    ("anthropic", DEFAULT_MODEL_ID),
+    ("openai", "gpt-5.5"),
+    ("azure-openai-responses", "gpt-5.4"),
+    ("openai-codex", "gpt-5.5"),
+    ("radius", "auto"),
+    ("nvidia", "nvidia/nemotron-3-super-120b-a12b"),
+    ("deepseek", "deepseek-v4-pro"),
+    ("google", "gemini-3.1-pro-preview"),
+    ("google-vertex", "gemini-3.1-pro-preview"),
+    ("github-copilot", "gpt-5.4"),
+    ("openrouter", "moonshotai/kimi-k2.6"),
+    ("vercel-ai-gateway", "zai/glm-5.1"),
+    ("xai", "grok-4.6"),
+    ("groq", "openai/gpt-oss-120b"),
+    ("cerebras", "gpt-oss-120b"),
+    ("zai", "glm-5.3"),
+    ("zai-coding-cn", "glm-5.3"),
+    ("mistral", "devstral-medium-latest"),
+    ("minimax", "MiniMax-M2.7"),
+    ("minimax-cn", "MiniMax-M2.7"),
+    ("moonshotai", "kimi-k2.6"),
+    ("moonshotai-cn", "kimi-k2.6"),
+    ("huggingface", "moonshotai/Kimi-K2.6"),
+    ("fireworks", "accounts/fireworks/models/kimi-k2p6"),
+    ("together", "moonshotai/Kimi-K2.6"),
+    ("baseten", "zai-org/GLM-5.2"),
+    ("opencode", "kimi-k2.6"),
+    ("opencode-go", "kimi-k2.6"),
+    ("kimi-coding", "kimi-for-coding"),
+    ("cloudflare-workers-ai", "@cf/moonshotai/kimi-k2.6"),
+    (
+        "cloudflare-ai-gateway",
+        "workers-ai/@cf/moonshotai/kimi-k2.6",
+    ),
+    ("qwen-token-plan", "qwen3.7-max"),
+    ("qwen-token-plan-cn", "qwen3.7-max"),
+    ("qwen-token-plan-individual", "qwen3.8-max"),
+    ("xiaomi", "mimo-v2.5-pro"),
+    ("xiaomi-token-plan-cn", "mimo-v2.5-pro"),
+    ("xiaomi-token-plan-ams", "mimo-v2.5-pro"),
+    ("xiaomi-token-plan-sgp", "mimo-v2.5-pro"),
+];
 
 /// The default thinking level when neither `--thinking` nor a `:level` suffix
 /// is present. Mirrors the TS `DEFAULT_THINKING_LEVEL` (`"medium"`, clamped to
@@ -497,6 +544,7 @@ pub fn resolve(
                 let thinking_level = cli_thinking.unwrap_or(DEFAULT_THINKING_LEVEL);
                 let model = pick_default_model(
                     &catalog,
+                    &models_cfg,
                     provider_key.is_some(),
                     openai_provider_key.is_some(),
                 );
@@ -793,6 +841,29 @@ fn provider_matches(model: &Model, requested: &str, cfg: &config::ModelsConfig) 
         .unwrap_or(false)
 }
 
+/// Provider identity matching for native Pi's default-model table. Unlike the
+/// CLI matcher, this intentionally does not treat `openai` as a protocol alias:
+/// a default belonging to OpenAI must not select the same model id from an
+/// unrelated OpenAI-compatible gateway.
+fn model_belongs_to_default_provider(
+    model: &Model,
+    requested: &str,
+    cfg: &config::ModelsConfig,
+) -> bool {
+    if model.provider.eq_ignore_ascii_case(requested) {
+        return true;
+    }
+    cfg.providers
+        .iter()
+        .find(|(id, _)| id.eq_ignore_ascii_case(requested))
+        .and_then(|(_, provider)| config::provider_to_models(requested, provider))
+        .is_some_and(|configured| {
+            configured.iter().any(|candidate| {
+                candidate.api == model.api && candidate.id.eq_ignore_ascii_case(&model.id)
+            })
+        })
+}
+
 /// Whether a catalog model is "configured-auth" — i.e. the request built for it
 /// would pass `assertRequestAuth` and not return "No API key". Mirrors the TS
 /// `hasConfiguredAuth(providerId)` filter that `getAvailableSnapshot()` applies
@@ -839,27 +910,33 @@ fn model_has_header_auth(m: &Model) -> bool {
 
 /// Choose the default model when `--model` is absent. Mirrors upstream
 /// `findInitialModel` [`packages/coding-agent/src/core/model-resolver.ts`]:
-/// the built-in default (`claude-sonnet-5`) wins *if it has configured auth*;
-/// otherwise fall back to the first authed model in the catalog (the TS
-/// `availableModels[0]` when no `defaultModelPerProvider` entry matches — e.g.
-/// a `~/.rpi/models.json` gateway is the only configured endpoint). This fixes
-/// the gateway-only case where the old hard-coded `claude-sonnet-5` default
-/// carried a gateway Bearer to `api.anthropic.com` and 401'd.
+/// known-provider defaults are checked in native declaration order, followed by
+/// the first authenticated model in the catalog (`availableModels[0]`). This
+/// also keeps a models.json-only gateway from accidentally selecting an
+/// unauthenticated built-in model.
 ///
 /// `provider_key` is the resolved x-api-key (`Some` on the `--api-key`/
 /// auth.json/`ANTHROPIC_API_KEY` path; `None` on the Bearer path). It is passed
 /// in (not read from a field) because the auth decision is local to `resolve`.
-fn pick_default_model(catalog: &[Model], has_anthropic_key: bool, has_openai_key: bool) -> Model {
-    // 1. Built-in default, when it is authed — preserves the standard
-    //    `ANTHROPIC_API_KEY`/`auth.json` behavior (claude-sonnet-5).
-    if let Some(m) = catalog
-        .iter()
-        .find(|m| m.id.eq_ignore_ascii_case(DEFAULT_MODEL_ID))
-        .filter(|m| model_is_authed_for_resolution(m, has_anthropic_key, has_openai_key))
-    {
-        return m.clone();
+fn pick_default_model(
+    catalog: &[Model],
+    models_cfg: &config::ModelsConfig,
+    has_anthropic_key: bool,
+    has_openai_key: bool,
+) -> Model {
+    // 1. Native Pi's known-provider defaults, in its declared priority order.
+    for (provider, model_id) in DEFAULT_MODELS_PER_PROVIDER {
+        if let Some(model) = catalog.iter().find(|model| {
+            model.id.eq_ignore_ascii_case(model_id)
+                && model_belongs_to_default_provider(model, provider, models_cfg)
+                && model_is_authed_for_resolution(model, has_anthropic_key, has_openai_key)
+        }) {
+            return model.clone();
+        }
     }
-    // 2. First authed model (TS `availableModels[0]`). In a gateway-only setup
+
+    // 2. First authed model (TS `availableModels[0]`). Provider and model array
+    //    declaration order is preserved while loading models.json.
     //    this is the gateway model (Bearer folded onto it, base_url = gateway).
     if let Some(m) = catalog
         .iter()
@@ -867,7 +944,7 @@ fn pick_default_model(catalog: &[Model], has_anthropic_key: bool, has_openai_key
     {
         return m.clone();
     }
-    // 3. Last resort: the built-in default, authed or not. The auth gate above
+    // 3. Last resort: the built-in Anthropic default, authed or not. The auth gate above
     //    already errored when no source resolved, so reaching here means *some*
     //    auth exists but none folded/attached to a model we can see — keep the
     //    historical default to avoid a NoMatch surprise.
@@ -955,7 +1032,7 @@ mod tests {
     }
 
     #[test]
-    fn default_model_is_sonnet_5() {
+    fn default_model_matches_native_anthropic_default() {
         let r = resolve_with_key(None, None, None).unwrap();
         assert_eq!(r.model.id, DEFAULT_MODEL_ID);
         assert_eq!(r.thinking_level, DEFAULT_THINKING_LEVEL);
@@ -965,7 +1042,7 @@ mod tests {
     #[test]
     fn settings_default_model_wins_when_authed() {
         // A copied pi `settings.json` carrying `defaultModel` (step 3 of pi's
-        // `findInitialModel`) overrides the built-in `claude-sonnet-5` default
+        // `findInitialModel`) overrides the built-in Anthropic default
         // when that model is in the catalog and authed. Mirrors the on-disk-
         // parity goal: drop a `.pi/agent/` dir at `~/.rpi/agent/` and the saved
         // default comes alive on launch (no `--model` needed).
@@ -1625,7 +1702,7 @@ mod tests {
     /// pi's `findInitialModel` step-3 applies `defaultModelPerProvider`
     /// regardless of provider id. Without this, enabling a second gateway
     /// flips the no-`--model` default to the FIRST authed model in catalog
-    /// order (BTreeMap sorts provider ids), not the user's saved choice.
+    /// order, not the user's saved choice.
     #[test]
     fn settings_default_model_honored_for_models_json_provider() {
         let _env = TestEnv::new();
@@ -1649,24 +1726,82 @@ mod tests {
 }"#,
         )
         .unwrap();
-        // Saved default points at the BETA gateway's model — even though
-        // "alpha-gw" sorts first and would win first-authed without the
-        // settings arm.
+        // Saved default points at the ALPHA gateway's model even though
+        // "beta-gw" is declared first and would win first-authed without the
+        // settings arm, matching native Pi's Object.entries order.
         std::fs::write(
             config::settings_path().unwrap(),
-            r#"{"defaultProvider":"beta-gw","defaultModel":"beta-model"}"#,
+            r#"{"defaultProvider":"alpha-gw","defaultModel":"alpha-model"}"#,
         )
         .unwrap();
         let r = resolve(None, None, None, None, None).unwrap();
-        assert_eq!(r.model.id, "beta-model");
-        // An unknown provider id falls through to first-authed (alpha-gw).
+        assert_eq!(r.model.id, "alpha-model");
+        // An unknown provider id falls through to first-authed (beta-gw).
         std::fs::write(
             config::settings_path().unwrap(),
             r#"{"defaultProvider":"not-a-provider","defaultModel":"beta-model"}"#,
         )
         .unwrap();
         let r = resolve(None, None, None, None, None).unwrap();
-        assert_eq!(r.model.id, "alpha-model");
+        assert_eq!(r.model.id, "beta-model");
+    }
+
+    #[test]
+    fn models_json_fallback_preserves_provider_and_model_declaration_order() {
+        let _env = TestEnv::new();
+        std::fs::write(
+            config::models_path().unwrap(),
+            r#"{
+  "providers": {
+    "routeryo-copy": {
+      "api": "openai-completions",
+      "baseUrl": "https://router.example.com/v1",
+      "apiKey": "router-key",
+      "models": [
+        { "id": "gpt-5.6-sol" },
+        { "id": "gpt-5.6-terra" }
+      ]
+    },
+    "alpha-gw": {
+      "api": "openai-completions",
+      "baseUrl": "https://alpha.example.com/v1",
+      "apiKey": "alpha-key",
+      "models": [ { "id": "alpha-model" } ]
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let resolved = resolve(None, None, None, None, None).unwrap();
+        assert_eq!(resolved.model.provider, "routeryo-copy");
+        assert_eq!(resolved.model.id, "gpt-5.6-sol");
+    }
+
+    #[test]
+    fn native_known_provider_default_beats_first_model_in_array() {
+        let _env = TestEnv::new();
+        std::fs::write(
+            config::models_path().unwrap(),
+            r#"{
+  "providers": {
+    "deepseek": {
+      "api": "openai-completions",
+      "baseUrl": "https://api.deepseek.com",
+      "apiKey": "deepseek-key",
+      "models": [
+        { "id": "deepseek-chat" },
+        { "id": "deepseek-v4-pro" }
+      ]
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let resolved = resolve(None, None, None, None, None).unwrap();
+        assert_eq!(resolved.model.provider, "deepseek");
+        assert_eq!(resolved.model.id, "deepseek-v4-pro");
     }
 
     /// The `/model` selector catalog (`available_catalog`) is auth-filtered —

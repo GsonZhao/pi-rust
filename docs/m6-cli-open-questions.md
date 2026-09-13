@@ -314,15 +314,18 @@ which is what makes a copied pi `settings.json`'s `defaultModel` come alive
 on launch. The precedence (`provider.rs::resolve` None-branch):
 
 1. **Saved settings default** (pi step 3): if `~/.rpi/agent/settings.json`
-   has `defaultProvider` = `"anthropic"` (or absent — v1 is anthropic-only)
-   **and** `defaultModel`, and that model is in the catalog **and authed**,
+   has a known `defaultProvider` **and** `defaultModel`, and that model is in
+   the catalog **and authed**,
    select it (honoring `defaultThinkingLevel`). This is the on-disk-parity
    path — drop a pi `settings.json` at `~/.rpi/agent/` and the saved default
    wins without `--model`.
-2. **Built-in default** `claude-sonnet-5` if it is *already authenticated*
-   (pi step 4 / `defaultModelPerProvider`; v1 keeps `claude-sonnet-5` vs
-   pi's `claude-opus-4-8` as a deliberate divergence).
-3. **First authenticated model** in the catalog (TS `availableModels[0]`).
+2. **Known-provider default** (pi step 4 / `defaultModelPerProvider`): scan the
+   native Pi provider-default table in declaration order and select the first
+   authenticated model that exists. The Anthropic default is
+   `claude-opus-4-8`.
+3. **First authenticated model** in the catalog (TS `availableModels[0]`). rpi
+   preserves the declaration order of `models.json.providers` and every
+   provider's `models` array, matching JavaScript `Object.entries` ordering.
 
 A model is "authenticated" when it carries an auth-owned header (a folded
 Bearer — see `Auth source → fold scope` below) or the provider holds a
@@ -343,8 +346,8 @@ M6-followup F (see `rpi-config-auth-bearer` notes).
 | Bearer source | Fold scope | Default picks |
 |---|---|---|
 | `~/.rpi/models.json` gateway (`authHeader:true`+`apiKey`) | gateway models only (`base_url` ≠ Anthropic, or a `--base-url` override is active) | the gateway model |
-| `ANTHROPIC_AUTH_TOKEN` env | **every** model (a global credential for the configured endpoint) | `claude-sonnet-5` |
-| `--api-key` / `auth.json` / `ANTHROPIC_API_KEY` (x-api-key path) | no Bearer at all (auth rides on the provider key) | `claude-sonnet-5` |
+| `ANTHROPIC_AUTH_TOKEN` env | **every** model (a global credential for the configured endpoint) | `claude-opus-4-8` |
+| `--api-key` / `auth.json` / `ANTHROPIC_API_KEY` (x-api-key path) | no Bearer at all (auth rides on the provider key) | `claude-opus-4-8` |
 
 Why two fold scopes: a `models.json` gateway key is endpoint-specific (the
 DashScope key only works against DashScope), so it must not ride on built-in

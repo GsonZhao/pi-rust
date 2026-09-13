@@ -279,8 +279,8 @@ native pi does — the first *authenticated* model in the catalog when the
 built-in default isn't authenticated. So a `models.json`-only Anthropic or
 OpenAI gateway setup "just works": the gateway model is the only authenticated
 one, so `rpi -p "hi"` routes through it — no `--model` needed. With a standard
-`ANTHROPIC_API_KEY`/`auth.json`/`--api-key` setup, the built-in
-`claude-sonnet-5` remains the default.
+`ANTHROPIC_API_KEY`/`auth.json`/`--api-key` setup, the native Pi default
+`claude-opus-4-8` is selected when available.
 See
 [docs/m6-cli-open-questions.md §4–5](docs/m6-cli-open-questions.md) for the
 full auth precedence, the default-selection rule, the `~/.rpi`-flat-vs-nested

@@ -290,7 +290,9 @@ pub fn delete_credential(provider_id: &str) -> Result<bool, ConfigError> {
 #[serde(rename_all = "camelCase")]
 pub struct ModelsConfig {
     #[serde(default)]
-    pub providers: BTreeMap<String, ProviderConfig>,
+    // Native Pi walks Object.entries(config.providers), so declaration order
+    // participates in the final available-model fallback.
+    pub providers: indexmap::IndexMap<String, ProviderConfig>,
 }
 
 /// A provider entry in `models.json`. The fields mirror the TS `ProviderConfig`

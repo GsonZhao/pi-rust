@@ -42,6 +42,7 @@ futures = "0.3"
 # Serialization / schemas
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
+indexmap = { version = "2", features = ["serde"] }
 schemars = { version = "0.8", features = ["preserve_order"] }
 jsonschema = "0.18"
 
