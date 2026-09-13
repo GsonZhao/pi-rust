@@ -31,6 +31,8 @@ hardening provider streaming and extension startup behavior.
   dependency graph are both verified with the 1.78 toolchain.
 - Timing-sensitive custom UI tests now wait for asynchronous Node protocol
   actions under parallel test load.
+- The published `rpi-cli` crate now carries its embedded documentation inside
+  the package, so the crates.io tarball builds independently of the workspace.
 
 ## Install
 

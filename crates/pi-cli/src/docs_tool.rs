@@ -31,37 +31,37 @@ static DOCS: &[DocPage] = &[
     DocPage {
         topic: "authoring",
         description: "创建 Pi JS/TS package 与 Rust cdylib 扩展的模板、开发流程、安全边界、测试和发布最佳实践",
-        content: include_str!("../../../docs/extension-authoring.md"),
+        content: include_str!("../embedded-docs/extension-authoring.md"),
         aliases: &["package-authoring", "extension-authoring", "create-package", "create-extension"],
     },
     DocPage {
         topic: "guide",
         description: "完整使用手册：安装、模型、CLI、.rpi 资源、Pi package、扩展、SDK、排错和发布",
-        content: include_str!("../../../docs/user-guide.md"),
+        content: include_str!("../embedded-docs/user-guide.md"),
         aliases: &["manual", "user-guide", "cli", "quickstart"],
     },
     DocPage {
         topic: "overview",
         description: "rpi installation, built-in tools, configuration, packages, and release basics",
-        content: include_str!("../../../README.md"),
+        content: include_str!("../embedded-docs/README.md"),
         aliases: &["readme", "getting-started", "start", "usage"],
     },
     DocPage {
         topic: "extensions",
         description: "Rust plugins, Pi JavaScript/TypeScript extensions, runtime capabilities, and UI compatibility",
-        content: include_str!("../../../docs/extension-backends.md"),
+        content: include_str!("../embedded-docs/extension-backends.md"),
         aliases: &["plugin", "plugins", "extension", "js", "typescript", "ts"],
     },
     DocPage {
         topic: "architecture",
         description: "rpi crate layering, agent loop, provider, harness, sessions, and extension boundaries",
-        content: include_str!("../../../docs/architecture.md"),
+        content: include_str!("../embedded-docs/architecture.md"),
         aliases: &["design", "crates", "sdk"],
     },
     DocPage {
         topic: "compatibility",
         description: "known Pi parity decisions, resource precedence, and remaining compatibility notes",
-        content: include_str!("../../../docs/m6-cli-open-questions.md"),
+        content: include_str!("../embedded-docs/m6-cli-open-questions.md"),
         aliases: &["pi", "parity", "migration"],
     },
 ];
