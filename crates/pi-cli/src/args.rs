@@ -11,7 +11,7 @@
 //!
 //! Divergences from the TS parser (all deliberate v1 scope cuts, documented in
 //! `docs/m6-cli-open-questions.md`):
-//! - `--mode rpc`, `--tui-mode`, `--export`, `--list-models`,
+//! - `--mode rpc`, `--tui-mode`, `--export`,
 //!   `--fork`, `--offline`, `--approve`/`-na`,
 //!   `--extension`/`-e`, `--skill`, and `--prompt-template` are recognized but
 //!   not all wired into the full TS package manager. The supported resource
@@ -56,6 +56,10 @@ pub struct Args {
 
     pub print: bool,
     pub mode: Mode,
+
+    /// `--list-models [search]`: list the merged model catalog and exit.
+    /// `Some("")` represents the bare flag; `None` means absent.
+    pub list_models: Option<String>,
 
     pub continue_session: bool,
     pub resume: bool,
@@ -338,6 +342,20 @@ pub fn parse_args(args: &[String]) -> Args {
                     result.exclude_tools = Some(split_csv(&v));
                 }
             }
+            "--list-models" => {
+                // Optionally consumes a search term, matching the native
+                // parser's bare-flag versus string distinction.
+                let mut search = inline.clone().unwrap_or_default();
+                if inline.is_none()
+                    && i + 1 < args.len()
+                    && !args[i + 1].starts_with('-')
+                    && !args[i + 1].starts_with('@')
+                {
+                    i += 1;
+                    search = args[i].clone();
+                }
+                result.list_models = Some(search);
+            }
             // ---- Recognized-but-ignored v1 scope cuts (warn, don't error) ----
             // `flag_key` has already had any `=value` peeled, so these match the
             // bare flag name even when the user wrote `--offline=1`.
@@ -377,19 +395,6 @@ pub fn parse_args(args: &[String]) -> Args {
             }
             "--theme" => {
                 result.theme = take_value(&mut result, "--theme");
-            }
-            "--list-models" => {
-                // Optionally consumes a search term.
-                if inline.is_none()
-                    && i + 1 < args.len()
-                    && !args[i + 1].starts_with('-')
-                    && !args[i + 1].starts_with('@')
-                {
-                    i += 1;
-                }
-                result
-                    .ignored
-                    .push("--list-models is not supported in v1 (ignored)".to_string());
             }
             // Unknown long flag (with or without `=`). `flag_key` already holds
             // the bare name, so both `--frobnicate` and `--frobnicate=x` land
@@ -484,6 +489,7 @@ pub fn print_help() {
   --append-system-prompt <text>  Append text to the system prompt (repeatable)
   --thinking <level>             off, minimal, low, medium, high, xhigh, max
   --mode <mode>                  Output mode: text (default), json, or rpc
+  --list-models [search]         List available models (with optional fuzzy search)
   --print, -p                    Non-interactive: process prompt(s) and exit
   --continue, -c                 Continue the most recent session
   --resume, -r                   Browse and select a session to resume
@@ -662,6 +668,21 @@ mod tests {
         );
         // The value is consumed, not read as a message:
         assert!(a.messages.is_empty());
+    }
+
+    #[test]
+    fn list_models_accepts_bare_and_search_forms() {
+        let bare = parse_args(&s(&["--list-models"]));
+        assert_eq!(bare.list_models.as_deref(), Some(""));
+        assert!(bare.ignored.is_empty());
+        assert!(bare.messages.is_empty());
+
+        let search = parse_args(&s(&["--list-models", "claude"]));
+        assert_eq!(search.list_models.as_deref(), Some("claude"));
+        assert!(search.messages.is_empty());
+
+        let inline = parse_args(&s(&["--list-models=gpt"]));
+        assert_eq!(inline.list_models.as_deref(), Some("gpt"));
     }
 
     #[test]

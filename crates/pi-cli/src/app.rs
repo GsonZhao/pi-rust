@@ -142,6 +142,14 @@ pub async fn run() -> i32 {
     // set (an explicit override is its own layout).
     let _ = crate::config::migrate_legacy_layout();
 
+    // `--list-models` is intentionally handled before credentials, session
+    // restoration, and harness construction. Native Pi exposes this as a
+    // catalog inspection command, so it must work for a newly installed user
+    // who has not authenticated yet.
+    if let Some(search) = parsed.list_models.as_deref() {
+        return list_models(search).await;
+    }
+
     // Build before provider resolution so compiler errors do not require
     // valid model credentials. The staged directory joins normal discovery.
     let dev_extension = if let Some(options) = &dev_options {
@@ -355,6 +363,89 @@ pub async fn run() -> i32 {
         dev.cleanup();
     }
     exit_code
+}
+
+/// Print the merged model catalog, optionally filtered by a case-insensitive
+/// fuzzy-ish substring over provider, id, and display name.
+async fn list_models(search: &str) -> i32 {
+    let catalog = match crate::provider::catalog_all() {
+        Ok(models) => models,
+        Err(error) => {
+            eprintln!("warning: could not load models.json: {error}");
+            Vec::new()
+        }
+    };
+    let needle = search.trim().to_ascii_lowercase();
+    let mut models: Vec<_> = catalog
+        .into_iter()
+        .filter(|model| {
+            needle.is_empty()
+                || format!("{} {} {}", model.provider, model.id, model.name)
+                    .to_ascii_lowercase()
+                    .contains(&needle)
+        })
+        .collect();
+    if models.is_empty() {
+        if needle.is_empty() {
+            println!("No models available");
+        } else {
+            println!("No models matching \"{search}\"");
+        }
+        return 0;
+    }
+
+    fn format_tokens(value: u64) -> String {
+        if value >= 1_000_000 {
+            let whole = value % 1_000_000 == 0;
+            if whole { format!("{}M", value / 1_000_000) } else { format!("{:.1}M", value as f64 / 1_000_000.0) }
+        } else if value >= 1_000 {
+            let whole = value % 1_000 == 0;
+            if whole { format!("{}K", value / 1_000) } else { format!("{:.1}K", value as f64 / 1_000.0) }
+        } else {
+            value.to_string()
+        }
+    }
+
+    let rows: Vec<_> = models
+        .drain(..)
+        .map(|model| {
+            let images = model
+                .input
+                .iter()
+                .any(|input| matches!(input, rpi_ai::InputModality::Image));
+            (
+                model.provider,
+                model.id,
+                format_tokens(model.context_window),
+                format_tokens(model.max_tokens),
+                if model.reasoning { "yes" } else { "no" }.to_string(),
+                if images { "yes" } else { "no" }.to_string(),
+            )
+        })
+        .collect();
+    let widths = (
+        rows.iter().map(|r| r.0.len()).max().unwrap_or(8).max(8),
+        rows.iter().map(|r| r.1.len()).max().unwrap_or(5).max(5),
+        rows.iter().map(|r| r.2.len()).max().unwrap_or(7).max(7),
+        rows.iter().map(|r| r.3.len()).max().unwrap_or(7).max(7),
+        rows.iter().map(|r| r.4.len()).max().unwrap_or(8).max(8),
+        rows.iter().map(|r| r.5.len()).max().unwrap_or(6).max(6),
+    );
+    println!(
+        "{:provider$}  {:model$}  {:context$}  {:max_out$}  {:thinking$}  {:images$}",
+        "provider", "model", "context", "max-out", "thinking", "images",
+        provider = widths.0, model = widths.1, context = widths.2,
+        max_out = widths.3, thinking = widths.4, images = widths.5,
+    );
+    for row in rows {
+        println!(
+            "{:provider$}  {:model$}  {:context$}  {:max_out$}  {:thinking$}  {:images$}",
+            row.0, row.1, row.2, row.3, row.4, row.5,
+            provider = widths.0, model = widths.1, context = widths.2,
+            max_out = widths.3, thinking = widths.4, images = widths.5,
+        );
+    }
+    0
 }
 
 /// Read piped stdin into a string. Mirrors TS `readPipedStdin`: returns `None`

@@ -609,6 +609,23 @@ pub fn available_catalog(resolved: &ResolvedModel) -> Vec<Model> {
         .collect()
 }
 
+/// Return the merged built-in + `models.json` catalog without requiring a
+/// credential or selecting a runnable model. This is used by CLI commands
+/// such as `--list-models`, which must remain useful before authentication.
+pub fn catalog_all() -> Result<Vec<Model>, config::ConfigError> {
+    let cfg = config::load_models_config()?;
+    let mut catalog = anthropic_models();
+    catalog.extend(openai_responses_models());
+    merge_user_catalog(&mut catalog, &cfg);
+    catalog.sort_by(|a, b| {
+        a.provider
+            .to_ascii_lowercase()
+            .cmp(&b.provider.to_ascii_lowercase())
+            .then_with(|| a.id.to_ascii_lowercase().cmp(&b.id.to_ascii_lowercase()))
+    });
+    Ok(catalog)
+}
+
 /// Merge `~/.rpi/models.json` providers into the built-in catalog. Models from
 /// the same runtime provider and API replace entries with the same id; models
 /// with the same id under different OpenAI-compatible providers remain
