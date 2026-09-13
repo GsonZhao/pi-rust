@@ -402,6 +402,16 @@ pub fn set_project_trust(cwd: &Path, trusted: Option<bool>) -> Result<(), Config
     Ok(())
 }
 
+/// Return the stored trust decision for `cwd`. A missing entry (or an entry
+/// explicitly set to `null`) returns `None`; callers choose their safe default.
+pub fn project_trust_decision(cwd: &Path) -> Result<Option<bool>, ConfigError> {
+    let key = std::fs::canonicalize(cwd)
+        .unwrap_or_else(|_| cwd.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    Ok(read_trust()?.get(&key).copied().flatten())
+}
+
 /// Parse the models JSON, tolerating `//` line comments (a minimal subset of
 /// upstream's `stripJsonComments`). Tries strict JSON first; on failure, strips
 /// `//…` to end-of-line and retries.

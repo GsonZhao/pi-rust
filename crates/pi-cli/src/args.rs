@@ -62,6 +62,9 @@ pub struct Args {
     pub list_models: Option<String>,
     /// `--offline`: disable best-effort startup network checks.
     pub offline: bool,
+    /// Explicit project trust override. `--approve` trusts the current
+    /// project; `--no-approve` keeps project-local resources disabled.
+    pub trust_override: Option<bool>,
 
     pub continue_session: bool,
     pub resume: bool,
@@ -359,6 +362,8 @@ pub fn parse_args(args: &[String]) -> Args {
                 result.list_models = Some(search);
             }
             "--offline" => result.offline = true,
+            "--approve" | "-a" => result.trust_override = Some(true),
+            "--no-approve" | "-na" => result.trust_override = Some(false),
             // ---- Recognized-but-ignored v1 scope cuts (warn, don't error) ----
             // `flag_key` has already had any `=value` peeled, so these match the
             // bare flag name even when the user wrote `--offline=1`.
@@ -375,10 +380,6 @@ pub fn parse_args(args: &[String]) -> Args {
                     "--models"
                         | "--export"
                         | "--tui-mode"
-                        | "--approve"
-                        | "-a"
-                        | "--no-approve"
-                        | "-na"
                         | "--no-themes"
                 ) =>
             {
@@ -493,6 +494,8 @@ pub fn print_help() {
   --mode <mode>                  Output mode: text (default), json, or rpc
   --list-models [search]         List available models (with optional fuzzy search)
   --offline                      Disable startup network checks
+  --approve, -a                  Trust the current project for local resources
+  --no-approve, -na              Do not trust the current project
   --print, -p                    Non-interactive: process prompt(s) and exit
   --continue, -c                 Continue the most recent session
   --resume, -r                   Browse and select a session to resume
@@ -693,6 +696,16 @@ mod tests {
         let args = parse_args(&s(&["--offline"]));
         assert!(args.offline);
         assert!(args.ignored.is_empty());
+    }
+
+    #[test]
+    fn project_trust_flags_are_honored_without_warning() {
+        let approved = parse_args(&s(&["--approve"]));
+        assert_eq!(approved.trust_override, Some(true));
+        assert!(approved.ignored.is_empty());
+        let denied = parse_args(&s(&["--no-approve"]));
+        assert_eq!(denied.trust_override, Some(false));
+        assert!(denied.ignored.is_empty());
     }
 
     #[test]

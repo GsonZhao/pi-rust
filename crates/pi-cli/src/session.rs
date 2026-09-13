@@ -56,8 +56,9 @@ use crate::extension_api::ExtensionBackend;
 use crate::provider::ResolvedModel;
 use crate::resource_dirs::{
     discover_append_system_prompt_file_with_packages, discover_system_prompt_file_with_packages,
-    extension_dirs, load_prompt_templates_with_precedence, load_skills_with_precedence,
-    prompt_template_dirs, skill_dirs,
+    extension_dirs, global_extension_dirs, global_prompt_template_dirs, global_skill_dirs,
+    load_prompt_templates_with_precedence, load_skills_with_precedence, prompt_template_dirs,
+    skill_dirs,
 };
 use rpi_extensions::{
     emit_resources_discover, ExtensionEmitter, ExtensionSession, NullDiagnostics,
@@ -78,7 +79,11 @@ pub(crate) fn should_load_js_packages(args: &Args) -> bool {
 /// starts the Node host, including during reload.
 pub(crate) fn package_resources_for(args: &Args, cwd: &Path) -> crate::packages::PackageResources {
     if should_load_js_packages(args) {
-        crate::packages::discover_from_settings(cwd)
+        if resolve_project_trust(args, cwd) {
+            crate::packages::discover_from_settings(cwd)
+        } else {
+            crate::packages::discover_from_global_settings(cwd)
+        }
     } else {
         crate::packages::PackageResources::default()
     }
@@ -202,9 +207,15 @@ pub async fn build(
     BuildError,
 > {
     let cwd_str = cwd.to_string_lossy().to_string();
+    let project_trusted = resolve_project_trust(args, cwd);
+    if !project_trusted && args.verbose {
+        eprintln!(
+            "warning: project is not trusted; local settings, resources, and discovered extensions are disabled (use --approve or /trust)"
+        );
+    }
     // Pi packages are explicitly opt-in because discovery can start Node and
-    // execute package code. Rust cdylib extensions retain their own
-    // --no-extensions gate below.
+    // execute package code. Trust additionally limits discovery to global
+    // settings when the current project has not been approved.
     let package_resources = package_resources_for(args, cwd);
 
     // ---- B5a: build the action bridge BEFORE extension load ----
@@ -269,12 +280,12 @@ pub async fn build(
     let extension_session = if args.no_extensions {
         ExtensionSession::none()
     } else {
-        load_extensions(args, cwd, Some(Arc::clone(&action_bridge)))
+        load_extensions(args, cwd, project_trusted, Some(Arc::clone(&action_bridge)))
     };
     let js_extension_session = if !should_load_js_packages(args) {
         None
     } else {
-        let paths = js_extension_paths(args, cwd, &package_resources);
+        let paths = js_extension_paths(args, cwd, project_trusted, &package_resources);
         let js_context = serde_json::json!({
             "cwd": cwd_str,
             "theme": resolved.theme.clone(),
@@ -389,12 +400,13 @@ pub async fn build(
     // direction as skills/prompts precedence.
     let base_prompt = match args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
-        None => match discover_system_prompt_file_with_packages(cwd, &package_resources) {
+        None if project_trusted => match discover_system_prompt_file_with_packages(cwd, &package_resources) {
             Some(path) => {
                 std::fs::read_to_string(&path).unwrap_or_else(|_| default_system_prompt(&cwd_str))
             }
             None => default_system_prompt(&cwd_str),
         },
+        None => default_system_prompt(&cwd_str),
     };
 
     // ---- Append-text sources (precedence: --append-system-prompt > APPEND_SYSTEM.md) ----
@@ -410,7 +422,9 @@ pub async fn build(
     }
     if args.append_system_prompt.is_empty() {
         if let Some(path) =
-            discover_append_system_prompt_file_with_packages(cwd, &package_resources)
+            project_trusted
+                .then(|| discover_append_system_prompt_file_with_packages(cwd, &package_resources))
+                .flatten()
         {
             if let Ok(text) = std::fs::read_to_string(&path) {
                 append_texts.push(text);
@@ -459,7 +473,7 @@ pub async fn build(
     let mut skills: Vec<rpi_harness::types::Skill> = Vec::new();
     let mut skill_diags: Vec<rpi_harness::skills::SkillDiagnostic> = Vec::new();
     if !args.no_skills {
-        let mut dirs = skill_dirs(cwd);
+        let mut dirs = if project_trusted { skill_dirs(cwd) } else { global_skill_dirs() };
         dirs.extend(args.skill.iter().cloned());
         dirs.extend(discovered.skill_paths.iter().map(PathBuf::from));
         if let Some(session) = &js_extension_session {
@@ -474,7 +488,11 @@ pub async fn build(
     let mut prompt_templates: Vec<rpi_harness::types::PromptTemplate> = Vec::new();
     let mut prompt_diags: Vec<rpi_harness::prompt_templates::PromptTemplateDiagnostic> = Vec::new();
     if !args.no_prompt_templates {
-        let mut dirs = prompt_template_dirs(cwd);
+        let mut dirs = if project_trusted {
+            prompt_template_dirs(cwd)
+        } else {
+            global_prompt_template_dirs()
+        };
         dirs.extend(args.prompt_template.iter().cloned());
         dirs.extend(discovered.prompt_paths.iter().map(PathBuf::from));
         if let Some(session) = &js_extension_session {
@@ -486,7 +504,7 @@ pub async fn build(
         prompt_diags = result.diagnostics;
     }
 
-    let context_block = if args.no_context_files {
+    let context_block = if args.no_context_files || !project_trusted {
         String::new()
     } else {
         // `load_project_context_files` walks the global agentDir first then
@@ -912,6 +930,7 @@ pub async fn reload_extension_resources(
         }
     }
     let cwd_str = ctx.cwd.to_string_lossy().to_string();
+    let project_trusted = resolve_project_trust(&effective_args, &ctx.cwd);
     let package_resources = package_resources_for(&effective_args, &ctx.cwd);
     let mut warnings = false;
 
@@ -947,7 +966,12 @@ pub async fn reload_extension_resources(
     let extension_session = if effective_args.no_extensions {
         rpi_extensions::ExtensionSession::none()
     } else {
-        load_extensions(&effective_args, &ctx.cwd, Some(Arc::clone(&fresh_bridge)))
+        load_extensions(
+            &effective_args,
+            &ctx.cwd,
+            project_trusted,
+            Some(Arc::clone(&fresh_bridge)),
+        )
     };
     if extension_session.is_empty() && !effective_args.no_extensions {
         // The fresh session may be empty if no cdylibs are present — not a
@@ -1283,6 +1307,20 @@ fn build_models_with_extensions(
     models
 }
 
+/// Resolve the project trust gate without prompting. Explicit CLI overrides
+/// win; otherwise a stored `trust.json` decision is honored. An absent or
+/// malformed decision fails closed so untrusted project files cannot execute
+/// during startup.
+fn resolve_project_trust(args: &Args, cwd: &Path) -> bool {
+    if let Some(override_value) = args.trust_override {
+        return override_value;
+    }
+    crate::config::project_trust_decision(cwd)
+        .ok()
+        .flatten()
+        .unwrap_or(false)
+}
+
 /// Resolve the extension dirs to scan and load the cdylib plugins, returning
 /// the loaded session guard (keeps the `Library` handles alive for the harness
 /// lifetime). Scan order: configured project paths, project `.rpi/extensions`,
@@ -1293,9 +1331,14 @@ fn build_models_with_extensions(
 fn load_extensions(
     args: &Args,
     cwd: &Path,
+    project_trusted: bool,
     action_bridge: Option<Arc<rpi_extensions::ActionBridge>>,
 ) -> ExtensionSession {
-    let mut dirs = extension_dirs(cwd);
+    let mut dirs = if project_trusted {
+        extension_dirs(cwd)
+    } else {
+        global_extension_dirs()
+    };
     dirs.extend(args.extensions_dir.iter().cloned());
     let diagnostics: Arc<dyn PluginDiagnostics> = Arc::new(NullDiagnostics);
     // B5a: the action bridge is cloned into every loaded plugin's vtable
@@ -1310,10 +1353,16 @@ fn load_extensions(
 fn js_extension_paths(
     args: &Args,
     cwd: &Path,
+    project_trusted: bool,
     packages: &crate::packages::PackageResources,
 ) -> Vec<PathBuf> {
     let mut paths = packages.extension_paths();
-    for dir in extension_dirs(cwd) {
+    let discovered_dirs = if project_trusted {
+        extension_dirs(cwd)
+    } else {
+        global_extension_dirs()
+    };
+    for dir in discovered_dirs {
         if let Ok(entries) = std::fs::read_dir(dir) {
             paths.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
                 matches!(
@@ -1942,6 +1991,18 @@ mod tests {
             select_session(&args, cwd),
             SessionSelection::Ephemeral
         ));
+    }
+
+    #[test]
+    fn project_trust_override_fails_closed_by_default() {
+        let denied = Args::default();
+        assert!(!resolve_project_trust(&denied, Path::new("C:/definitely-not-a-project")));
+
+        let approved = Args {
+            trust_override: Some(true),
+            ..Args::default()
+        };
+        assert!(resolve_project_trust(&approved, Path::new("C:/definitely-not-a-project")));
     }
 
     #[test]

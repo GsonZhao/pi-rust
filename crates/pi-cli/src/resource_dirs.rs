@@ -297,6 +297,12 @@ pub fn skill_dirs(cwd: &Path) -> Vec<PathBuf> {
     dirs
 }
 
+/// Resource directories that do not depend on the current project. Used when
+/// the project trust gate denies local configuration/resources.
+pub fn global_skill_dirs() -> Vec<PathBuf> {
+    global_resource_dirs("skills", ResourceKind::Skills)
+}
+
 /// The ordered prompt-template paths for a project: configured paths, then
 /// `[<cwd>/.rpi/prompts, <cwd>/.pi/prompts, <agent_dir>/prompts]`.
 pub fn prompt_template_dirs(cwd: &Path) -> Vec<PathBuf> {
@@ -306,6 +312,10 @@ pub fn prompt_template_dirs(cwd: &Path) -> Vec<PathBuf> {
         dirs.push(g);
     }
     dirs
+}
+
+pub fn global_prompt_template_dirs() -> Vec<PathBuf> {
+    global_resource_dirs("prompts", ResourceKind::Prompts)
 }
 
 /// The ordered Rust extension directories for a project. Configured paths are
@@ -318,6 +328,10 @@ pub fn extension_dirs(cwd: &Path) -> Vec<PathBuf> {
         dirs.push(g);
     }
     dirs
+}
+
+pub fn global_extension_dirs() -> Vec<PathBuf> {
+    global_resource_dirs("extensions", ResourceKind::Extensions)
 }
 
 #[derive(Clone, Copy)]
@@ -350,6 +364,13 @@ fn configured_global_dirs(agent_dir: PathBuf, kind: ResourceKind) -> Vec<PathBuf
         .into_iter()
         .flat_map(|settings| configured_paths(&settings, &agent_dir, kind))
         .collect()
+}
+
+fn global_resource_dirs(sub: &str, kind: ResourceKind) -> Vec<PathBuf> {
+    let Some(g) = global_dir(sub) else { return Vec::new() };
+    let mut dirs = configured_global_dirs(g.clone(), kind);
+    dirs.push(g);
+    dirs
 }
 
 fn configured_paths(

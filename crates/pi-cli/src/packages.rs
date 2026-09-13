@@ -132,6 +132,17 @@ pub fn discover_from_settings(cwd: &Path) -> PackageResources {
     discover(cwd, &specs)
 }
 
+/// Resolve only packages declared in the global settings file. Project-local
+/// package declarations are intentionally excluded when the current project
+/// has not been trusted.
+pub fn discover_from_global_settings(cwd: &Path) -> PackageResources {
+    let specs = crate::settings::load_settings()
+        .ok()
+        .and_then(|settings| settings.packages)
+        .unwrap_or_default();
+    discover(cwd, &specs)
+}
+
 /// Discover packages in settings order. Package resources are intentionally
 /// returned after project and global resources; callers append these paths last
 /// so a package cannot shadow a project-local or user-local resource.
