@@ -10,6 +10,8 @@
 - `--approve/-a` 与 `--no-approve/-na`：控制项目级资源和扩展是否加载；
 - JSON mode：输出 agent/turn/message/delta/tool execution 事件；
 - `--export <session.jsonl> [output.html]`：导出独立 HTML；`.jsonl` 目标保留 JSONL；
+- Ctrl+G：使用 `RPI_EXTERNAL_EDITOR`、`VISUAL`、`EDITOR` 或平台默认编辑器编辑当前草稿；
+- Shift+Tab / BackTab：循环当前模型支持的 thinking level；
 - 相关 parser、图片处理和 trust gate 单元测试。
 
 Trust 行为：

@@ -2392,6 +2392,10 @@ enum TuiMessage {
     /// mailbox) signal the main loop, which awaits
     /// `reload_extension_resources` on the async runtime.
     ReloadExtensions,
+    /// Result returned after Ctrl+G edits a temporary file in an external
+    /// editor. Handling it on the async loop keeps editor mutation single-
+    /// threaded with the rest of the TUI state.
+    ExternalEditorResult(Result<String, String>),
 }
 
 /// Extract the concatenated text content from an assistant message (mirrors
@@ -4519,6 +4523,7 @@ pub async fn interactive_tui(
     let scroll_for_key = scroll_view.clone();
     let lane_for_key = lane.clone();
     let state_for_key = state.clone();
+    let model_catalog_for_key = model_catalog_arc.clone();
     let js_for_key = reload_context.js_extension_session.clone();
     let js_dialog_for_key = js_dialog_bridge.clone();
     // Ctrl+L routes through the same registry as `/model` (one path, not two),
@@ -4808,7 +4813,14 @@ pub async fn interactive_tui(
                 }
             }
 
-            // 2c. Ctrl+T: toggle expansion on the most recent tool component.
+            // 2c. Ctrl+G: edit the current draft in the user's external
+            // editor, matching native Pi's VISUAL/EDITOR fallback chain.
+            if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('g') {
+                launch_external_editor(editor_for_key.get_text(), tx_for_key.clone());
+                continue;
+            }
+
+            // 2d. Ctrl+T: toggle expansion on the most recent tool component.
             //     The key loop tracks no per-line focus, so this is an "expand
             //     last tool" affordance rather than a cursor-targeted toggle
             //     (documented limitation; see `toggle_expand_last_tool`).
@@ -4818,7 +4830,7 @@ pub async fn interactive_tui(
                 continue;
             }
 
-            // 2d. Ctrl+M: cycle to the next model in the catalog after the one
+            // 2e. Ctrl+M: cycle to the next model in the catalog after the one
             //     currently tracked in `current_model_id`, apply it live via
             //     `lane.set_model` (takes effect on the next user message — the
             //     in-flight run's config is already snapshotted), and update the
@@ -4836,6 +4848,39 @@ pub async fn interactive_tui(
                     });
                     tui_for_key.request_render_reusing_scroll_content();
                 }
+                continue;
+            }
+
+            // 2f. Shift+Tab / BackTab: cycle the current model's supported
+            // thinking levels, matching native Pi's thinking-level shortcut.
+            if key.code == KeyCode::BackTab
+                || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT))
+            {
+                let lane = lane_for_key.clone();
+                let catalog = model_catalog_for_key.clone();
+                let state = state_for_key.clone();
+                tokio::spawn(async move {
+                    let Ok(current_model) = lane.get_model().await else { return };
+                    let levels = catalog
+                        .iter()
+                        .find(|model| model.provider == current_model.provider && model.id == current_model.id)
+                        .map(|model| model.supported_thinking_levels())
+                        .unwrap_or_else(|| vec![rpi_ai::types::ThinkingLevel::Medium]);
+                    if levels.is_empty() { return; }
+                    let current = lane
+                        .get_thinking_level()
+                        .await
+                        .unwrap_or(rpi_ai::types::ThinkingLevel::Medium);
+                    let next = levels
+                        .iter()
+                        .position(|level| *level == current)
+                        .map(|index| levels[(index + 1) % levels.len()])
+                        .unwrap_or(levels[0]);
+                    if lane.set_thinking_level(next).await.is_ok() {
+                        state.footer.set_thinking_level(Some(thinking_level_name(next)));
+                        state.tui.as_ref().map(|tui| tui.request_render(false));
+                    }
+                });
                 continue;
             }
 
@@ -5006,6 +5051,18 @@ pub async fn interactive_tui(
                     Vec::new(),
                 )
                 .await;
+            }
+            Some(TuiMessage::ExternalEditorResult(result)) => {
+                match result {
+                    Ok(text) => {
+                        let cursor = text.chars().count();
+                        editor.set_text(&text);
+                        editor.set_cursor(0, cursor);
+                        add_note_message(&chat_container, "Draft updated from external editor.");
+                    }
+                    Err(error) => add_error_message(&chat_container, &error),
+                }
+                tui.request_render(false);
             }
             Some(TuiMessage::OpenTree) => {
                 if *state.status.lock().unwrap() != RunStatus::Idle {
@@ -5262,6 +5319,52 @@ async fn ensure_js_runtime_before_prompt(
         }
     }
     true
+}
+
+fn launch_external_editor(draft: String, tx: mpsc::UnboundedSender<TuiMessage>) {
+    std::thread::spawn(move || {
+        let file = match tempfile::Builder::new()
+            .prefix("rpi-draft-")
+            .suffix(".md")
+            .tempfile()
+        {
+            Ok(file) => file,
+            Err(error) => {
+                let _ = tx.send(TuiMessage::ExternalEditorResult(Err(format!(
+                    "Could not create editor file: {error}"
+                ))));
+                return;
+            }
+        };
+        if let Err(error) = std::fs::write(file.path(), draft.as_bytes()) {
+            let _ = tx.send(TuiMessage::ExternalEditorResult(Err(format!(
+                "Could not write editor file: {error}"
+            ))));
+            return;
+        }
+        let editor = std::env::var("RPI_EXTERNAL_EDITOR")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| std::env::var("VISUAL").ok())
+            .or_else(|| std::env::var("EDITOR").ok())
+            .unwrap_or_else(|| {
+                if cfg!(windows) {
+                    "notepad".to_string()
+                } else {
+                    "nano".to_string()
+                }
+            });
+        let status = std::process::Command::new(&editor)
+            .arg(file.path())
+            .status();
+        let result = match status {
+            Ok(status) if status.success() => std::fs::read_to_string(file.path())
+                .map_err(|error| format!("Could not read editor file: {error}")),
+            Ok(status) => Err(format!("External editor exited with {status}")),
+            Err(error) => Err(format!("Could not launch external editor `{editor}`: {error}")),
+        };
+        let _ = tx.send(TuiMessage::ExternalEditorResult(result));
+    });
 }
 
 /// Drive a single prompt through the lane. When `streaming` is true, the
