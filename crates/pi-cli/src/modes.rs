@@ -18,7 +18,7 @@
 use std::io::{BufRead, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
 
-use rpi_ai::types::{AssistantMessage, Content, StopReason};
+use rpi_ai::types::{AssistantMessage, Content, ImageContent, StopReason};
 use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome};
 use rpi_harness::events::{HarnessEvent, RunEndOutcome};
 
@@ -53,6 +53,7 @@ pub async fn print(
     _args: &Args,
     initial: Option<String>,
     extra_messages: &[String],
+    initial_images: Vec<ImageContent>,
 ) -> i32 {
     let lane: Arc<dyn AgentLane> = harness.lane("main");
 
@@ -74,8 +75,9 @@ pub async fn print(
         return 0;
     }
 
+    let mut images = initial_images;
     for prompt in prompts {
-        match lane.prompt_text(&prompt, Vec::new()).await {
+        match lane.prompt_text(&prompt, std::mem::take(&mut images)).await {
             Ok(result) => {
                 last_exit = outcome_exit_code(&result.outcome);
                 match &result.outcome {
@@ -146,6 +148,7 @@ pub async fn json(
     _args: &Args,
     initial: Option<String>,
     extra_messages: &[String],
+    initial_images: Vec<ImageContent>,
 ) -> i32 {
     let lane: Arc<dyn AgentLane> = harness.lane("main");
     let collected: Arc<Mutex<Vec<HarnessEvent>>> = Arc::new(Mutex::new(Vec::new()));
@@ -174,8 +177,9 @@ pub async fn json(
     let mut last_exit = 0;
     let mut final_outcome: Option<HarnessRunOutcome> = None;
 
+    let mut images = initial_images;
     for prompt in prompts {
-        match lane.prompt_text(&prompt, Vec::new()).await {
+        match lane.prompt_text(&prompt, std::mem::take(&mut images)).await {
             Ok(result) => {
                 last_exit = outcome_exit_code(&result.outcome);
                 final_outcome = Some(result.outcome);
@@ -260,6 +264,7 @@ pub async fn interactive(
     model_catalog: Vec<rpi_ai::Model>,
     initial: Option<String>,
     extra_messages: &[String],
+    initial_images: Vec<ImageContent>,
     theme: Option<&str>,
     reload_context: &crate::session::ReloadContext,
 ) -> i32 {
@@ -276,13 +281,14 @@ pub async fn interactive(
             model_catalog,
             initial,
             extra_messages,
+            initial_images,
             theme,
             reload_context,
         )
         .await
     } else {
         // Fall back to simple REPL
-        interactive_repl(harness, args, initial, extra_messages).await
+        interactive_repl(harness, args, initial, extra_messages, initial_images).await
     }
 }
 
@@ -292,6 +298,7 @@ pub async fn interactive_repl(
     #[allow(unused_variables)] args: &Args,
     initial: Option<String>,
     extra_messages: &[String],
+    initial_images: Vec<ImageContent>,
 ) -> i32 {
     // Debug: confirm we entered REPL mode
     let lane: Arc<dyn AgentLane> = harness.lane("main");
@@ -312,8 +319,9 @@ pub async fn interactive_repl(
     for m in extra_messages {
         prompts.push(m.clone());
     }
+    let mut images = initial_images;
     for prompt in prompts {
-        if let Err(code) = run_one(&lane, &prompt).await {
+        if let Err(code) = run_one(&lane, &prompt, std::mem::take(&mut images)).await {
             return code;
         }
     }
@@ -343,7 +351,7 @@ pub async fn interactive_repl(
             eprintln!("(aborted)");
             continue;
         }
-        if let Err(code) = run_one(&lane, trimmed).await {
+        if let Err(code) = run_one(&lane, trimmed, Vec::new()).await {
             return code;
         }
     }
@@ -353,8 +361,12 @@ pub async fn interactive_repl(
 /// Run a single prompt in interactive mode, printing the assistant reply (or
 /// the error). Returns `Ok(())` on success/soft-failure, `Err(exit_code)` on a
 /// hard rejection.
-async fn run_one(lane: &Arc<dyn AgentLane>, prompt: &str) -> Result<(), i32> {
-    match lane.prompt_text(prompt, Vec::new()).await {
+async fn run_one(
+    lane: &Arc<dyn AgentLane>,
+    prompt: &str,
+    images: Vec<ImageContent>,
+) -> Result<(), i32> {
+    match lane.prompt_text(prompt, images).await {
         Ok(result) => {
             match &result.outcome {
                 HarnessRunOutcome::Completed { final_message, .. }

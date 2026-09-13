@@ -28,7 +28,7 @@
 use std::io::{IsTerminal, Read};
 use std::path::Path;
 
-use rpi_ai::types::ImageContent;
+use rpi_ai::types::{ImageContent, ImageContentType};
 
 use crate::args::{parse_args, print_help, print_version, resolve_mode, Args, RunMode};
 use crate::provider::{resolve, ResolveError};
@@ -217,7 +217,7 @@ pub async fn run() -> i32 {
     let stdin_text = read_piped_stdin();
 
     // ---- @file attachments → text (TS processFileArguments, text branch only) ----
-    let (file_text, _file_images) = match process_file_args(&parsed.file_args, &cwd) {
+    let (file_text, file_images) = match process_file_args(&parsed.file_args, &cwd) {
         Ok(t) => t,
         Err(msg) => {
             eprintln!("error: {msg}");
@@ -327,8 +327,8 @@ pub async fn run() -> i32 {
     };
 
     let exit_code = match mode {
-        RunMode::Print => crate::modes::print(&harness, &parsed, initial.clone(), &extra).await,
-        RunMode::Json => crate::modes::json(&harness, &parsed, initial.clone(), &extra).await,
+        RunMode::Print => crate::modes::print(&harness, &parsed, initial.clone(), &extra, file_images.clone()).await,
+        RunMode::Json => crate::modes::json(&harness, &parsed, initial.clone(), &extra, file_images.clone()).await,
         RunMode::Interactive => {
             crate::modes::interactive(
                 &harness,
@@ -337,6 +337,7 @@ pub async fn run() -> i32 {
                 model_catalog,
                 initial.clone(),
                 &extra,
+                file_images.clone(),
                 parsed.theme.as_deref().or(resolved.theme.as_deref()),
                 &reload_context,
             )
@@ -484,18 +485,13 @@ fn read_piped_stdin() -> Option<String> {
 /// TS `processFileArguments`: each readable text file is wrapped in
 /// `<file name="...">\n<contents>\n</file>\n` and concatenated.
 ///
-/// v1 divergence: the TS image branch (detect mime → base64 → `ImageContent`)
-/// is **not ported** — `pi-tools` ships an image *detector* but no CLI-facing
-/// image processor, and the v1 `modes` do not forward images into
-/// `prompt_text`. Recognized image extensions are reported as an error rather
-/// than silently mis-parsed as text. See `docs/m6-cli-open-questions.md`.
-///
 /// Paths are resolved relative to `cwd` (the TS uses `resolve(readPath, cwd)`).
 fn process_file_args(
     file_args: &[std::path::PathBuf],
     cwd: &Path,
 ) -> Result<(String, Vec<ImageContent>), String> {
     let mut text = String::new();
+    let mut images = Vec::new();
     for rel in file_args {
         let abs = if rel.is_absolute() {
             rel.clone()
@@ -505,39 +501,25 @@ fn process_file_args(
         if !abs.exists() {
             return Err(format!("file not found: {}", abs.display()));
         }
-        // v1: refuse image files outright (no image-attachment path yet).
-        if is_likely_image(&abs) {
-            return Err(format!(
-                "image attachments are not supported in v1: {}",
-                abs.display()
+        let bytes = std::fs::read(&abs)
+            .map_err(|e| format!("could not read file {}: {e}", abs.display()))?;
+        if let Some(mime_type) = rpi_tools::detect_supported_image_mime_type(&bytes) {
+            images.push(ImageContent {
+                kind: ImageContentType,
+                data: rpi_tools::encode_base64(&bytes),
+                mime_type: mime_type.to_string(),
+            });
+        } else {
+            let content = String::from_utf8(bytes)
+                .map_err(|_| format!("file is not valid UTF-8 text or a supported image: {}", abs.display()))?;
+            text.push_str(&format!(
+                "<file name=\"{}\">\n{}\n</file>\n",
+                abs.display(),
+                content
             ));
         }
-        match std::fs::read_to_string(&abs) {
-            Ok(content) => {
-                text.push_str(&format!(
-                    "<file name=\"{}\">\n{}\n</file>\n",
-                    abs.display(),
-                    content
-                ));
-            }
-            Err(e) => {
-                return Err(format!("could not read file {}: {e}", abs.display()));
-            }
-        }
     }
-    Ok((text, Vec::new()))
-}
-
-/// True if the path's extension looks like a raster image the TS path would
-/// have base64-attached. Used to route `@file` away from the text branch.
-fn is_likely_image(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
-            .as_deref(),
-        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp")
-    )
+    Ok((text, images))
 }
 
 /// Build the initial prompt + the remaining extra messages. Mirrors TS
@@ -642,10 +624,17 @@ mod tests {
     }
 
     #[test]
-    fn is_likely_image_detects_extensions() {
-        assert!(is_likely_image(Path::new("foo.png")));
-        assert!(is_likely_image(Path::new("foo.JPG")));
-        assert!(!is_likely_image(Path::new("foo.rs")));
-        assert!(!is_likely_image(Path::new("foo")));
+    fn process_file_args_attaches_supported_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.bin");
+        let mut png = vec![137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13];
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&[0; 13]);
+        std::fs::write(&path, png).unwrap();
+        let (text, images) = process_file_args(&[path], dir.path()).unwrap();
+        assert!(text.is_empty());
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].mime_type, "image/png");
+        assert!(!images[0].data.is_empty());
     }
 }

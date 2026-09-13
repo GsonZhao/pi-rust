@@ -4022,6 +4022,7 @@ pub async fn interactive_tui(
     model_catalog: Vec<rpi_ai::Model>,
     initial: Option<String>,
     extra_messages: &[String],
+    initial_images: Vec<rpi_ai::types::ImageContent>,
     theme: Option<&str>,
     reload_context: &crate::session::ReloadContext,
 ) -> i32 {
@@ -4960,6 +4961,7 @@ pub async fn interactive_tui(
     for m in extra_messages {
         prompts.push(m.clone());
     }
+    let mut images = initial_images;
     for prompt in prompts {
         if !*running.lock().unwrap() {
             break;
@@ -4975,6 +4977,7 @@ pub async fn interactive_tui(
             reload_context.js_extension_session.as_ref(),
             &js_dialog_bridge,
             args,
+            std::mem::take(&mut images),
         )
         .await;
     }
@@ -5000,6 +5003,7 @@ pub async fn interactive_tui(
                     reload_context.js_extension_session.as_ref(),
                     &js_dialog_bridge,
                     args,
+                    Vec::new(),
                 )
                 .await;
             }
@@ -5273,6 +5277,7 @@ async fn run_prompt_streaming(
     js: Option<&crate::js_extensions::JsExtensionSession>,
     dialog_bridge: &JsDialogBridge,
     args: &Args,
+    images: Vec<rpi_ai::types::ImageContent>,
 ) {
     // The persistent Node host is intentionally started at the first real
     // prompt. By this point the TUI key worker and all UI/runtime handlers are
@@ -5290,7 +5295,7 @@ async fn run_prompt_streaming(
         return;
     }
 
-    let outcome = lane.prompt_text(prompt, Vec::new()).await;
+    let outcome = lane.prompt_text(prompt, images).await;
 
     // The drain task finalized the assistant message via MessageEnd/AgentEnd,
     // but guard against runs that ended without a terminal event (e.g. a hard
