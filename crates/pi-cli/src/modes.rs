@@ -18,10 +18,10 @@
 use std::io::{BufRead, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
 
+use rpi_agent::events::AgentEvent;
 use rpi_ai::types::{AssistantMessage, Content, ImageContent, StopReason};
 use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome};
 use rpi_harness::events::{HarnessEvent, RunEndOutcome};
-use rpi_agent::events::AgentEvent;
 
 use crate::args::Args;
 
@@ -250,7 +250,10 @@ fn emit_agent_event(event: &AgentEvent) {
             "type":"agent_end", "messageCount": messages.len()
         }),
         AgentEvent::TurnStart => serde_json::json!({"type":"turn_start"}),
-        AgentEvent::TurnEnd { message, tool_results } => serde_json::json!({
+        AgentEvent::TurnEnd {
+            message,
+            tool_results,
+        } => serde_json::json!({
             "type":"turn_end", "message": serde_json::to_value(message).ok(),
             "toolResultCount": tool_results.len()
         }),
@@ -260,13 +263,28 @@ fn emit_agent_event(event: &AgentEvent) {
         AgentEvent::MessageEnd { message } => serde_json::json!({
             "type":"message_end", "message": serde_json::to_value(message).ok()
         }),
-        AgentEvent::MessageUpdate { assistant_message_event, .. } => {
+        AgentEvent::MessageUpdate {
+            assistant_message_event,
+            ..
+        } => {
             let mut value = serde_json::json!({"type":"message_update"});
             let object = value.as_object_mut().expect("json object");
             match assistant_message_event {
-                AssistantMessageEvent::TextDelta { content_index, delta, .. }
-                | AssistantMessageEvent::ThinkingDelta { content_index, delta, .. }
-                | AssistantMessageEvent::ToolCallDelta { content_index, delta, .. } => {
+                AssistantMessageEvent::TextDelta {
+                    content_index,
+                    delta,
+                    ..
+                }
+                | AssistantMessageEvent::ThinkingDelta {
+                    content_index,
+                    delta,
+                    ..
+                }
+                | AssistantMessageEvent::ToolCallDelta {
+                    content_index,
+                    delta,
+                    ..
+                } => {
                     object.insert("contentIndex".into(), (*content_index).into());
                     object.insert("delta".into(), delta.clone().into());
                 }
@@ -274,14 +292,27 @@ fn emit_agent_event(event: &AgentEvent) {
             }
             value
         }
-        AgentEvent::ToolExecutionStart { tool_call_id, tool_name, args } => serde_json::json!({
+        AgentEvent::ToolExecutionStart {
+            tool_call_id,
+            tool_name,
+            args,
+        } => serde_json::json!({
             "type":"tool_execution_start", "toolCallId":tool_call_id,
             "toolName":tool_name, "args":args
         }),
-        AgentEvent::ToolExecutionUpdate { tool_call_id, tool_name, .. } => serde_json::json!({
+        AgentEvent::ToolExecutionUpdate {
+            tool_call_id,
+            tool_name,
+            ..
+        } => serde_json::json!({
             "type":"tool_execution_update", "toolCallId":tool_call_id, "toolName":tool_name
         }),
-        AgentEvent::ToolExecutionEnd { tool_call_id, tool_name, is_error, .. } => serde_json::json!({
+        AgentEvent::ToolExecutionEnd {
+            tool_call_id,
+            tool_name,
+            is_error,
+            ..
+        } => serde_json::json!({
             "type":"tool_execution_end", "toolCallId":tool_call_id,
             "toolName":tool_name, "isError":is_error
         }),
@@ -335,6 +366,7 @@ pub async fn interactive(
     extra_messages: &[String],
     initial_images: Vec<ImageContent>,
     theme: Option<&str>,
+    no_themes: bool,
     reload_context: &crate::session::ReloadContext,
 ) -> i32 {
     // Check if TUI is supported
@@ -352,6 +384,7 @@ pub async fn interactive(
             extra_messages,
             initial_images,
             theme,
+            no_themes,
             reload_context,
         )
         .await

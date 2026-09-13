@@ -15,10 +15,11 @@
 //!   re-run through `load_skills`/`load_prompt_templates` (individual `.md` files
 //!   load too — `load_skills` accepts both dirs and files). Package themes are
 //!   parsed by the TUI when selected via settings or `--theme`.**
-//!   **Trust gating remains deferred** — project resources are discovered
-//!   unconditionally (a copied `.rpi/` or legacy `.pi/` drops in and works).
-//! - **No `--models` cycling, no `ModelRuntime`/multi-provider.** One model,
-//!   one provider (Anthropic), resolved up-front by [`crate::provider`].
+//!   A project trust gate now fails closed by default; use `--approve` or a
+//!   stored `trust.json` decision to enable project-local resources.
+//! - **No `ModelRuntime`/multi-provider registry.** The resolver supports the
+//!   built-in Anthropic/OpenAI-compatible providers and `models.json`, but
+//!   runtime catalog mutation remains outside this layer.
 //! - **Built-in tools**: `read`, `bash`, `edit`, and `write`, matching Pi's
 //!   default `createCodingTools` set. The former rpi-only `docs`, `grep`,
 //!   `find`, `ls`, and `powershell` tools remain library modules but are no
@@ -400,12 +401,13 @@ pub async fn build(
     // direction as skills/prompts precedence.
     let base_prompt = match args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
-        None if project_trusted => match discover_system_prompt_file_with_packages(cwd, &package_resources) {
-            Some(path) => {
-                std::fs::read_to_string(&path).unwrap_or_else(|_| default_system_prompt(&cwd_str))
+        None if project_trusted => {
+            match discover_system_prompt_file_with_packages(cwd, &package_resources) {
+                Some(path) => std::fs::read_to_string(&path)
+                    .unwrap_or_else(|_| default_system_prompt(&cwd_str)),
+                None => default_system_prompt(&cwd_str),
             }
-            None => default_system_prompt(&cwd_str),
-        },
+        }
         None => default_system_prompt(&cwd_str),
     };
 
@@ -421,10 +423,9 @@ pub async fn build(
         append_texts.push(text);
     }
     if args.append_system_prompt.is_empty() {
-        if let Some(path) =
-            project_trusted
-                .then(|| discover_append_system_prompt_file_with_packages(cwd, &package_resources))
-                .flatten()
+        if let Some(path) = project_trusted
+            .then(|| discover_append_system_prompt_file_with_packages(cwd, &package_resources))
+            .flatten()
         {
             if let Ok(text) = std::fs::read_to_string(&path) {
                 append_texts.push(text);
@@ -473,7 +474,11 @@ pub async fn build(
     let mut skills: Vec<rpi_harness::types::Skill> = Vec::new();
     let mut skill_diags: Vec<rpi_harness::skills::SkillDiagnostic> = Vec::new();
     if !args.no_skills {
-        let mut dirs = if project_trusted { skill_dirs(cwd) } else { global_skill_dirs() };
+        let mut dirs = if project_trusted {
+            skill_dirs(cwd)
+        } else {
+            global_skill_dirs()
+        };
         dirs.extend(args.skill.iter().cloned());
         dirs.extend(discovered.skill_paths.iter().map(PathBuf::from));
         if let Some(session) = &js_extension_session {
@@ -1996,13 +2001,19 @@ mod tests {
     #[test]
     fn project_trust_override_fails_closed_by_default() {
         let denied = Args::default();
-        assert!(!resolve_project_trust(&denied, Path::new("C:/definitely-not-a-project")));
+        assert!(!resolve_project_trust(
+            &denied,
+            Path::new("C:/definitely-not-a-project")
+        ));
 
         let approved = Args {
             trust_override: Some(true),
             ..Args::default()
         };
-        assert!(resolve_project_trust(&approved, Path::new("C:/definitely-not-a-project")));
+        assert!(resolve_project_trust(
+            &approved,
+            Path::new("C:/definitely-not-a-project")
+        ));
     }
 
     #[test]

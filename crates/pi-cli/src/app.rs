@@ -241,6 +241,9 @@ pub async fn run() -> i32 {
             eprintln!("warning: {warn}");
         }
     }
+    if parsed.no_themes && parsed.theme.is_some() {
+        eprintln!("warning: --no-themes overrides --theme; using the built-in default theme");
+    }
 
     // ---- stdin (TS readPipedStdin: non-TTY stdin becomes initial prompt text) ----
     let stdin_text = read_piped_stdin();
@@ -356,16 +359,27 @@ pub async fn run() -> i32 {
     };
 
     let exit_code = match mode {
-        RunMode::Print => crate::modes::print(&harness, &parsed, initial.clone(), &extra, file_images.clone()).await,
-        RunMode::Json => crate::modes::json(
-            &harness,
-            &parsed,
-            initial.clone(),
-            &extra,
-            file_images.clone(),
-            Some(event_rx),
-        )
-        .await,
+        RunMode::Print => {
+            crate::modes::print(
+                &harness,
+                &parsed,
+                initial.clone(),
+                &extra,
+                file_images.clone(),
+            )
+            .await
+        }
+        RunMode::Json => {
+            crate::modes::json(
+                &harness,
+                &parsed,
+                initial.clone(),
+                &extra,
+                file_images.clone(),
+                Some(event_rx),
+            )
+            .await
+        }
         RunMode::Interactive => {
             crate::modes::interactive(
                 &harness,
@@ -375,7 +389,12 @@ pub async fn run() -> i32 {
                 initial.clone(),
                 &extra,
                 file_images.clone(),
-                parsed.theme.as_deref().or(resolved.theme.as_deref()),
+                if parsed.no_themes {
+                    None
+                } else {
+                    parsed.theme.as_deref().or(resolved.theme.as_deref())
+                },
+                parsed.no_themes,
                 &reload_context,
             )
             .await
@@ -435,10 +454,18 @@ async fn list_models(search: &str) -> i32 {
     fn format_tokens(value: u64) -> String {
         if value >= 1_000_000 {
             let whole = value % 1_000_000 == 0;
-            if whole { format!("{}M", value / 1_000_000) } else { format!("{:.1}M", value as f64 / 1_000_000.0) }
+            if whole {
+                format!("{}M", value / 1_000_000)
+            } else {
+                format!("{:.1}M", value as f64 / 1_000_000.0)
+            }
         } else if value >= 1_000 {
             let whole = value % 1_000 == 0;
-            if whole { format!("{}K", value / 1_000) } else { format!("{:.1}K", value as f64 / 1_000.0) }
+            if whole {
+                format!("{}K", value / 1_000)
+            } else {
+                format!("{:.1}K", value as f64 / 1_000.0)
+            }
         } else {
             value.to_string()
         }
@@ -471,16 +498,34 @@ async fn list_models(search: &str) -> i32 {
     );
     println!(
         "{:provider$}  {:model$}  {:context$}  {:max_out$}  {:thinking$}  {:images$}",
-        "provider", "model", "context", "max-out", "thinking", "images",
-        provider = widths.0, model = widths.1, context = widths.2,
-        max_out = widths.3, thinking = widths.4, images = widths.5,
+        "provider",
+        "model",
+        "context",
+        "max-out",
+        "thinking",
+        "images",
+        provider = widths.0,
+        model = widths.1,
+        context = widths.2,
+        max_out = widths.3,
+        thinking = widths.4,
+        images = widths.5,
     );
     for row in rows {
         println!(
             "{:provider$}  {:model$}  {:context$}  {:max_out$}  {:thinking$}  {:images$}",
-            row.0, row.1, row.2, row.3, row.4, row.5,
-            provider = widths.0, model = widths.1, context = widths.2,
-            max_out = widths.3, thinking = widths.4, images = widths.5,
+            row.0,
+            row.1,
+            row.2,
+            row.3,
+            row.4,
+            row.5,
+            provider = widths.0,
+            model = widths.1,
+            context = widths.2,
+            max_out = widths.3,
+            thinking = widths.4,
+            images = widths.5,
         );
     }
     0
@@ -547,8 +592,12 @@ fn process_file_args(
                 mime_type: mime_type.to_string(),
             });
         } else {
-            let content = String::from_utf8(bytes)
-                .map_err(|_| format!("file is not valid UTF-8 text or a supported image: {}", abs.display()))?;
+            let content = String::from_utf8(bytes).map_err(|_| {
+                format!(
+                    "file is not valid UTF-8 text or a supported image: {}",
+                    abs.display()
+                )
+            })?;
             text.push_str(&format!(
                 "<file name=\"{}\">\n{}\n</file>\n",
                 abs.display(),

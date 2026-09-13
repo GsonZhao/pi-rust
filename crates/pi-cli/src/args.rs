@@ -110,6 +110,9 @@ pub struct Args {
     /// Pi JavaScript/TypeScript packages. This is intentionally opt-in because
     /// loading a package may start a Node runtime and execute package code.
     pub enable_pi_packages: bool,
+    /// `--no-themes`: disable package/custom theme discovery and loading.
+    /// Built-in presets remain available unless a custom `--theme` is given.
+    pub no_themes: bool,
     /// `--extensions-dir`/`-ed`: an extra directory to scan for cdylib plugins
     /// (`.dll`/`.so`/`.dylib`), in addition to project `.rpi/extensions`
     /// (with legacy `.pi/extensions` compatibility) and global
@@ -378,18 +381,11 @@ pub fn parse_args(args: &[String]) -> Args {
             //
             // NOTE: `--no-skills`/`-ns`, `--no-prompt-templates`/`-np`,
             // `--no-context-files`/`-nc`, `--no-extensions`/`-ne`, and
-            // `--enable-pi-packages` are honored (parsed into real fields
-            // above), so they no longer reach this arm. The skill/prompt/context
-            // flags gate resource discovery (`session.rs`); package loading is
-            // separately opt-in.
-            other
-                if matches!(
-                    other,
-                    "--models"
-                        | "--tui-mode"
-                        | "--no-themes"
-                ) =>
-            {
+            // `--enable-pi-packages`, and `--no-themes` are honored (parsed
+            // into real fields above), so they no longer reach this arm. The
+            // resource flags gate discovery in `session.rs`; package loading
+            // is separately opt-in.
+            other if matches!(other, "--models" | "--tui-mode") => {
                 // Consume a value if the next token isn't a flag (so
                 // `--models sonnet` doesn't swallow `sonnet` as a message).
                 if inline.is_none()
@@ -406,6 +402,7 @@ pub fn parse_args(args: &[String]) -> Args {
             "--theme" => {
                 result.theme = take_value(&mut result, "--theme");
             }
+            "--no-themes" => result.no_themes = true,
             // Unknown long flag (with or without `=`). `flag_key` already holds
             // the bare name, so both `--frobnicate` and `--frobnicate=x` land
             // here; consume a value if the next token isn't a flag/file.
@@ -582,7 +579,7 @@ pub fn print_help() {
   ~/.rpi/agent/models.json. The interactive TUI, Rust and JS/TS extensions,
   opt-in Pi package resources, skills, prompt templates, themes, model cycling, session
   fork/export, and trust commands are
-  available in the current build. OAuth and HTML export remain
+  available in the current build. OAuth, RPC, and full model cycling remain
   outside the current implementation.
 ",
         name = crate::APP_NAME,
@@ -836,6 +833,13 @@ mod tests {
     fn theme_flag_is_honored() {
         let a = parse_args(&s(&["--theme", "ocean.json"]));
         assert_eq!(a.theme.as_deref(), Some("ocean.json"));
+        assert!(a.ignored.is_empty());
+    }
+
+    #[test]
+    fn no_themes_is_honored() {
+        let a = parse_args(&s(&["--no-themes"]));
+        assert!(a.no_themes);
         assert!(a.ignored.is_empty());
     }
 

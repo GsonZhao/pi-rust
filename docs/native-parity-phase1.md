@@ -12,6 +12,9 @@
 - `--export <session.jsonl> [output.html]`：导出独立 HTML；`.jsonl` 目标保留 JSONL；
 - Ctrl+G：使用 `RPI_EXTERNAL_EDITOR`、`VISUAL`、`EDITOR` 或平台默认编辑器编辑当前草稿；
 - Shift+Tab / BackTab：循环当前模型支持的 thinking level；
+- `--no-themes`：禁用包/自定义主题加载；与 `--theme` 冲突时 fail-safe 使用内置默认主题；
+- Ctrl+O：在紧凑/展开之间切换所有工具输出面板；
+- Ctrl+T：切换 reasoning/thinking 区块的可见性，新消息继承该偏好；
 - 相关 parser、图片处理和 trust gate 单元测试。
 
 Trust 行为：
@@ -30,4 +33,4 @@ cargo test -p rpi-cli app::tests::process_file_args_attaches_supported_images
 cargo test -p rpi-cli session::tests::project_trust_override_fails_closed_by_default
 ```
 
-仍待后续阶段：核心 TUI 快捷键和完整多 provider/OAuth/RPC parity。
+仍待后续阶段：double Escape、可配置 keybindings、clipboard image/drag-and-drop，以及完整多 provider/OAuth/RPC parity。

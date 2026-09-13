@@ -2615,9 +2615,11 @@ fn open_settings_theme_selector(
         SelectItem::new("light", "Light").with_description("Light background"),
         SelectItem::new("monochrome", "Monochrome").with_description("No color accents"),
     ];
-    for path in package_resources.theme_files() {
-        if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
-            items.push(SelectItem::new(name, name).with_description("Package theme"));
+    if state.themes_enabled {
+        for path in package_resources.theme_files() {
+            if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+                items.push(SelectItem::new(name, name).with_description("Package theme"));
+            }
         }
     }
     let list = Arc::new(SelectList::new(items, 10));
@@ -2635,13 +2637,15 @@ fn open_settings_theme_selector(
             "dark" => Some(ThemePreset::Dark),
             name => {
                 if let Ok(cwd) = std::env::current_dir() {
-                    if let Ok(custom) = crate::packages::load_theme_with_resources(
-                        &cwd,
-                        name,
-                        &package_resources_sel,
-                    ) {
-                        rpi_tui::global_theme_manager().set(custom.clone());
-                        state_sel.theme_manager.set(custom);
+                    if state_sel.themes_enabled {
+                        if let Ok(custom) = crate::packages::load_theme_with_resources(
+                            &cwd,
+                            name,
+                            &package_resources_sel,
+                        ) {
+                            rpi_tui::global_theme_manager().set(custom.clone());
+                            state_sel.theme_manager.set(custom);
+                        }
                     }
                 }
                 add_note_message(&chat_sel, &format!("Theme set to {}.", item.label));
@@ -3657,10 +3661,12 @@ struct TuiState {
     /// generic tool map so bash output streams into a `BashExecutionComponent`
     /// rather than a plain `ToolExecutionComponent`). Phase 5 routing.
     bash_components: std::sync::Mutex<HashMap<String, Arc<BashExecutionComponent>>>,
-    /// The most recently created tool component (bash or generic). Ctrl+T
-    /// toggles `expanded` on this — a pragmatic "expand last tool" since the
-    /// key loop has no per-line focus. Updated on every tool/bash Start.
-    last_tool_comp: std::sync::Mutex<Option<Arc<ToolExecutionComponent>>>,
+    /// Whether package/custom themes may be selected in this session.
+    themes_enabled: bool,
+    /// Persisted display preference toggled by Ctrl+T.
+    hide_thinking: std::sync::Mutex<bool>,
+    /// Global tool-output expansion preference toggled by Ctrl+O.
+    tool_outputs_expanded: std::sync::Mutex<bool>,
     /// Run status for the status indicator + interrupt routing.
     status: std::sync::Mutex<RunStatus>,
     /// Cancellation signal for the short phase that starts the persistent JS
@@ -3946,25 +3952,33 @@ impl TuiState {
         self.extension_editor_open() || self.extension_input_open()
     }
 
-    /// Record a freshly created tool component as the "most recent" so Ctrl+T
-    /// can toggle its expansion. Idempotent overwrites — only the latest lives.
-    fn remember_tool(&self, comp: Arc<ToolExecutionComponent>) {
-        *self.last_tool_comp.lock().unwrap() = Some(comp);
+    fn set_hide_thinking(&self, hide: bool) {
+        *self.hide_thinking.lock().unwrap() = hide;
+        if let Some(comp) = self.current_assistant.lock().unwrap().as_ref() {
+            comp.set_hide_thinking(hide);
+        }
     }
 
-    /// Toggle `expanded` on the most recent tool component (Ctrl+T). Returns
-    /// `true` if a component was toggled. Limitation: the key loop tracks no
-    /// per-line focus, so this always targets the *last* tool shown — not the
-    /// one under the cursor. Documented in the plan; a focused expansion would
-    /// need mouse/line hit-testing which is out of scope this pass.
-    fn toggle_expand_last_tool(&self) -> bool {
-        if let Some(comp) = self.last_tool_comp.lock().unwrap().as_ref() {
-            let cur = comp.is_expanded();
-            comp.set_expanded(!cur);
-            true
-        } else {
-            false
+    fn hide_thinking(&self) -> bool {
+        *self.hide_thinking.lock().unwrap()
+    }
+
+    fn toggle_thinking(&self) -> bool {
+        let next = !self.hide_thinking();
+        self.set_hide_thinking(next);
+        next
+    }
+
+    fn toggle_tool_outputs(&self) -> bool {
+        let next = !*self.tool_outputs_expanded.lock().unwrap();
+        *self.tool_outputs_expanded.lock().unwrap() = next;
+        for comp in self.tool_components.lock().unwrap().values() {
+            comp.set_expanded(next);
         }
+        for comp in self.bash_components.lock().unwrap().values() {
+            comp.set_expanded(next);
+        }
+        next
     }
 
     /// The model id currently tracked as active (footer + Ctrl+M anchor).
@@ -4028,6 +4042,7 @@ pub async fn interactive_tui(
     extra_messages: &[String],
     initial_images: Vec<rpi_ai::types::ImageContent>,
     theme: Option<&str>,
+    no_themes: bool,
     reload_context: &crate::session::ReloadContext,
 ) -> i32 {
     let lane: Arc<dyn AgentLane> = harness.lane("main");
@@ -4072,7 +4087,7 @@ pub async fn interactive_tui(
     } {
         apply_theme_preset(preset);
         theme_manager.apply_preset(preset);
-    } else {
+    } else if !no_themes {
         if let Some(name) = theme {
             match crate::packages::load_theme_with_resources(&cwd, name, &package_resources) {
                 Ok(custom) => {
@@ -4279,7 +4294,9 @@ pub async fn interactive_tui(
         current_assistant: std::sync::Mutex::new(None),
         tool_components: std::sync::Mutex::new(HashMap::new()),
         bash_components: std::sync::Mutex::new(HashMap::new()),
-        last_tool_comp: std::sync::Mutex::new(None),
+        themes_enabled: !no_themes,
+        hide_thinking: std::sync::Mutex::new(false),
+        tool_outputs_expanded: std::sync::Mutex::new(false),
         status: std::sync::Mutex::new(RunStatus::Idle),
         js_preparation_cancel: std::sync::Mutex::new(None),
         footer: footer.clone(),
@@ -4820,17 +4837,22 @@ pub async fn interactive_tui(
                 continue;
             }
 
-            // 2d. Ctrl+T: toggle expansion on the most recent tool component.
-            //     The key loop tracks no per-line focus, so this is an "expand
-            //     last tool" affordance rather than a cursor-targeted toggle
-            //     (documented limitation; see `toggle_expand_last_tool`).
-            if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('t') {
-                state_for_key.toggle_expand_last_tool();
+            // 2d. Ctrl+O: toggle all tool output panels between compact and
+            // expanded rendering (native Pi's global output toggle).
+            if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('o') {
+                state_for_key.toggle_tool_outputs();
                 tui_for_key.request_render(false);
                 continue;
             }
 
-            // 2e. Ctrl+M: cycle to the next model in the catalog after the one
+            // 2e. Ctrl+T: toggle visibility of reasoning/thinking blocks.
+            if key.modifiers == KeyModifiers::CONTROL && key.code == KeyCode::Char('t') {
+                state_for_key.toggle_thinking();
+                tui_for_key.request_render(false);
+                continue;
+            }
+
+            // 2f. Ctrl+M: cycle to the next model in the catalog after the one
             //     currently tracked in `current_model_id`, apply it live via
             //     `lane.set_model` (takes effect on the next user message — the
             //     in-flight run's config is already snapshotted), and update the
@@ -4860,13 +4882,19 @@ pub async fn interactive_tui(
                 let catalog = model_catalog_for_key.clone();
                 let state = state_for_key.clone();
                 tokio::spawn(async move {
-                    let Ok(current_model) = lane.get_model().await else { return };
+                    let Ok(current_model) = lane.get_model().await else {
+                        return;
+                    };
                     let levels = catalog
                         .iter()
-                        .find(|model| model.provider == current_model.provider && model.id == current_model.id)
+                        .find(|model| {
+                            model.provider == current_model.provider && model.id == current_model.id
+                        })
                         .map(|model| model.supported_thinking_levels())
                         .unwrap_or_else(|| vec![rpi_ai::types::ThinkingLevel::Medium]);
-                    if levels.is_empty() { return; }
+                    if levels.is_empty() {
+                        return;
+                    }
                     let current = lane
                         .get_thinking_level()
                         .await
@@ -4877,7 +4905,9 @@ pub async fn interactive_tui(
                         .map(|index| levels[(index + 1) % levels.len()])
                         .unwrap_or(levels[0]);
                     if lane.set_thinking_level(next).await.is_ok() {
-                        state.footer.set_thinking_level(Some(thinking_level_name(next)));
+                        state
+                            .footer
+                            .set_thinking_level(Some(thinking_level_name(next)));
                         state.tui.as_ref().map(|tui| tui.request_render(false));
                     }
                 });
@@ -5361,7 +5391,9 @@ fn launch_external_editor(draft: String, tx: mpsc::UnboundedSender<TuiMessage>) 
             Ok(status) if status.success() => std::fs::read_to_string(file.path())
                 .map_err(|error| format!("Could not read editor file: {error}")),
             Ok(status) => Err(format!("External editor exited with {status}")),
-            Err(error) => Err(format!("Could not launch external editor `{editor}`: {error}")),
+            Err(error) => Err(format!(
+                "Could not launch external editor `{editor}`: {error}"
+            )),
         };
         let _ = tx.send(TuiMessage::ExternalEditorResult(result));
     });
@@ -5651,6 +5683,7 @@ async fn handle_agent_event(
                 if let Some(t) = state.markdown_transformer() {
                     comp.set_markdown_transformer(Some(t));
                 }
+                comp.set_hide_thinking(state.hide_thinking());
                 comp.set_streaming(true);
                 // Render text AND thinking blocks in order (the old path fed
                 // only the concatenated text, so thinking blocks never showed).
@@ -5717,6 +5750,7 @@ async fn handle_agent_event(
                             let mut bash = state.bash_components.lock().unwrap();
                             if !bash.contains_key(&tc.id) {
                                 let comp = Arc::new(BashExecutionComponent::new(command));
+                                comp.set_expanded(*state.tool_outputs_expanded.lock().unwrap());
                                 chat.add_child(comp.clone());
                                 bash.insert(tc.id.clone(), comp);
                             }
@@ -5727,6 +5761,7 @@ async fn handle_agent_event(
                                     &tc.name,
                                     &tc.arguments.to_string(),
                                 ));
+                                comp.set_expanded(*state.tool_outputs_expanded.lock().unwrap());
                                 comp.set_running();
                                 chat.add_child(comp.clone());
                                 tools.insert(tc.id.clone(), comp);
@@ -5821,11 +5856,12 @@ async fn handle_agent_event(
                     existing.set_command(&command);
                 } else {
                     let comp = Arc::new(BashExecutionComponent::new(command));
+                    comp.set_expanded(*state.tool_outputs_expanded.lock().unwrap());
                     chat.add_child(comp.clone());
                     bash_map.insert(tool_call_id.clone(), comp);
                 }
             } else {
-                let comp = {
+                let _comp = {
                     let mut tools = state.tool_components.lock().unwrap();
                     if let Some(existing) = tools.get(&tool_call_id) {
                         existing.set_args(&args.to_string());
@@ -5833,9 +5869,10 @@ async fn handle_agent_event(
                     } else {
                         let comp =
                             Arc::new(ToolExecutionComponent::new(&tool_name, &args.to_string()));
+                        comp.set_expanded(*state.tool_outputs_expanded.lock().unwrap());
                         // A `read` of a SKILL.md renders as native Pi's
                         // `[skill] <name>` invocation box (custom-message
-                        // background, collapsed to one line, Ctrl+T expands the
+                        // background, collapsed to one line, Ctrl+O expands the
                         // skill markdown) instead of a generic READ tool panel.
                         if let Some(skill) = skill_tool_name(&tool_name, &args) {
                             comp.set_skill_name(skill);
@@ -5846,7 +5883,6 @@ async fn handle_agent_event(
                         comp
                     }
                 };
-                state.remember_tool(comp);
             }
             state.sync_working_loader_with_bash();
             tui.request_render(false);
@@ -5886,10 +5922,10 @@ async fn handle_agent_event(
                 // full content, not the single-line ⏎-folded summary.
                 comp.set_result(&tool_result_text(&partial_result), false);
                 apply_edit_diff(comp, &tool_name, &partial_result.details, &tui);
-                state.remember_tool(comp.clone());
             } else {
                 // No component yet — create a running one so the partial shows.
                 let comp = Arc::new(ToolExecutionComponent::new(&tool_name, ""));
+                comp.set_expanded(*state.tool_outputs_expanded.lock().unwrap());
                 if let Some(skill) = skill_tool_name(&tool_name, &args) {
                     comp.set_skill_name(skill);
                 }
@@ -5902,7 +5938,6 @@ async fn handle_agent_event(
                     .lock()
                     .unwrap()
                     .insert(tool_call_id.clone(), comp.clone());
-                state.remember_tool(comp);
             }
             state.sync_working_loader_with_bash();
             tui.request_render(false);
@@ -5928,6 +5963,7 @@ async fn handle_agent_event(
                         .unwrap_or("")
                         .to_string();
                     let comp = Arc::new(BashExecutionComponent::new(command));
+                    comp.set_expanded(*state.tool_outputs_expanded.lock().unwrap());
                     comp.append_output(&tool_result_text(&result));
                     finalize_bash(&comp, &result, is_error);
                     chat.add_child(comp);
@@ -5941,10 +5977,10 @@ async fn handle_agent_event(
                     // Tool ended without a Start/Update (e.g. a very fast tool):
                     // render a finalized component directly.
                     let comp = Arc::new(ToolExecutionComponent::new(&tool_name, ""));
+                    comp.set_expanded(*state.tool_outputs_expanded.lock().unwrap());
                     comp.set_result(&tool_result_text(&result), is_error);
                     apply_edit_diff(&comp, &tool_name, &result.details, &tui);
                     chat.add_child(comp.clone());
-                    state.remember_tool(comp);
                 }
             }
             state.sync_working_loader_with_bash();
@@ -6429,9 +6465,11 @@ fn open_theme_selector(
         SelectItem::new("light", "Light").with_description("Light background"),
         SelectItem::new("monochrome", "Monochrome").with_description("No color accents"),
     ];
-    for path in package_resources.theme_files() {
-        if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
-            items.push(SelectItem::new(name, name).with_description("Package theme"));
+    if state.themes_enabled {
+        for path in package_resources.theme_files() {
+            if let Some(name) = path.file_stem().and_then(|s| s.to_str()) {
+                items.push(SelectItem::new(name, name).with_description("Package theme"));
+            }
         }
     }
     let list = Arc::new(SelectList::new(items, 10));
@@ -6449,13 +6487,15 @@ fn open_theme_selector(
             "dark" => Some(ThemePreset::Dark),
             name => {
                 if let Ok(cwd) = std::env::current_dir() {
-                    if let Ok(custom) = crate::packages::load_theme_with_resources(
-                        &cwd,
-                        name,
-                        &package_resources_sel,
-                    ) {
-                        rpi_tui::global_theme_manager().set(custom.clone());
-                        state_sel.theme_manager.set(custom);
+                    if state_sel.themes_enabled {
+                        if let Ok(custom) = crate::packages::load_theme_with_resources(
+                            &cwd,
+                            name,
+                            &package_resources_sel,
+                        ) {
+                            rpi_tui::global_theme_manager().set(custom.clone());
+                            state_sel.theme_manager.set(custom);
+                        }
                     }
                 }
                 add_note_message(&chat_sel, &format!("Theme set to {}.", item.label));
@@ -7569,7 +7609,9 @@ mod tests {
             current_assistant: std::sync::Mutex::new(None),
             tool_components: std::sync::Mutex::new(HashMap::new()),
             bash_components: std::sync::Mutex::new(HashMap::new()),
-            last_tool_comp: std::sync::Mutex::new(None),
+            themes_enabled: true,
+            hide_thinking: std::sync::Mutex::new(false),
+            tool_outputs_expanded: std::sync::Mutex::new(false),
             status: std::sync::Mutex::new(RunStatus::Idle),
             js_preparation_cancel: std::sync::Mutex::new(None),
             footer: Arc::new(FooterComponent::new()),
@@ -7888,7 +7930,9 @@ mod tests {
             current_assistant: std::sync::Mutex::new(None),
             tool_components: std::sync::Mutex::new(HashMap::new()),
             bash_components: std::sync::Mutex::new(HashMap::new()),
-            last_tool_comp: std::sync::Mutex::new(None),
+            themes_enabled: true,
+            hide_thinking: std::sync::Mutex::new(false),
+            tool_outputs_expanded: std::sync::Mutex::new(false),
             status: std::sync::Mutex::new(RunStatus::Idle),
             js_preparation_cancel: std::sync::Mutex::new(None),
             footer: Arc::new(FooterComponent::new()),
@@ -7951,7 +7995,9 @@ mod tests {
             current_assistant: std::sync::Mutex::new(None),
             tool_components: std::sync::Mutex::new(HashMap::new()),
             bash_components: std::sync::Mutex::new(HashMap::new()),
-            last_tool_comp: std::sync::Mutex::new(None),
+            themes_enabled: true,
+            hide_thinking: std::sync::Mutex::new(false),
+            tool_outputs_expanded: std::sync::Mutex::new(false),
             status: std::sync::Mutex::new(RunStatus::Idle),
             js_preparation_cancel: std::sync::Mutex::new(None),
             footer: Arc::new(FooterComponent::new()),
@@ -8017,7 +8063,9 @@ mod tests {
             current_assistant: std::sync::Mutex::new(None),
             tool_components: std::sync::Mutex::new(HashMap::new()),
             bash_components: std::sync::Mutex::new(HashMap::new()),
-            last_tool_comp: std::sync::Mutex::new(None),
+            themes_enabled: true,
+            hide_thinking: std::sync::Mutex::new(false),
+            tool_outputs_expanded: std::sync::Mutex::new(false),
             status: std::sync::Mutex::new(RunStatus::Idle),
             js_preparation_cancel: std::sync::Mutex::new(None),
             footer: Arc::new(FooterComponent::new()),
@@ -8086,7 +8134,9 @@ mod tests {
             current_assistant: std::sync::Mutex::new(None),
             tool_components: std::sync::Mutex::new(HashMap::new()),
             bash_components: std::sync::Mutex::new(HashMap::new()),
-            last_tool_comp: std::sync::Mutex::new(None),
+            themes_enabled: true,
+            hide_thinking: std::sync::Mutex::new(false),
+            tool_outputs_expanded: std::sync::Mutex::new(false),
             status: std::sync::Mutex::new(RunStatus::Idle),
             js_preparation_cancel: std::sync::Mutex::new(None),
             footer: Arc::new(FooterComponent::new()),

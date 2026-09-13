@@ -367,7 +367,9 @@ fn configured_global_dirs(agent_dir: PathBuf, kind: ResourceKind) -> Vec<PathBuf
 }
 
 fn global_resource_dirs(sub: &str, kind: ResourceKind) -> Vec<PathBuf> {
-    let Some(g) = global_dir(sub) else { return Vec::new() };
+    let Some(g) = global_dir(sub) else {
+        return Vec::new();
+    };
     let mut dirs = configured_global_dirs(g.clone(), kind);
     dirs.push(g);
     dirs
