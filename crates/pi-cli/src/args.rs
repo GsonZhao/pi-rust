@@ -11,7 +11,7 @@
 //!
 //! Divergences from the TS parser (all deliberate v1 scope cuts, documented in
 //! `docs/m6-cli-open-questions.md`):
-//! - `--mode rpc`, `--tui-mode`, `--export`, `--list-models`,
+//! - `--mode rpc`, `--tui-mode`, `--export`,
 //!   `--fork`, `--offline`, `--approve`/`-na`,
 //!   `--extension`/`-e`, `--skill`, and `--prompt-template` are recognized but
 //!   not all wired into the full TS package manager. The supported resource
@@ -56,6 +56,10 @@ pub struct Args {
 
     pub print: bool,
     pub mode: Mode,
+    /// `--list-models [search]`: list the available model catalog and exit.
+    /// `Some(None)` means no search term; `Some(Some(pattern))` applies a
+    /// case-insensitive fuzzy/subsequence filter.
+    pub list_models: Option<Option<String>>,
 
     pub continue_session: bool,
     pub resume: bool,
@@ -374,16 +378,18 @@ pub fn parse_args(args: &[String]) -> Args {
             }
             "--list-models" => {
                 // Optionally consumes a search term.
-                if inline.is_none()
-                    && i + 1 < args.len()
+                let search = if let Some(value) = inline.clone() {
+                    Some(value)
+                } else if i + 1 < args.len()
                     && !args[i + 1].starts_with('-')
                     && !args[i + 1].starts_with('@')
                 {
                     i += 1;
-                }
-                result
-                    .ignored
-                    .push("--list-models is not supported in v1 (ignored)".to_string());
+                    Some(args[i].clone())
+                } else {
+                    None
+                };
+                result.list_models = Some(search);
             }
             // Unknown long flag (with or without `=`). `flag_key` already holds
             // the bare name, so both `--frobnicate` and `--frobnicate=x` land
@@ -496,6 +502,7 @@ pub fn print_help() {
   --extensions-dir, -ed <dir>    Extra dir to scan for plugins (.dll/.so/.dylib); repeatable
                                  (also via RPI_EXTENSIONS_DIR env: ';' on Windows, ':' on Unix)
   --debug-system-prompt          Print the resolved system-prompt sections to stderr (verification)
+  --list-models [search]         List available models (optional fuzzy search)
   --verbose                      Show startup warnings (e.g. ignored flags)
   --help, -h                     Show this help
   --version, -v                  Show version
@@ -655,6 +662,17 @@ mod tests {
         );
         // The value is consumed, not read as a message:
         assert!(a.messages.is_empty());
+    }
+
+    #[test]
+    fn list_models_accepts_optional_search_without_warning() {
+        let a = parse_args(&s(&["--list-models"]));
+        assert_eq!(a.list_models, Some(None));
+        assert!(a.ignored.is_empty());
+        let a = parse_args(&s(&["--list-models", "sonnet"]));
+        assert_eq!(a.list_models, Some(Some("sonnet".to_string())));
+        assert!(a.messages.is_empty());
+        assert!(a.ignored.is_empty());
     }
 
     #[test]

@@ -142,6 +142,13 @@ pub async fn run() -> i32 {
     // set (an explicit override is its own layout).
     let _ = crate::config::migrate_legacy_layout();
 
+    // `--list-models` is a catalog/discovery command. It must not require a
+    // provider credential or build a harness just to print local models.
+    if let Some(search) = parsed.list_models.as_ref() {
+        print_model_catalog(crate::provider::catalog_snapshot(), search.as_deref());
+        return 0;
+    }
+
     // Build before provider resolution so compiler errors do not require
     // valid model credentials. The staged directory joins normal discovery.
     let dev_extension = if let Some(options) = &dev_options {
@@ -351,6 +358,137 @@ pub async fn run() -> i32 {
         dev.cleanup();
     }
     exit_code
+}
+
+/// Print the local model catalog in a stable, script-friendly table. Matching
+/// uses a case-insensitive subsequence so a short query such as `sonnet` or
+/// `gpt4o` behaves like native Pi's fuzzy model search without a dependency on
+/// a full fuzzy-search crate.
+fn print_model_catalog(mut models: Vec<rpi_ai::Model>, search: Option<&str>) {
+    if let Some(pattern) = search.filter(|value| !value.is_empty()) {
+        models.retain(|model| {
+            let haystack = format!("{} {}", model.provider, model.id);
+            fuzzy_subsequence_match(&haystack, pattern)
+        });
+        if models.is_empty() {
+            println!("No models matching \"{pattern}\"");
+            return;
+        }
+    }
+    models.sort_by(|a, b| a.provider.cmp(&b.provider).then_with(|| a.id.cmp(&b.id)));
+    if models.is_empty() {
+        println!("No models available.");
+        return;
+    }
+
+    let rows: Vec<(String, String, String, String, &'static str, &'static str)> = models
+        .iter()
+        .map(|model| {
+            let context = format_token_count(model.context_window);
+            let max_out = format_token_count(model.max_tokens);
+            let thinking = if model.reasoning { "yes" } else { "no" };
+            let images = if model
+                .input
+                .iter()
+                .any(|modality| matches!(modality, rpi_ai::InputModality::Image))
+            {
+                "yes"
+            } else {
+                "no"
+            };
+            (
+                model.provider.clone(),
+                model.id.clone(),
+                context,
+                max_out,
+                thinking,
+                images,
+            )
+        })
+        .collect();
+    let headers = (
+        "provider", "model", "context", "max-out", "thinking", "images",
+    );
+    let widths = (
+        std::iter::once(headers.0.len())
+            .chain(rows.iter().map(|row| row.0.len()))
+            .max()
+            .unwrap_or(headers.0.len()),
+        std::iter::once(headers.1.len())
+            .chain(rows.iter().map(|row| row.1.len()))
+            .max()
+            .unwrap_or(headers.1.len()),
+        std::iter::once(headers.2.len())
+            .chain(rows.iter().map(|row| row.2.len()))
+            .max()
+            .unwrap_or(headers.2.len()),
+        std::iter::once(headers.3.len())
+            .chain(rows.iter().map(|row| row.3.len()))
+            .max()
+            .unwrap_or(headers.3.len()),
+        headers.4.len(),
+        headers.5.len(),
+    );
+    println!(
+        "{:<p$}  {:<m$}  {:>c$}  {:>o$}  {:<t$}  {:<i$}",
+        headers.0,
+        headers.1,
+        headers.2,
+        headers.3,
+        headers.4,
+        headers.5,
+        p = widths.0,
+        m = widths.1,
+        c = widths.2,
+        o = widths.3,
+        t = widths.4,
+        i = widths.5,
+    );
+    for row in rows {
+        println!(
+            "{:<p$}  {:<m$}  {:>c$}  {:>o$}  {:<t$}  {:<i$}",
+            row.0,
+            row.1,
+            row.2,
+            row.3,
+            row.4,
+            row.5,
+            p = widths.0,
+            m = widths.1,
+            c = widths.2,
+            o = widths.3,
+            t = widths.4,
+            i = widths.5,
+        );
+    }
+}
+
+fn format_token_count(count: u64) -> String {
+    if count >= 1_000_000 {
+        let millions = count as f64 / 1_000_000.0;
+        if count % 1_000_000 == 0 {
+            format!("{}M", millions as u64)
+        } else {
+            format!("{millions:.1}M")
+        }
+    } else if count >= 1_000 {
+        let thousands = count as f64 / 1_000.0;
+        if count % 1_000 == 0 {
+            format!("{}K", thousands as u64)
+        } else {
+            format!("{thousands:.1}K")
+        }
+    } else {
+        count.to_string()
+    }
+}
+
+fn fuzzy_subsequence_match(haystack: &str, needle: &str) -> bool {
+    let mut chars = haystack.chars().map(|ch| ch.to_ascii_lowercase());
+    needle
+        .chars()
+        .map(|ch| ch.to_ascii_lowercase())
+        .all(|wanted| chars.by_ref().any(|candidate| candidate == wanted))
 }
 
 /// Read piped stdin into a string. Mirrors TS `readPipedStdin`: returns `None`
