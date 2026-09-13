@@ -793,7 +793,7 @@ fn find_model(
         .iter()
         .find(|model| {
             model.id.eq_ignore_ascii_case(pattern)
-                && provider.is_none_or(|requested| provider_matches(model, requested, cfg))
+                && provider.map_or(true, |requested| provider_matches(model, requested, cfg))
         })
         .cloned()
 }

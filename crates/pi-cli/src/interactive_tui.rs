@@ -47,8 +47,7 @@ use rpi_tui::{
     FooterComponent, Image, ImageOptions, Input, Loader, ProcessTerminal, ScrollView,
     ScrollViewOptions, SelectItem, SelectList, SlashCommand as SlashCommandEntry,
     SlashCommandAutocompleteProvider, Spacer, StackChild, StackEntry, Text, ThemeManager,
-    ThemePreset, ToolExecutionComponent, TuiAltScreen,
-    UserMessageComponent, VStack, TUI,
+    ThemePreset, ToolExecutionComponent, TuiAltScreen, UserMessageComponent, VStack, TUI,
 };
 use rpi_tui::{bold as tui_bold, theme as current_theme};
 
@@ -2825,7 +2824,7 @@ fn find_model_selector_match(catalog: &[rpi_ai::Model], input: &str) -> Option<r
         .iter()
         .find(|model| {
             model.id.eq_ignore_ascii_case(id)
-                && provider.is_none_or(|provider| {
+                && provider.map_or(true, |provider| {
                     model.provider.eq_ignore_ascii_case(provider)
                         || (provider.eq_ignore_ascii_case("anthropic")
                             && matches!(model.api, rpi_ai::Api::AnthropicMessages))

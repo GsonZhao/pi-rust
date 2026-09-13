@@ -294,7 +294,7 @@ impl Component for ToolExecutionComponent {
                 let hint = colors.muted.fg(&hint);
                 lines.push(apply_background_to_line(&hint, width, |s| bg.bg(s)));
             }
-        } else if diff_lines.as_ref().is_none_or(|d| d.is_empty()) && !*expanded {
+        } else if diff_lines.as_ref().map_or(true, |d| d.is_empty()) && !*expanded {
             // No result yet, no diff, and collapsed: pad one bg-tinted row so
             // the tool block still reads as a block (pi keeps the bg band).
             let pad = apply_background_to_line("", width, |s| bg.bg(s));

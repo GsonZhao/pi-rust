@@ -70,15 +70,18 @@ struct DistTags {
 /// Keep this compatibility entry point conservative: callers that have not
 /// explicitly opted into Pi packages must never parse package settings.
 pub async fn check_startup(cwd: &Path) -> UpdateReport {
-    check_startup_with_packages(cwd, false).await
+    let _ = cwd;
+    check_startup_with_package_resources(None).await
 }
 
 /// Perform a cached, best-effort startup check.
 ///
-/// enable_pi_packages is the already-resolved runtime gate
-/// (--enable-pi-packages plus the --no-extensions kill switch). Package
-/// settings are only discovered and checked when this is true.
-pub async fn check_startup_with_packages(cwd: &Path, enable_pi_packages: bool) -> UpdateReport {
+/// `package_resources` must be the same trust-gated resource set that the
+/// session will load. `None` disables Pi package checks entirely.
+pub async fn check_startup_with_package_resources(
+    package_resources: Option<&crate::packages::PackageResources>,
+) -> UpdateReport {
+    let enable_pi_packages = package_resources.is_some();
     if std::env::var_os("RPI_DISABLE_UPDATE_CHECK").is_some() {
         return UpdateReport::default();
     }
@@ -89,7 +92,7 @@ pub async fn check_startup_with_packages(cwd: &Path, enable_pi_packages: bool) -
     let previous_cache = read_cache(&cache_path);
     if let Some(cache) = previous_cache.as_ref() {
         if cache_is_fresh(cache, enable_pi_packages) {
-            return report_from_cache(&cache, cwd, enable_pi_packages);
+            return report_from_cache(cache, package_resources);
         }
     }
 
@@ -102,12 +105,17 @@ pub async fn check_startup_with_packages(cwd: &Path, enable_pi_packages: bool) -
         Err(_) => return UpdateReport::default(),
     };
     let rpi_latest = fetch_rpi_latest(&client).await;
-    let package_names = if enable_pi_packages {
-        crate::packages::discover_from_settings(cwd)
+    let package_names = if let Some(resources) = package_resources {
+        resources
             .packages
-            .into_iter()
+            .iter()
             .filter(|package| package.version.is_some() && is_registry_package_path(&package.root))
-            .map(|package| (package.name, package.version.unwrap_or_default()))
+            .map(|package| {
+                (
+                    package.name.clone(),
+                    package.version.clone().unwrap_or_default(),
+                )
+            })
             .collect::<Vec<_>>()
     } else {
         Vec::new()
@@ -165,7 +173,7 @@ pub async fn check_startup_with_packages(cwd: &Path, enable_pi_packages: bool) -
     {
         let _ = write_cache(&cache_path, &cache);
     }
-    report_from_cache(&cache, cwd, enable_pi_packages)
+    report_from_cache(&cache, package_resources)
 }
 
 fn cache_is_fresh(cache: &UpdateCache, enable_pi_packages: bool) -> bool {
@@ -174,7 +182,10 @@ fn cache_is_fresh(cache: &UpdateCache, enable_pi_packages: bool) -> bool {
         && (!enable_pi_packages || now.saturating_sub(cache.packages_checked_at) < CACHE_TTL_MS)
 }
 
-fn report_from_cache(cache: &UpdateCache, cwd: &Path, enable_pi_packages: bool) -> UpdateReport {
+fn report_from_cache(
+    cache: &UpdateCache,
+    package_resources: Option<&crate::packages::PackageResources>,
+) -> UpdateReport {
     let mut notices = Vec::new();
     if let Some(latest) = cache.rpi_latest.as_deref() {
         if is_newer(crate::VERSION, latest) {
@@ -186,9 +197,8 @@ fn report_from_cache(cache: &UpdateCache, cwd: &Path, enable_pi_packages: bool) 
             });
         }
     }
-    if enable_pi_packages {
-        let resources = crate::packages::discover_from_settings(cwd);
-        for package in resources.packages {
+    if let Some(resources) = package_resources {
+        for package in &resources.packages {
             let Some(current) = package.version.as_deref() else {
                 continue;
             };
@@ -197,7 +207,7 @@ fn report_from_cache(cache: &UpdateCache, cwd: &Path, enable_pi_packages: bool) 
             };
             if is_newer(current, latest) {
                 notices.push(UpdateNotice {
-                    name: package.name,
+                    name: package.name.clone(),
                     current: current.into(),
                     latest: latest.into(),
                     command: "rpi package update".into(),
@@ -361,7 +371,6 @@ pub fn run_self_update(args: &[String]) -> i32 {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
-    use std::path::Path;
 
     use super::{cache_is_fresh, is_newer, report_from_cache, UpdateCache};
 
@@ -385,8 +394,38 @@ mod tests {
             native_packages: BTreeMap::new(),
         };
 
-        let report = report_from_cache(&cache, Path::new("."), false);
+        let report = report_from_cache(&cache, None);
         assert!(report.notices.is_empty());
+    }
+
+    #[test]
+    fn package_notices_use_only_the_supplied_resource_set() {
+        let temp = tempfile::tempdir().unwrap();
+        let package_dir = temp.path().join(".rpi/packages/example");
+        std::fs::create_dir_all(&package_dir).unwrap();
+        std::fs::write(
+            package_dir.join("package.json"),
+            r#"{"name":"example-package","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let resources =
+            crate::packages::discover(temp.path(), &[package_dir.to_string_lossy().into_owned()]);
+        assert_eq!(resources.packages.len(), 1);
+
+        let mut packages = BTreeMap::new();
+        packages.insert("example-package".to_string(), "2.0.0".to_string());
+        let cache = UpdateCache {
+            checked_at: 0,
+            rpi_latest: None,
+            packages,
+            packages_checked_at: 0,
+            native_packages: BTreeMap::new(),
+        };
+
+        assert!(report_from_cache(&cache, None).notices.is_empty());
+        let report = report_from_cache(&cache, Some(&resources));
+        assert_eq!(report.notices.len(), 1);
+        assert_eq!(report.notices[0].name, "example-package");
     }
 
     #[test]

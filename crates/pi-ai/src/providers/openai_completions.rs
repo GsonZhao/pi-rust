@@ -602,7 +602,7 @@ impl StreamState {
         else {
             return;
         };
-        if chunk.get("usage").is_none_or(Value::is_null) {
+        if chunk.get("usage").map_or(true, Value::is_null) {
             if let Some(usage) = choice.get("usage").filter(|v| !v.is_null()) {
                 self.output.usage = parse_usage(usage);
             }

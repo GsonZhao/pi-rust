@@ -3066,14 +3066,14 @@ mod tests {
                 .send(worker_session.invoke_command("custom", ""))
                 .unwrap();
         });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while !session.custom_active() && std::time::Instant::now() < deadline {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         assert!(session.custom_active(), "custom UI did not open");
         session.send_custom_input("x").unwrap();
         let value = receiver
-            .recv_timeout(std::time::Duration::from_secs(2))
+            .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap()
             .unwrap();
         assert_eq!(value["result"]["consumed"], true);

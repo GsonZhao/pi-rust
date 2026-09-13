@@ -230,11 +230,10 @@ pub async fn run() -> i32 {
         && std::io::stdin().is_terminal()
         && std::io::stdout().is_terminal()
     {
-        let report = crate::updates::check_startup_with_packages(
-            &cwd,
-            crate::session::should_load_js_packages(&parsed),
-        )
-        .await;
+        let package_resources = crate::session::should_load_js_packages(&parsed)
+            .then(|| crate::session::package_resources_for(&parsed, &cwd));
+        let report =
+            crate::updates::check_startup_with_package_resources(package_resources.as_ref()).await;
         crate::updates::print_startup_notices(&report);
     }
 
