@@ -738,6 +738,52 @@ pub fn provider_is_openai_responses(cfg: &ProviderConfig) -> bool {
     matches!(cfg.api.as_deref(), Some("openai-responses"))
 }
 
+/// Resolve an OpenAI-compatible provider key from its explicit config or the
+/// conventional provider-specific environment variable. Native Pi accepts
+/// both `apiKey: "$ENV"` and common `<PROVIDER>_API_KEY` names; keeping this
+/// helper in the config layer lets every OpenAI-compatible protocol share the
+/// same behavior.
+pub fn openai_provider_api_key(provider_id: &str, cfg: &ProviderConfig) -> Option<String> {
+    if let Some(raw) = cfg.api_key.as_deref().filter(|key| !key.is_empty()) {
+        if let Some(value) = resolve_config_value(raw, None).filter(|value| !value.is_empty()) {
+            return Some(value);
+        }
+    }
+
+    let normalized: String = provider_id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let mut names = vec![format!("{normalized}_API_KEY")];
+    match provider_id.to_ascii_lowercase().as_str() {
+        "openai" | "openai-completions" | "openai-responses" => {
+            names.push("OPENAI_API_KEY".to_string())
+        }
+        "deepseek" => names.push("DEEPSEEK_API_KEY".to_string()),
+        "groq" => names.push("GROQ_API_KEY".to_string()),
+        "mistral" => names.push("MISTRAL_API_KEY".to_string()),
+        "fireworks" => names.push("FIREWORKS_API_KEY".to_string()),
+        "together" | "togetherai" => names.push("TOGETHER_API_KEY".to_string()),
+        "openrouter" => names.push("OPENROUTER_API_KEY".to_string()),
+        "xai" => names.push("XAI_API_KEY".to_string()),
+        "cerebras" => names.push("CEREBRAS_API_KEY".to_string()),
+        "perplexity" => names.push("PERPLEXITY_API_KEY".to_string()),
+        "moonshot" | "moonshotai" | "kimi" => names.push("MOONSHOT_API_KEY".to_string()),
+        "qwen" | "qwen-token-plan" => names.push("DASHSCOPE_API_KEY".to_string()),
+        "zai" | "zhipu" => names.push("ZHIPUAI_API_KEY".to_string()),
+        _ => {}
+    }
+    names
+        .into_iter()
+        .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+}
+
 /// Convert a `(provider_id, ProviderConfig)` pair into a list of library
 /// [`Model`]s. Provider-level `base_url`/`headers`/`auth_header` fold into each
 /// model. Returns `None` for protocols that do not have a runtime provider.
@@ -814,12 +860,7 @@ pub fn provider_to_models(provider_id: &str, cfg: &ProviderConfig) -> Option<Vec
             }
         }
         if matches!(api, Api::OpenaiCompletions | Api::OpenaiResponses) {
-            if let Some(key) = cfg
-                .api_key
-                .as_deref()
-                .filter(|key| !key.is_empty())
-                .and_then(|key| resolve_config_value(key, None))
-            {
+            if let Some(key) = openai_provider_api_key(provider_id, cfg) {
                 headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
                 headers.insert("authorization".to_string(), format!("Bearer {key}"));
             }
@@ -1159,6 +1200,42 @@ mod tests {
                 .map(String::as_str),
             Some("Bearer secret")
         );
+    }
+
+    #[test]
+    fn openai_provider_uses_provider_specific_api_key_environment_alias() {
+        let _guard = env_lock().lock().unwrap();
+        let env_name = "RPI_FAKE_PROVIDER_API_KEY";
+        std::env::set_var(env_name, "env-secret");
+        let cfg = ProviderConfig {
+            name: None,
+            base_url: Some("https://gateway.example.com/v1".into()),
+            api_key: None,
+            api: Some("openai-completions".into()),
+            headers: None,
+            auth_header: None,
+            models: vec![ModelDefinition {
+                id: "fake-model".into(),
+                name: None,
+                base_url: None,
+                reasoning: None,
+                context_window: None,
+                max_tokens: None,
+                input: None,
+                headers: None,
+                compat: None,
+            }],
+        };
+        let models = provider_to_models("rpi-fake-provider", &cfg).unwrap();
+        assert_eq!(
+            models[0]
+                .headers
+                .as_ref()
+                .and_then(|headers| headers.get("authorization"))
+                .map(String::as_str),
+            Some("Bearer env-secret")
+        );
+        std::env::remove_var(env_name);
     }
 
     #[test]

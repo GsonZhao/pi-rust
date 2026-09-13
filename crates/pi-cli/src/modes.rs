@@ -170,11 +170,19 @@ pub async fn json(
 
     // The harness bus carries run lifecycle events; the agent receiver carries
     // the native fine-grained stream (turns, message deltas, and tools).
+    let (agent_done_tx, mut agent_done_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let agent_event_task = agent_events.take().map(|mut rx| {
         tokio::spawn(async move {
+            let done_tx = agent_done_tx;
             loop {
                 match rx.recv().await {
-                    Ok(event) => emit_agent_event(&event),
+                    Ok(event) => {
+                        let terminal = event.is_terminal();
+                        emit_agent_event(&event);
+                        if terminal {
+                            let _ = done_tx.send(());
+                        }
+                    }
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
@@ -197,6 +205,16 @@ pub async fn json(
     for prompt in prompts {
         match lane.prompt_text(&prompt, std::mem::take(&mut images)).await {
             Ok(result) => {
+                // The harness resolves after its run outcome, while the
+                // broadcast listener may still be scheduling the terminal
+                // AgentEnd line. Wait briefly so JSON consumers see the full
+                // lifecycle before the final result summary. The timeout is
+                // deliberately bounded for custom/older harness emitters.
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(250),
+                    agent_done_rx.recv(),
+                )
+                .await;
                 last_exit = outcome_exit_code(&result.outcome);
                 final_outcome = Some(result.outcome);
             }
@@ -243,11 +261,19 @@ pub async fn json(
 }
 
 fn emit_agent_event(event: &AgentEvent) {
+    println!("{}", agent_event_json(event));
+}
+
+/// Stable JSON projection for the fine-grained agent lifecycle stream.
+/// Complex payloads use their serde representation instead of being dropped,
+/// while convenience fields keep the stream easy to consume incrementally.
+fn agent_event_json(event: &AgentEvent) -> serde_json::Value {
     use rpi_ai::types::AssistantMessageEvent;
-    let line = match event {
+    match event {
         AgentEvent::AgentStart => serde_json::json!({"type":"agent_start"}),
         AgentEvent::AgentEnd { messages } => serde_json::json!({
-            "type":"agent_end", "messageCount": messages.len()
+            "type":"agent_end", "messageCount": messages.len(),
+            "messages": serde_json::to_value(messages).unwrap_or(serde_json::Value::Null)
         }),
         AgentEvent::TurnStart => serde_json::json!({"type":"turn_start"}),
         AgentEvent::TurnEnd {
@@ -255,7 +281,8 @@ fn emit_agent_event(event: &AgentEvent) {
             tool_results,
         } => serde_json::json!({
             "type":"turn_end", "message": serde_json::to_value(message).ok(),
-            "toolResultCount": tool_results.len()
+            "toolResultCount": tool_results.len(),
+            "toolResults": serde_json::to_value(tool_results).unwrap_or(serde_json::Value::Null)
         }),
         AgentEvent::MessageStart { message } => serde_json::json!({
             "type":"message_start", "message": serde_json::to_value(message).ok()
@@ -264,10 +291,16 @@ fn emit_agent_event(event: &AgentEvent) {
             "type":"message_end", "message": serde_json::to_value(message).ok()
         }),
         AgentEvent::MessageUpdate {
+            message,
             assistant_message_event,
-            ..
         } => {
-            let mut value = serde_json::json!({"type":"message_update"});
+            let mut value = serde_json::json!({
+                "type":"message_update",
+                "message": serde_json::to_value(message).unwrap_or(serde_json::Value::Null),
+                "assistantMessageEvent": serde_json::to_value(assistant_message_event)
+                    .unwrap_or(serde_json::Value::Null),
+                "eventType": assistant_message_event.type_tag(),
+            });
             let object = value.as_object_mut().expect("json object");
             match assistant_message_event {
                 AssistantMessageEvent::TextDelta {
@@ -303,21 +336,47 @@ fn emit_agent_event(event: &AgentEvent) {
         AgentEvent::ToolExecutionUpdate {
             tool_call_id,
             tool_name,
-            ..
+            args,
+            partial_result,
         } => serde_json::json!({
-            "type":"tool_execution_update", "toolCallId":tool_call_id, "toolName":tool_name
+            "type":"tool_execution_update", "toolCallId":tool_call_id, "toolName":tool_name,
+            "args": args,
+            "partialResult": tool_result_json(partial_result)
         }),
         AgentEvent::ToolExecutionEnd {
             tool_call_id,
             tool_name,
+            result,
             is_error,
-            ..
         } => serde_json::json!({
             "type":"tool_execution_end", "toolCallId":tool_call_id,
-            "toolName":tool_name, "isError":is_error
+            "toolName":tool_name, "isError":is_error,
+            "result": tool_result_json(result)
         }),
-    };
-    println!("{line}");
+    }
+}
+
+fn tool_result_json(result: &rpi_agent::types::AgentToolResult) -> serde_json::Value {
+    let content: Vec<serde_json::Value> = result
+        .content
+        .iter()
+        .map(|item| match item {
+            rpi_agent::types::TextContentOrImage::Text(text) => serde_json::json!({
+                "type": "text",
+                "text": text.text,
+            }),
+            rpi_agent::types::TextContentOrImage::Image(image) => {
+                serde_json::to_value(image).unwrap_or(serde_json::Value::Null)
+            }
+        })
+        .collect();
+    serde_json::json!({
+        "content": content,
+        "details": result.details,
+        "usage": result.usage.as_ref().and_then(|usage| serde_json::to_value(usage).ok()),
+        "addedToolNames": result.added_tool_names,
+        "terminate": result.terminate,
+    })
 }
 
 /// Emit a single harness event as a JSON line on stdout. Mirrors the TS
@@ -506,6 +565,8 @@ async fn run_one(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rpi_agent::events::AgentEvent;
+    use rpi_agent::types::AgentToolResult;
     use rpi_ai::types::{
         AssistantMessage, Content, StopReason, TextContent, TextContentType, Usage,
     };
@@ -565,5 +626,22 @@ mod tests {
         assert_eq!(run_end_outcome_str(RunEndOutcome::Completed), "completed");
         assert_eq!(run_end_outcome_str(RunEndOutcome::Aborted), "aborted");
         assert_eq!(run_end_outcome_str(RunEndOutcome::Failed), "failed");
+    }
+
+    #[test]
+    fn agent_event_projection_keeps_terminal_and_tool_payloads() {
+        let end = agent_event_json(&AgentEvent::AgentEnd { messages: vec![] });
+        assert_eq!(end["type"], "agent_end");
+        assert_eq!(end["messages"], serde_json::json!([]));
+
+        let tool = agent_event_json(&AgentEvent::ToolExecutionEnd {
+            tool_call_id: "call-1".into(),
+            tool_name: "read".into(),
+            result: AgentToolResult::text("hello"),
+            is_error: false,
+        });
+        assert_eq!(tool["type"], "tool_execution_end");
+        assert_eq!(tool["result"]["content"][0]["text"], "hello");
+        assert_eq!(tool["result"]["terminate"], false);
     }
 }
