@@ -332,7 +332,15 @@ pub async fn run() -> i32 {
 
     let exit_code = match mode {
         RunMode::Print => crate::modes::print(&harness, &parsed, initial.clone(), &extra, file_images.clone()).await,
-        RunMode::Json => crate::modes::json(&harness, &parsed, initial.clone(), &extra, file_images.clone()).await,
+        RunMode::Json => crate::modes::json(
+            &harness,
+            &parsed,
+            initial.clone(),
+            &extra,
+            file_images.clone(),
+            Some(event_rx),
+        )
+        .await,
         RunMode::Interactive => {
             crate::modes::interactive(
                 &harness,

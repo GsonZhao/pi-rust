@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 use rpi_ai::types::{AssistantMessage, Content, ImageContent, StopReason};
 use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome};
 use rpi_harness::events::{HarnessEvent, RunEndOutcome};
+use rpi_agent::events::AgentEvent;
 
 use crate::args::Args;
 
@@ -149,6 +150,7 @@ pub async fn json(
     initial: Option<String>,
     extra_messages: &[String],
     initial_images: Vec<ImageContent>,
+    mut agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
 ) -> i32 {
     let lane: Arc<dyn AgentLane> = harness.lane("main");
     let collected: Arc<Mutex<Vec<HarnessEvent>>> = Arc::new(Mutex::new(Vec::new()));
@@ -165,6 +167,20 @@ pub async fn json(
     // Keep the watch alive for the whole run. Leaking is acceptable for a
     // single-shot CLI process (the bus outlives this scope anyway).
     std::mem::forget(watch);
+
+    // The harness bus carries run lifecycle events; the agent receiver carries
+    // the native fine-grained stream (turns, message deltas, and tools).
+    let agent_event_task = agent_events.take().map(|mut rx| {
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => emit_agent_event(&event),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        })
+    });
 
     let mut prompts: Vec<String> = Vec::new();
     if let Some(init) = initial {
@@ -191,6 +207,9 @@ pub async fn json(
                     "error": e.to_string(),
                 });
                 println!("{line}");
+                if let Some(task) = agent_event_task {
+                    task.abort();
+                }
                 return 1;
             }
         }
@@ -217,7 +236,57 @@ pub async fn json(
         "finalText": final_text,
     });
     println!("{result_line}");
+    if let Some(task) = agent_event_task {
+        task.abort();
+    }
     last_exit
+}
+
+fn emit_agent_event(event: &AgentEvent) {
+    use rpi_ai::types::AssistantMessageEvent;
+    let line = match event {
+        AgentEvent::AgentStart => serde_json::json!({"type":"agent_start"}),
+        AgentEvent::AgentEnd { messages } => serde_json::json!({
+            "type":"agent_end", "messageCount": messages.len()
+        }),
+        AgentEvent::TurnStart => serde_json::json!({"type":"turn_start"}),
+        AgentEvent::TurnEnd { message, tool_results } => serde_json::json!({
+            "type":"turn_end", "message": serde_json::to_value(message).ok(),
+            "toolResultCount": tool_results.len()
+        }),
+        AgentEvent::MessageStart { message } => serde_json::json!({
+            "type":"message_start", "message": serde_json::to_value(message).ok()
+        }),
+        AgentEvent::MessageEnd { message } => serde_json::json!({
+            "type":"message_end", "message": serde_json::to_value(message).ok()
+        }),
+        AgentEvent::MessageUpdate { assistant_message_event, .. } => {
+            let mut value = serde_json::json!({"type":"message_update"});
+            let object = value.as_object_mut().expect("json object");
+            match assistant_message_event {
+                AssistantMessageEvent::TextDelta { content_index, delta, .. }
+                | AssistantMessageEvent::ThinkingDelta { content_index, delta, .. }
+                | AssistantMessageEvent::ToolCallDelta { content_index, delta, .. } => {
+                    object.insert("contentIndex".into(), (*content_index).into());
+                    object.insert("delta".into(), delta.clone().into());
+                }
+                _ => {}
+            }
+            value
+        }
+        AgentEvent::ToolExecutionStart { tool_call_id, tool_name, args } => serde_json::json!({
+            "type":"tool_execution_start", "toolCallId":tool_call_id,
+            "toolName":tool_name, "args":args
+        }),
+        AgentEvent::ToolExecutionUpdate { tool_call_id, tool_name, .. } => serde_json::json!({
+            "type":"tool_execution_update", "toolCallId":tool_call_id, "toolName":tool_name
+        }),
+        AgentEvent::ToolExecutionEnd { tool_call_id, tool_name, is_error, .. } => serde_json::json!({
+            "type":"tool_execution_end", "toolCallId":tool_call_id,
+            "toolName":tool_name, "isError":is_error
+        }),
+    };
+    println!("{line}");
 }
 
 /// Emit a single harness event as a JSON line on stdout. Mirrors the TS
