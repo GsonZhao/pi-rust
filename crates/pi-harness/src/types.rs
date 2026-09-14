@@ -258,7 +258,7 @@ impl Default for RetryPolicy {
             // SDK retries remain disabled separately in the agent stream
             // options so one failure is not retried twice.
             enabled: true,
-            max_retries: 3,
+            max_retries: 10,
             base_delay_ms: 2000,
             max_agent_delay_ms: 60_000,
         }
@@ -472,5 +472,17 @@ impl Default for AgentHarnessOptions {
             entry_transforms: Vec::new(),
             provider_hooks: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RetryPolicy;
+
+    #[test]
+    fn retry_policy_allows_ten_retries_by_default() {
+        let retry = RetryPolicy::default();
+        assert!(retry.enabled);
+        assert_eq!(retry.max_retries, 10);
     }
 }

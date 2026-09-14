@@ -46,8 +46,9 @@ use rpi_tui::{
     EditorOptions, EditorStyle, FilePathAutocompleteProvider, Focusable, FollowMode,
     FooterComponent, Image, ImageOptions, Input, Loader, ProcessTerminal, ScrollView,
     ScrollViewOptions, SelectItem, SelectList, SlashCommand as SlashCommandEntry,
-    SlashCommandAutocompleteProvider, Spacer, StackChild, StackEntry, Text, ThemeManager,
-    ThemePreset, ToolExecutionComponent, TuiAltScreen, UserMessageComponent, VStack, TUI,
+    SlashCommandAutocompleteProvider, Spacer, StackChild, StackEntry, StatusIndicator, Text,
+    ThemeManager, ThemePreset, ToolExecutionComponent, TuiAltScreen, UserMessageComponent, VStack,
+    TUI,
 };
 use rpi_tui::{bold as tui_bold, theme as current_theme};
 
@@ -4064,7 +4065,10 @@ impl TuiState {
     fn apply_status(&self, status: RunStatus) {
         match status {
             RunStatus::Working => {
-                self.footer.set_status("Working…");
+                // The status dock already shows the active loader. Keep the
+                // footer focused on the model and shortcuts instead of
+                // repeating a second `Working…` at the bottom of the TUI.
+                self.footer.set_status("");
                 // Reflect the in-flight turn in the terminal window/tab title
                 // (OSC 2). No-op when `tui` is absent (unit tests).
                 if let Some(tui) = &self.tui {
@@ -4106,6 +4110,22 @@ impl TuiState {
         if self.show_terminal_progress && self.bash_components.lock().unwrap().is_empty() {
             self.status_container.add_child(self.loader.clone());
         }
+    }
+
+    fn show_retry(&self, attempt: u32, max_retries: u32, delay_ms: u64) {
+        *self.status.lock().unwrap() = RunStatus::Working;
+        self.footer.set_status("");
+        if let Some(tui) = &self.tui {
+            tui.set_title("rpi — retrying");
+        }
+        self.loader.stop();
+        self.status_container.clear();
+        self.status_container
+            .add_child(Arc::new(StatusIndicator::retry(
+                attempt,
+                max_retries,
+                std::time::Duration::from_millis(delay_ms),
+            )));
     }
 
     /// Whether a selector overlay is currently open (routes keys to it first).
@@ -6141,6 +6161,16 @@ async fn handle_agent_event(
             tui.request_render(false);
         }
 
+        AgentEvent::RetryScheduled {
+            attempt,
+            max_retries,
+            delay_ms,
+            ..
+        } => {
+            state.show_retry(attempt, max_retries, delay_ms);
+            tui.request_render(false);
+        }
+
         AgentEvent::TurnStart => {
             // A new turn: reset the streaming-assistant guard so the next
             // MessageStart creates a fresh component.
@@ -6535,19 +6565,21 @@ async fn handle_agent_event(
     }
 }
 
-/// Return the diagnostic carried by a failed assistant message. Providers may
-/// omit `error_message`; keep a stable fallback so an error can never render as
-/// an empty transcript turn.
+/// Return the diagnostic carried by a failed or aborted provider request.
+/// Providers may omit `error_message`; keep a stable fallback so a terminal
+/// request failure can never render as an empty transcript turn.
 fn assistant_error_text(message: &rpi_ai::AssistantMessage) -> Option<String> {
-    if message.stop_reason != rpi_ai::StopReason::Error {
-        return None;
-    }
+    let fallback = match message.stop_reason {
+        rpi_ai::StopReason::Error => "Provider request failed.",
+        rpi_ai::StopReason::Aborted => "Request aborted.",
+        _ => return None,
+    };
     Some(
         message
             .error_message
             .as_deref()
             .filter(|text| !text.trim().is_empty())
-            .unwrap_or("Provider request failed.")
+            .unwrap_or(fallback)
             .to_string(),
     )
 }
@@ -8677,6 +8709,11 @@ mod tests {
         state.set_status(RunStatus::Idle);
         state.set_status(RunStatus::Working);
         assert_eq!(state.status_container.child_count(), 1);
+        assert!(state.footer.get_status().is_empty());
+        state.show_retry(3, 10, 8_000);
+        let retry_status = strip_ansi(&state.status_container.render(80).join("\n"));
+        assert!(retry_status.contains("Retrying (3/10)"));
+        state.set_status(RunStatus::Working);
         {
             let mut bash = state.bash_components.lock().unwrap();
             bash.insert(
@@ -8805,7 +8842,7 @@ mod tests {
     }
 
     #[test]
-    fn assistant_error_text_keeps_provider_diagnostic_visible() {
+    fn assistant_error_text_keeps_terminal_provider_diagnostic_visible() {
         use rpi_ai::types::{AssistantMessage, AssistantRole, StopReason, Usage};
 
         let failed = AssistantMessage {
@@ -8834,6 +8871,20 @@ mod tests {
         assert_eq!(
             assistant_error_text(&no_detail).as_deref(),
             Some("Provider request failed.")
+        );
+
+        let mut aborted = no_detail;
+        aborted.stop_reason = StopReason::Aborted;
+        aborted.error_message = Some("abort error: Request aborted".into());
+        assert_eq!(
+            assistant_error_text(&aborted).as_deref(),
+            Some("abort error: Request aborted")
+        );
+
+        aborted.error_message = None;
+        assert_eq!(
+            assistant_error_text(&aborted).as_deref(),
+            Some("Request aborted.")
         );
     }
 

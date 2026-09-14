@@ -48,6 +48,7 @@ pub struct StatusIndicator {
     frame: Mutex<usize>,
     start: Mutex<Option<Instant>>,
     countdown: Mutex<Option<CountdownTimer>>,
+    retry_progress: Option<(u32, u32)>,
 }
 
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -61,6 +62,7 @@ impl StatusIndicator {
             frame: Mutex::new(0),
             start: Mutex::new(Some(Instant::now())),
             countdown: Mutex::new(None),
+            retry_progress: None,
         }
     }
 
@@ -80,6 +82,7 @@ impl StatusIndicator {
             frame: Mutex::new(0),
             start: Mutex::new(Some(Instant::now())),
             countdown: Mutex::new(Some(CountdownTimer::new(delay))),
+            retry_progress: Some((attempt, max_attempts)),
         }
     }
 
@@ -99,6 +102,7 @@ impl StatusIndicator {
             frame: Mutex::new(0),
             start: Mutex::new(Some(Instant::now())),
             countdown: Mutex::new(None),
+            retry_progress: None,
         }
     }
 
@@ -111,6 +115,7 @@ impl StatusIndicator {
             frame: Mutex::new(0),
             start: Mutex::new(Some(Instant::now())),
             countdown: Mutex::new(None),
+            retry_progress: None,
         }
     }
 
@@ -125,23 +130,15 @@ impl StatusIndicator {
     pub fn tick_countdown(&self) {
         let update = {
             let c = self.countdown.lock().unwrap();
-            if let Some(timer) = c.as_ref() {
-                if timer.expired() {
-                    None
-                } else {
-                    Some(timer.remaining_secs())
-                }
-            } else {
-                None
-            }
+            c.as_ref().map(CountdownTimer::remaining_secs)
         };
         if let Some(secs) = update {
-            // We don't know attempt/max here (not stored) — keep the existing
-            // leading text and just rewrite the seconds. Simpler: callers that
-            // need precise retry text should call set_message directly. For
-            // the common case we leave the message as-is unless the host wants
-            // to update it; this method is a no-op hook for future use.
-            let _ = secs;
+            if let Some((attempt, max_attempts)) = self.retry_progress {
+                self.set_message(format!(
+                    "Retrying ({attempt}/{max_attempts}) in {secs}s... ({} to cancel)",
+                    raw_key_hint_keys()
+                ));
+            }
         }
     }
 
@@ -177,6 +174,7 @@ impl StatusIndicator {
 
 impl Component for StatusIndicator {
     fn render(&self, width: usize) -> Vec<String> {
+        self.tick_countdown();
         let kind = *self.kind.lock().unwrap();
         let message = self.message.lock().unwrap().clone();
         let (spinner_color, msg_color) = Self::colors_for(kind);
@@ -283,6 +281,14 @@ mod tests {
         let ind = StatusIndicator::compaction(CompactionReason::Manual);
         let lines = ind.render(60);
         assert!(lines[0].contains("Compacting"));
+    }
+
+    #[test]
+    fn test_retry_indicator_renders_attempt_budget() {
+        let ind = StatusIndicator::retry(3, 10, Duration::from_secs(8));
+        let lines = ind.render(80);
+        assert!(lines[0].contains("Retrying (3/10)"));
+        assert!(lines[0].contains("to cancel"));
     }
 
     #[test]

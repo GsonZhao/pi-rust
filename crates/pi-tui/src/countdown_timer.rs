@@ -33,7 +33,11 @@ impl CountdownTimer {
         if now >= self.deadline {
             0
         } else {
-            (self.deadline - now).as_secs() as u32
+            let remaining = self.deadline - now;
+            remaining
+                .as_secs()
+                .saturating_add(u64::from(remaining.subsec_nanos() > 0))
+                .min(u32::MAX as u64) as u32
         }
     }
 

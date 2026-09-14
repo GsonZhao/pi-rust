@@ -32,7 +32,8 @@
 
 use std::sync::{Arc, Mutex};
 
-use rpi_ai::providers::faux::{FauxProvider, FauxScript};
+use rpi_agent::{AgentEmitter, AgentEvent, CollectorEmitter};
+use rpi_ai::providers::faux::{faux_assistant_message, FauxProvider, FauxScript, FauxStep};
 use rpi_ai::Provider;
 use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome};
 use rpi_harness::events::{HarnessEvent, RunEndOutcome};
@@ -40,7 +41,7 @@ use rpi_harness::session::memory::{InMemorySessionStorage, SystemClock};
 use rpi_harness::session::types::SessionMetadata;
 use rpi_harness::session::types::{BranchBounds, EntryOrder, EntryQuery, LaneRecord, RecordQuery};
 use rpi_harness::session::{DefaultIdGenerator, Session};
-use rpi_harness::types::{AgentHarnessOptions, HarnessTool};
+use rpi_harness::types::{AgentHarnessOptions, HarnessTool, RetryPolicy};
 use rpi_tools::{
     create_bash_tool, create_read_tool, create_write_tool, ExecutionToolContext, FileSystem,
     InMemoryExecutionEnv, MutationQueueRegistry,
@@ -52,6 +53,14 @@ use rpi_tools::{
 /// provider call count + the in-memory FS after the run.
 async fn harness_with(
     script: FauxScript,
+) -> (AgentHarness, Arc<FauxProvider>, Arc<InMemoryExecutionEnv>) {
+    harness_with_options(script, RetryPolicy::default(), None).await
+}
+
+async fn harness_with_options(
+    script: FauxScript,
+    retry: RetryPolicy,
+    agent_emitter: Option<Arc<dyn AgentEmitter>>,
 ) -> (AgentHarness, Arc<FauxProvider>, Arc<InMemoryExecutionEnv>) {
     let provider = FauxProvider::new(script);
     let model = provider.default_model().clone();
@@ -94,7 +103,7 @@ async fn harness_with(
         system_prompt: None,
         resources: Default::default(),
         stream_options: Default::default(),
-        retry: Default::default(),
+        retry,
         compaction: Default::default(),
         steering_mode: Default::default(),
         follow_up_mode: Default::default(),
@@ -104,7 +113,7 @@ async fn harness_with(
         models: vec![provider.clone() as Arc<dyn Provider>],
         to_provider_messages: None,
         entry_projectors: Default::default(),
-        agent_emitter: None,
+        agent_emitter,
         before_tool_call: None,
         after_tool_call: None,
         transform_context: None,
@@ -115,6 +124,54 @@ async fn harness_with(
 
     let harness = AgentHarness::create(options).await.expect("create harness");
     (harness, provider, env)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retryable_provider_failure_emits_retry_progress_and_recovers() {
+    let mut transient = faux_assistant_message("", rpi_ai::types::StopReason::Error);
+    transient.error_message = Some("503 service unavailable".into());
+    let script = FauxScript::new();
+    script.set_responses(vec![
+        FauxStep::message(transient),
+        FauxStep::text("Recovered after retry."),
+    ]);
+
+    let (collector, events) = CollectorEmitter::new();
+    let retry = RetryPolicy {
+        enabled: true,
+        max_retries: 2,
+        base_delay_ms: 0,
+        max_agent_delay_ms: 0,
+    };
+    let (harness, provider, _) =
+        harness_with_options(script, retry, Some(Arc::new(collector))).await;
+
+    let result = harness
+        .prompt_text("retry this request", vec![])
+        .await
+        .expect("retrying prompt completes");
+    assert!(matches!(
+        result.outcome,
+        HarnessRunOutcome::Completed { .. }
+    ));
+    assert_eq!(
+        provider
+            .state()
+            .call_count
+            .load(std::sync::atomic::Ordering::Relaxed),
+        2
+    );
+
+    let events = events.lock().unwrap();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentEvent::RetryScheduled {
+            attempt: 1,
+            max_retries: 2,
+            delay_ms: 0,
+            error,
+        } if error == "503 service unavailable"
+    )));
 }
 
 /// Collect bus events into a shared vec while the closure owns a `Handle`.

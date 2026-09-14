@@ -41,9 +41,9 @@ use tokio_util::sync::CancellationToken;
 
 use rpi_agent::message::AgentMessage;
 use rpi_agent::{
-    run_agent_loop, AfterToolCall, AfterToolResults, AgentContext, AgentEmitter, AgentLoopConfig,
-    AgentTool, BeforeToolCall, ConvertToLlm, QueueMode, ShouldStopAfterTurnContext, StreamFn,
-    TransformContext,
+    run_agent_loop, AfterToolCall, AfterToolResults, AgentContext, AgentEmitter, AgentEvent,
+    AgentLoopConfig, AgentTool, BeforeToolCall, ConvertToLlm, QueueMode,
+    ShouldStopAfterTurnContext, StreamFn, TransformContext,
 };
 use rpi_ai::types::{
     AssistantMessage, Content, DeferredHandle, StopReason, ThinkingLevel, Usage, UserContent,
@@ -1515,18 +1515,29 @@ impl AgentHarness {
             )
             .await;
 
-            let should_retry = retry_policy.enabled
-                && retry_attempt < retry_policy.max_retries
-                && attempt_result.as_ref().is_ok_and(|messages| {
+            let retry_error = attempt_result
+                .as_ref()
+                .ok()
+                .and_then(|messages| {
                     messages.iter().rev().find_map(|message| match message {
-                        AgentMessage::Assistant(assistant) => Some(
-                            assistant.stop_reason == StopReason::Error
-                                && crate::compaction::is_retryable_assistant_error(assistant),
-                        ),
+                        AgentMessage::Assistant(assistant) => Some(assistant.as_ref()),
                         _ => None,
-                    }) == Some(true)
+                    })
+                })
+                .filter(|assistant| {
+                    assistant.stop_reason == StopReason::Error
+                        && crate::compaction::is_retryable_assistant_error(assistant)
+                })
+                .map(|assistant| {
+                    assistant
+                        .error_message
+                        .clone()
+                        .unwrap_or_else(|| "Provider request failed.".to_string())
                 });
-            if !should_retry {
+            if !retry_policy.enabled
+                || retry_attempt >= retry_policy.max_retries
+                || retry_error.is_none()
+            {
                 break attempt_result;
             }
 
@@ -1535,6 +1546,14 @@ impl AgentHarness {
                 .base_delay_ms
                 .saturating_mul(1u64 << retry_attempt.saturating_sub(1))
                 .min(retry_policy.max_agent_delay_ms);
+            emitter
+                .emit(AgentEvent::RetryScheduled {
+                    attempt: retry_attempt,
+                    max_retries: retry_policy.max_retries,
+                    delay_ms,
+                    error: retry_error.expect("retry eligibility requires an error"),
+                })
+                .await;
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
                 _ = signal.cancelled() => break attempt_result,
