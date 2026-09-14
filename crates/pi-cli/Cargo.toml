@@ -24,8 +24,11 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 async-trait = { workspace = true }
 futures = { workspace = true }
+fs2 = { workspace = true }
+globset = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+semver = { workspace = true }
 indexmap = { workspace = true }
 schemars = { workspace = true }
 thiserror = { workspace = true }
@@ -39,6 +42,16 @@ crossterm = { version = "0.27", features = ["events"] }
 base64 = { workspace = true }
 png = { workspace = true }
 arboard = { version = "3", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
 
 [features]
 default = ["clipboard"]

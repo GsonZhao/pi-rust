@@ -21,9 +21,9 @@
 - settings `keybindings`：支持覆盖 interrupt、clear、exit、model、tool、thinking、
   external editor 等 TUI action 的组合键；
 - `/changelog`：显示当前版本和本阶段已实现的变更；
-- OpenAI-compatible provider：`models.json` 支持显式 `apiKey`，并按 provider id
-  查找 `<PROVIDER>_API_KEY` 与常见别名（如 `DEEPSEEK_API_KEY`、`GROQ_API_KEY`、
-  `OPENROUTER_API_KEY`）；
+- OpenAI-compatible provider：`models.json` 支持显式 `apiKey`；自定义 provider
+  通过 `apiKey: "$ENV"` 绑定环境变量，已知规范 provider 可使用
+  `DEEPSEEK_API_KEY`、`GROQ_API_KEY`、`OPENROUTER_API_KEY` 等内建别名；
 - 相关 parser、图片处理和 trust gate 单元测试。
 
 Trust 行为：

@@ -6,7 +6,7 @@
 
 - `settings.json` 支持 `hideThinkingBlock`、`quietStartup`、
   `showTerminalProgress`、`editorPaddingX`、`autocompleteMaxVisible`；
-- `quietStartup` 跳过交互启动更新提示；
+- `quietStartup` 隐藏交互启动标题和资源摘要，但不关闭更新检查；
 - `showTerminalProgress` 控制工作状态 loader；
 - 编辑器 padding 与补全列表上限从 settings 生效；
 - crossterm `Event::Paste` 支持普通文本粘贴；

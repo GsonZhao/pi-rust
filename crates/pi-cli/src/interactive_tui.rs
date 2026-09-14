@@ -1931,6 +1931,7 @@ impl SlashCommand for ThemeCommand {
             &ctx.editor_container,
             &ctx.editor,
             &ctx.tui,
+            &ctx.cwd,
             &ctx.package_resources,
         );
     }
@@ -2068,6 +2069,13 @@ impl SlashCommand for LogoutCommand {
     }
 }
 
+fn set_project_trust_for_command(
+    cwd: &std::path::Path,
+    value: Option<bool>,
+) -> Result<(), crate::config::ConfigError> {
+    crate::config::set_project_trust(cwd, value)
+}
+
 struct TrustCommand;
 impl SlashCommand for TrustCommand {
     fn name(&self) -> &'static str {
@@ -2087,8 +2095,7 @@ impl SlashCommand for TrustCommand {
                 return;
             }
         };
-        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-        match crate::config::set_project_trust(&cwd, value) {
+        match set_project_trust_for_command(&ctx.cwd, value) {
             Ok(()) => {
                 let label = match value {
                     Some(true) => "trusted",
@@ -2168,6 +2175,7 @@ impl SlashCommand for SettingsCommand {
             &ctx.model_catalog,
             &ctx.lane_model_id,
             &ctx.chat,
+            &ctx.cwd,
             &ctx.package_resources,
         );
     }
@@ -2514,6 +2522,7 @@ fn open_settings_selector(
     catalog: &[rpi_ai::Model],
     lane_model_id: &str,
     chat: &Arc<Container>,
+    cwd: &std::path::Path,
     package_resources: &Arc<crate::packages::PackageResources>,
 ) {
     let settings = crate::settings::load_settings().unwrap_or_default();
@@ -2554,6 +2563,7 @@ fn open_settings_selector(
     let chat_sel = chat.clone();
     let catalog_sel = catalog.to_vec();
     let lane_model_sel = lane_model_id.to_string();
+    let cwd_sel = cwd.to_path_buf();
     let package_resources_sel = package_resources.clone();
     list.on_select(Arc::new(move |item| {
         // Swap this menu for the sub-selector; each sub-selector saves its
@@ -2565,6 +2575,7 @@ fn open_settings_selector(
                 &editor_sel,
                 &tui_sel,
                 &chat_sel,
+                &cwd_sel,
                 &package_resources_sel,
             ),
             "model" => open_settings_model_selector(
@@ -2623,6 +2634,7 @@ fn open_settings_theme_selector(
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
     chat: &Arc<Container>,
+    cwd: &std::path::Path,
     package_resources: &Arc<crate::packages::PackageResources>,
 ) {
     let mut items = vec![
@@ -2644,6 +2656,7 @@ fn open_settings_theme_selector(
     let editor_sel = editor.clone();
     let tui_sel = tui.clone();
     let chat_sel = chat.clone();
+    let cwd_sel = cwd.to_path_buf();
     let package_resources_sel = package_resources.clone();
     list.on_select(Arc::new(move |item| {
         let preset = match item.value.as_str() {
@@ -2651,16 +2664,14 @@ fn open_settings_theme_selector(
             "monochrome" => Some(ThemePreset::Monochrome),
             "dark" => Some(ThemePreset::Dark),
             name => {
-                if let Ok(cwd) = std::env::current_dir() {
-                    if state_sel.themes_enabled {
-                        if let Ok(custom) = crate::packages::load_theme_with_resources(
-                            &cwd,
-                            name,
-                            &package_resources_sel,
-                        ) {
-                            rpi_tui::global_theme_manager().set(custom.clone());
-                            state_sel.theme_manager.set(custom);
-                        }
+                if state_sel.themes_enabled {
+                    if let Ok(custom) = crate::packages::load_theme_with_resources(
+                        &cwd_sel,
+                        name,
+                        &package_resources_sel,
+                    ) {
+                        rpi_tui::global_theme_manager().set(custom.clone());
+                        state_sel.theme_manager.set(custom);
                     }
                 }
                 add_note_message(&chat_sel, &format!("Theme set to {}.", item.label));
@@ -3101,7 +3112,7 @@ async fn share_session(harness: &AgentHarness, chat: &Arc<Container>) {
 /// `<cwd>/<session-name-or-id>.md` with the user/assistant/tool-call history
 /// (mirrors the TS `/export` intent locally — no remote sharing in v1).
 /// Best-effort: failures surface as a chat note.
-async fn export_session(harness: &AgentHarness, chat: &Arc<Container>) {
+async fn export_session(harness: &AgentHarness, chat: &Arc<Container>, cwd: &std::path::Path) {
     let tree = harness.session().view("main");
     let entries = match tree
         .find_entries(&EntryQuery {
@@ -3149,9 +3160,7 @@ async fn export_session(harness: &AgentHarness, chat: &Arc<Container>) {
     } else {
         format!("{name}.md")
     };
-    let path = std::env::current_dir()
-        .unwrap_or_else(|_| std::path::PathBuf::from("."))
-        .join(&file_name);
+    let path = cwd.join(&file_name);
     match std::fs::write(&path, md) {
         Ok(_) => add_note_message(chat, &format!("Exported session to {}", path.display())),
         Err(e) => add_error_message(chat, &format!("Could not write export: {e}")),
@@ -4192,6 +4201,81 @@ impl TuiState {
 // interactive_tui — the entry point
 // ===========================================================================
 
+#[derive(Debug, PartialEq)]
+struct TuiStartupSettings {
+    editor_padding_x: usize,
+    autocomplete_max_visible: usize,
+    hide_thinking: bool,
+    quiet_startup: bool,
+    show_terminal_progress: bool,
+}
+
+fn preferred_project_setting<T>(
+    project_settings: &[crate::settings::Settings],
+    field: impl Fn(&crate::settings::Settings) -> Option<T>,
+) -> Option<T> {
+    project_settings.iter().find_map(field)
+}
+
+fn should_show_startup_listing(verbose: bool, quiet_startup: bool) -> bool {
+    verbose || !quiet_startup
+}
+
+fn git_only_update_resources(
+    mut resources: crate::packages::PackageResources,
+) -> crate::packages::PackageResources {
+    resources
+        .packages
+        .retain(|package| matches!(package.source, crate::packages::PackageSource::Git));
+    resources
+}
+
+/// Resolve TUI-only settings with native Pi's project-over-global precedence.
+/// `project_settings` must be ordered `.rpi` then `.pi`; an explicit `Some`
+/// wins even when the value is `false` or zero.
+fn resolve_tui_startup_settings(
+    global: &crate::settings::Settings,
+    project_settings: &[crate::settings::Settings],
+    project_trusted: bool,
+) -> TuiStartupSettings {
+    let project_settings = if project_trusted {
+        project_settings
+    } else {
+        &[]
+    };
+    let editor_padding_x =
+        preferred_project_setting(project_settings, |settings| settings.editor_padding_x)
+            .or(global.editor_padding_x)
+            .unwrap_or(1)
+            .min(16);
+    let autocomplete_max_visible = preferred_project_setting(project_settings, |settings| {
+        settings.autocomplete_max_visible
+    })
+    .or(global.autocomplete_max_visible)
+    .unwrap_or(5)
+    .clamp(1, 20);
+    let hide_thinking =
+        preferred_project_setting(project_settings, |settings| settings.hide_thinking_block)
+            .or(global.hide_thinking_block)
+            .unwrap_or(false);
+    let quiet_startup =
+        preferred_project_setting(project_settings, |settings| settings.quiet_startup)
+            .or(global.quiet_startup)
+            .unwrap_or(false);
+    let show_terminal_progress =
+        preferred_project_setting(project_settings, |settings| settings.show_terminal_progress)
+            .or(global.show_terminal_progress)
+            .unwrap_or(true);
+
+    TuiStartupSettings {
+        editor_padding_x,
+        autocomplete_max_visible,
+        hide_thinking,
+        quiet_startup,
+        show_terminal_progress,
+    }
+}
+
 /// TUI-based interactive mode.
 ///
 /// `event_rx` carries the live `AgentEvent` stream (installed by
@@ -4218,14 +4302,26 @@ pub async fn interactive_tui(
     reload_context: &crate::session::ReloadContext,
 ) -> i32 {
     let lane: Arc<dyn AgentLane> = harness.lane("main");
+    // Reuse the startup snapshot captured before provider/session setup. An
+    // extension may mutate the process cwd while loading; that must not change
+    // which project settings or package update roots this TUI observes.
+    let cwd = reload_context.cwd.clone();
     let saved_settings = crate::settings::load_settings().unwrap_or_default();
-    let editor_padding_x = saved_settings.editor_padding_x.unwrap_or(1).min(16);
-    let autocomplete_max_visible = saved_settings
-        .autocomplete_max_visible
-        .unwrap_or(5)
-        .clamp(1, 20);
-    let hide_thinking = saved_settings.hide_thinking_block.unwrap_or(false);
-    let show_terminal_progress = saved_settings.show_terminal_progress.unwrap_or(true);
+    let project_trusted = reload_context.project_trusted;
+    let project_settings = if project_trusted {
+        crate::settings::load_project_settings(&cwd)
+    } else {
+        Vec::new()
+    };
+    let tui_settings =
+        resolve_tui_startup_settings(&saved_settings, &project_settings, project_trusted);
+    let editor_padding_x = tui_settings.editor_padding_x;
+    let autocomplete_max_visible = tui_settings.autocomplete_max_visible;
+    let hide_thinking = tui_settings.hide_thinking;
+    let show_terminal_progress = tui_settings.show_terminal_progress;
+    let quiet_startup = tui_settings.quiet_startup;
+    let update_checks_enabled =
+        !args.offline && std::env::var_os("RPI_DISABLE_UPDATE_CHECK").is_none();
 
     // Resolve the active model once, up front. The full id feeds the TuiState
     // tracking field + the selectors/key loop (which run on a blocking thread
@@ -4246,11 +4342,8 @@ pub async fn interactive_tui(
         .map(|skill| skill.name.clone())
         .collect();
 
-    // The cwd for @file autocomplete + session discovery.
-    let cwd = std::env::current_dir()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let package_resources = Arc::new(crate::session::package_resources_for(args, &cwd));
+    // Resolve package resources for @file autocomplete + session discovery.
+    let package_resources = reload_context.package_resources.clone();
 
     // Channel between the key/callback threads and the main async loop.
     let (tx, mut rx) = mpsc::unbounded_channel::<TuiMessage>();
@@ -4340,7 +4433,9 @@ pub async fn interactive_tui(
             }
         }
     }
-    add_welcome_message_with_capabilities(&chat_container, &active_tool_names, &skill_names);
+    if should_show_startup_listing(args.verbose, quiet_startup) {
+        add_welcome_message_with_capabilities(&chat_container, &active_tool_names, &skill_names);
+    }
 
     // First-launch gate: if `~/.rpi/.setup_done` is absent, show the welcome
     // banner + the earendil announcement once, then write the sentinel. The TS
@@ -4656,6 +4751,58 @@ pub async fn interactive_tui(
     }));
 
     tui.start_readerless();
+
+    // Consume local self-update results even when network checks are disabled.
+    // Keep package discovery separate so package managers and Git remotes
+    // cannot delay an rpi update notice or a prior helper failure.
+    let mut update_check_handles = Vec::new();
+    let rpi_chat = chat_container.clone();
+    let rpi_tui = tui.clone();
+    update_check_handles.push(tokio::spawn(async move {
+        let report = crate::updates::check_rpi_startup().await;
+        if !report.is_empty() {
+            add_update_notices(&rpi_chat, &report);
+        }
+        rpi_tui.request_render(false);
+    }));
+
+    if update_checks_enabled {
+        let update_args = args.clone();
+        let update_cwd = cwd.clone();
+        let update_project_trusted = project_trusted;
+        let chat = chat_container.clone();
+        let tui = tui.clone();
+        update_check_handles.push(tokio::spawn(async move {
+            let resources = crate::session::package_resources_for_update_check(
+                &update_args,
+                &update_cwd,
+                update_project_trusted,
+            );
+            let report = match crate::npm::NpmCommand::resolve(&update_cwd, update_project_trusted)
+            {
+                Ok(npm_command) => {
+                    crate::updates::check_package_startup_with_resources_and_npm_command_in_cwd(
+                        Some(&resources),
+                        &npm_command,
+                        update_project_trusted.then_some(update_cwd.as_path()),
+                    )
+                    .await
+                }
+                Err(error) => {
+                    add_error_message(
+                        &chat,
+                        &format!("npm package update checks disabled: {error}"),
+                    );
+                    let git_resources = git_only_update_resources(resources);
+                    crate::updates::check_package_startup_with_resources(Some(&git_resources)).await
+                }
+            };
+            if !report.is_empty() {
+                add_update_notices(&chat, &report);
+            }
+            tui.request_render(false);
+        }));
+    }
 
     // ---- Streaming drain task ----
     let drain_handle = if let Some(rx) = event_rx {
@@ -5483,7 +5630,7 @@ pub async fn interactive_tui(
                 tui.request_render(false);
             }
             Some(TuiMessage::ExportSession) => {
-                export_session(&harness, &chat_container).await;
+                export_session(&harness, &chat_container, &cwd).await;
                 tui.request_render(false);
             }
             Some(TuiMessage::ForkSession) => {
@@ -5536,6 +5683,10 @@ pub async fn interactive_tui(
     // bridge before joining the key worker and restoring the terminal.
     js_dialog_bridge.cancel_all();
     *running.lock().unwrap() = false;
+    for handle in update_check_handles {
+        handle.abort();
+        let _ = handle.await;
+    }
     // A hidden custom input listener can leave the key worker blocked on a
     // synchronous Node response. Stop the host first so transport shutdown
     // wakes that request before we join the worker.
@@ -6800,6 +6951,7 @@ fn open_theme_selector(
     editor_container: &Arc<Container>,
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
+    cwd: &std::path::Path,
     package_resources: &Arc<crate::packages::PackageResources>,
 ) {
     let mut items = vec![
@@ -6821,6 +6973,7 @@ fn open_theme_selector(
     let editor_sel = editor.clone();
     let tui_sel = tui.clone();
     let chat_sel = state.chat_container.clone();
+    let cwd_sel = cwd.to_path_buf();
     let package_resources_sel = package_resources.clone();
     list.on_select(Arc::new(move |item| {
         let preset = match item.value.as_str() {
@@ -6828,16 +6981,14 @@ fn open_theme_selector(
             "monochrome" => Some(ThemePreset::Monochrome),
             "dark" => Some(ThemePreset::Dark),
             name => {
-                if let Ok(cwd) = std::env::current_dir() {
-                    if state_sel.themes_enabled {
-                        if let Ok(custom) = crate::packages::load_theme_with_resources(
-                            &cwd,
-                            name,
-                            &package_resources_sel,
-                        ) {
-                            rpi_tui::global_theme_manager().set(custom.clone());
-                            state_sel.theme_manager.set(custom);
-                        }
+                if state_sel.themes_enabled {
+                    if let Ok(custom) = crate::packages::load_theme_with_resources(
+                        &cwd_sel,
+                        name,
+                        &package_resources_sel,
+                    ) {
+                        rpi_tui::global_theme_manager().set(custom.clone());
+                        state_sel.theme_manager.set(custom);
                     }
                 }
                 add_note_message(&chat_sel, &format!("Theme set to {}.", item.label));
@@ -7314,6 +7465,81 @@ fn add_welcome_message_with_capabilities(
     container.add_child(Arc::new(DynamicBorder::new()));
 }
 
+/// Append update notices inside the live transcript. Fullscreen mode clears
+/// pre-TUI stdout/stderr, so update state must be represented by components.
+fn add_update_notices(container: &Arc<Container>, report: &crate::updates::UpdateReport) {
+    let colors = current_theme().colors;
+    let group = Arc::new(Container::new());
+
+    for warning in &report.warnings {
+        let body = format!(
+            "{}\n{} {}{}",
+            colors.error.fg(&warning.message),
+            colors.muted.fg("Run"),
+            colors.accent.fg(&warning.command),
+            colors.muted.fg(" to retry.")
+        );
+        add_update_panel(&group, "Update Failed", &body, colors.error);
+    }
+
+    if let Some(notice) = report.notices.iter().find(|notice| notice.name == "rpi") {
+        let body = format!(
+            "{} {}{}",
+            colors
+                .muted
+                .fg(&format!("New version {} is available. Run", notice.latest)),
+            colors.accent.fg(&notice.command),
+            colors.muted.fg(".")
+        );
+        add_update_panel(&group, "Update Available", &body, colors.warning);
+    }
+
+    let package_notices = report
+        .notices
+        .iter()
+        .filter(|notice| notice.name != "rpi")
+        .collect::<Vec<_>>();
+    if !package_notices.is_empty() {
+        let command = package_notices[0].command.as_str();
+        let mut lines = vec![format!(
+            "{} {}{}",
+            colors.muted.fg("Package updates are available. Run"),
+            colors.accent.fg(command),
+            colors.muted.fg(".")
+        )];
+        lines.push(colors.muted.fg("Packages:"));
+        lines.extend(
+            package_notices
+                .into_iter()
+                .map(|notice| format!("- {} {} -> {}", notice.name, notice.current, notice.latest)),
+        );
+        add_update_panel(
+            &group,
+            "Package Updates Available",
+            &lines.join("\n"),
+            colors.warning,
+        );
+    }
+
+    // Other transcript producers append concurrently. Add the fully built
+    // group in one operation so card borders and content cannot interleave
+    // with user, assistant, tool, or extension messages.
+    if group.child_count() > 0 {
+        container.add_child(group);
+    }
+}
+
+fn add_update_panel(container: &Arc<Container>, title: &str, body: &str, color: rpi_tui::Color) {
+    container.add_child(Arc::new(Spacer::new(1)));
+    container.add_child(Arc::new(DynamicBorder::with_color(color)));
+    container.add_child(Arc::new(Text::new(
+        format!("{}\n{body}", color.fg(&tui_bold(title))),
+        1,
+        0,
+    )));
+    container.add_child(Arc::new(DynamicBorder::with_color(color)));
+}
+
 fn welcome_capability_line(label: &str, names: &[String]) -> String {
     let c = current_theme().colors;
     let value = if names.is_empty() {
@@ -7603,6 +7829,188 @@ mod tests {
     use rpi_tui::Component;
 
     #[test]
+    fn verbose_overrides_quiet_startup_listing() {
+        assert!(should_show_startup_listing(false, false));
+        assert!(should_show_startup_listing(true, false));
+        assert!(should_show_startup_listing(true, true));
+        assert!(!should_show_startup_listing(false, true));
+    }
+
+    #[test]
+    fn invalid_npm_command_fallback_keeps_only_git_package_checks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let git_root = tmp.path().join(".pi/git/github.com/example/repo");
+        let local_root = tmp.path().join("local-package");
+        std::fs::create_dir_all(git_root.join(".git")).unwrap();
+        std::fs::create_dir_all(&local_root).unwrap();
+        std::fs::write(
+            git_root.join("package.json"),
+            r#"{"name":"git-demo","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            local_root.join("package.json"),
+            r#"{"name":"local-demo","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let resources = crate::packages::discover(
+            tmp.path(),
+            &[
+                "git:github.com/example/repo".to_string(),
+                local_root.to_string_lossy().into_owned(),
+            ],
+        );
+        assert_eq!(resources.packages.len(), 2);
+
+        let filtered = git_only_update_resources(resources);
+
+        assert_eq!(filtered.packages.len(), 1);
+        assert!(matches!(
+            filtered.packages[0].source,
+            crate::packages::PackageSource::Git
+        ));
+    }
+
+    #[test]
+    fn trust_command_uses_the_session_cwd_after_process_chdir() {
+        struct RestoreProcessState {
+            config_dir: Option<std::ffi::OsString>,
+            cwd: std::path::PathBuf,
+        }
+
+        impl Drop for RestoreProcessState {
+            fn drop(&mut self) {
+                let _ = std::env::set_current_dir(&self.cwd);
+                match self.config_dir.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let session_cwd = tmp.path().join("session-project");
+        let changed_cwd = tmp.path().join("extension-cwd");
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(&session_cwd).unwrap();
+        std::fs::create_dir_all(&changed_cwd).unwrap();
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        let _restore = RestoreProcessState {
+            config_dir: std::env::var_os(crate::config::CONFIG_DIR_ENV),
+            cwd: std::env::current_dir().unwrap(),
+        };
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent_dir);
+        std::env::set_current_dir(&changed_cwd).unwrap();
+
+        set_project_trust_for_command(&session_cwd, Some(true)).unwrap();
+
+        assert_eq!(
+            crate::config::project_trust_decision(&session_cwd).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            crate::config::project_trust_decision(&changed_cwd).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn tui_startup_settings_prefer_rpi_project_fields_over_pi() {
+        let global = crate::settings::Settings {
+            editor_padding_x: Some(3),
+            autocomplete_max_visible: Some(6),
+            hide_thinking_block: Some(false),
+            quiet_startup: Some(true),
+            show_terminal_progress: Some(true),
+            ..Default::default()
+        };
+        let rpi_project = crate::settings::Settings {
+            editor_padding_x: Some(0),
+            hide_thinking_block: Some(true),
+            quiet_startup: Some(false),
+            show_terminal_progress: Some(false),
+            ..Default::default()
+        };
+        let pi_project = crate::settings::Settings {
+            editor_padding_x: Some(9),
+            autocomplete_max_visible: Some(12),
+            quiet_startup: Some(true),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_tui_startup_settings(&global, &[rpi_project, pi_project], true),
+            TuiStartupSettings {
+                editor_padding_x: 0,
+                autocomplete_max_visible: 12,
+                hide_thinking: true,
+                quiet_startup: false,
+                show_terminal_progress: false,
+            }
+        );
+    }
+
+    #[test]
+    fn tui_startup_settings_fall_back_from_rpi_to_pi_per_field() {
+        let global = crate::settings::Settings {
+            quiet_startup: Some(false),
+            ..Default::default()
+        };
+        let rpi_project = crate::settings::Settings::default();
+        let pi_project = crate::settings::Settings {
+            quiet_startup: Some(true),
+            ..Default::default()
+        };
+
+        let resolved = resolve_tui_startup_settings(&global, &[rpi_project, pi_project], true);
+
+        assert!(resolved.quiet_startup);
+    }
+
+    #[test]
+    fn tui_startup_settings_use_global_values_without_project_fields() {
+        let global = crate::settings::Settings {
+            editor_padding_x: Some(7),
+            autocomplete_max_visible: Some(8),
+            hide_thinking_block: Some(true),
+            quiet_startup: Some(true),
+            show_terminal_progress: Some(false),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_tui_startup_settings(&global, &[crate::settings::Settings::default()], true,),
+            TuiStartupSettings {
+                editor_padding_x: 7,
+                autocomplete_max_visible: 8,
+                hide_thinking: true,
+                quiet_startup: true,
+                show_terminal_progress: false,
+            }
+        );
+    }
+
+    #[test]
+    fn tui_startup_settings_ignore_untrusted_project_values() {
+        let global = crate::settings::Settings {
+            quiet_startup: Some(false),
+            show_terminal_progress: Some(true),
+            ..Default::default()
+        };
+        let project = crate::settings::Settings {
+            quiet_startup: Some(true),
+            show_terminal_progress: Some(false),
+            ..Default::default()
+        };
+
+        let resolved = resolve_tui_startup_settings(&global, &[project], false);
+
+        assert!(!resolved.quiet_startup);
+        assert!(resolved.show_terminal_progress);
+    }
+
+    #[test]
     fn transcript_page_uses_viewport_with_overlap() {
         assert_eq!(transcript_page_size(24), 20);
         assert_eq!(transcript_page_size(4), 1);
@@ -7762,6 +8170,56 @@ mod tests {
             plain.contains("rust-review · release"),
             "Skill names missing: {plain}"
         );
+    }
+
+    #[test]
+    fn update_notices_render_inside_the_transcript() {
+        let chat = Arc::new(Container::new());
+        let report = crate::updates::UpdateReport {
+            notices: vec![
+                crate::updates::UpdateNotice {
+                    name: "rpi".into(),
+                    current: "0.1.10".into(),
+                    latest: "0.1.11".into(),
+                    command: "rpi update".into(),
+                },
+                crate::updates::UpdateNotice {
+                    name: "rpi-search".into(),
+                    current: "0.1.0".into(),
+                    latest: "0.1.1".into(),
+                    command: "rpi package update".into(),
+                },
+            ],
+            warnings: vec![crate::updates::UpdateWarning {
+                message: "The previously scheduled rpi self-update failed: access denied".into(),
+                command: "rpi update".into(),
+            }],
+        };
+
+        add_update_notices(&chat, &report);
+
+        assert_eq!(chat.child_count(), 1);
+        let plain = strip_ansi(&chat.render(80).join("\n"));
+        assert!(plain.contains("Update Failed"), "{plain}");
+        assert!(
+            plain.contains("self-update failed: access denied"),
+            "{plain}"
+        );
+        assert!(plain.contains("Update Available"), "{plain}");
+        assert!(plain.contains("New version 0.1.11 is available"), "{plain}");
+        assert!(plain.contains("rpi update"), "{plain}");
+        assert!(plain.contains("Package Updates Available"), "{plain}");
+        assert!(plain.contains("rpi package update"), "{plain}");
+        assert!(plain.contains("- rpi-search 0.1.0 -> 0.1.1"), "{plain}");
+    }
+
+    #[test]
+    fn empty_update_report_does_not_add_transcript_content() {
+        let chat = Arc::new(Container::new());
+
+        add_update_notices(&chat, &crate::updates::UpdateReport::default());
+
+        assert_eq!(chat.child_count(), 0);
     }
 
     #[test]

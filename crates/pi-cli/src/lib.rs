@@ -58,6 +58,7 @@ pub mod interactive_tui;
 pub mod js_extensions;
 pub mod modes;
 pub mod node_transport;
+pub mod npm;
 pub mod packages;
 pub mod provider;
 pub mod resource_dirs;

@@ -150,6 +150,7 @@ JavaScript/TypeScript extensions. Install a package with:
 
 ```bash
 rpi install-pi npm:@scope/my-package@1.0.0
+rpi install-pi npm:my-alias@npm:@scope/my-package@^1
 rpi install-pi git:github.com/user/my-package@v1
 rpi install-pi ./my-pi-package
 ```
@@ -162,14 +163,21 @@ rpi uninstall-pi npm:@scope/my-package
 # 等价写法：rpi uninstall pi npm:@scope/my-package
 ```
 
-The installer stores project packages under `.rpi/packages` (use `--global`
-for `~/.rpi/agent/packages`), runs `npm install --omit=dev`, and enables the
-resolved package in settings. Package discovery and loading are disabled by
-default; start rpi with `--enable-pi-packages` to opt in. That startup performs
-a short one-shot Node.js discovery pass. In the interactive TUI, a long-lived
-Node.js host starts immediately before the first submitted prompt (or earlier
-when a package command or tool is used), so an idle TUI does not keep Node
-resident.
+npm and Git installs use Pi-compatible managed stores: project packages live
+under `.pi/npm` and `.pi/git`, while `--global` uses the configured rpi agent
+directory's `npm` and `git` stores. Local directories are enabled in place and
+are never copied or deleted. Existing legacy `.rpi/packages`, `.pi/packages`,
+and native `~/.pi/agent` installs remain discoverable. Package-manager argv is
+selected from trusted `.rpi/settings.json`, trusted `.pi/settings.json`, then
+global `settings.json`; the default is npm. rpi treats the setting as structured
+argv rather than a shell command string, applies hardened encoding to Windows
+`.cmd` shims, and uses the native Pi flags for npm, pnpm, or bun.
+
+Package discovery and loading are disabled by default; start rpi with
+`--enable-pi-packages` to opt in. That startup performs a short one-shot Node.js
+discovery pass. In the interactive TUI, a long-lived Node.js host starts
+immediately before the first submitted prompt (or earlier when a package
+command or tool is used), so an idle TUI does not keep Node resident.
 `registerTool`, `registerCommand`, and `resources_discover` are supported.
 TypeScript uses Node's native type stripping when available, or a package-local
 `jiti` dependency. Pi peer/runtime packages are installed and aliased from
@@ -289,20 +297,19 @@ multi-provider registry).
 
 ## Releasing
 
-Publish the crate family in dependency order with `cargo publish` (run
-`cargo login` once first so `~/.cargo/credentials.toml` exists with a
-publish-scoped token; crates.io records are permanent):
+The workspace `Taskfile.yml` is the canonical release entry point. Run
+`cargo login` once first so `~/.cargo/credentials.toml` contains a
+publish-scoped token; crates.io records are permanent.
 
-```
-# dep order: telemetry → ai → agent → tools → harness → plugin-sdk → extensions → tui → cli
-for c in rpi-telemetry rpi-ai rpi-agent rpi-tools rpi-harness rpi-plugin-sdk rpi-extensions rpi-tui rpi-cli; do
-  cargo publish -p "$c"
-done
+```bash
+task dry-run RELEASE_VERSION=0.1.12
+task publish RELEASE_VERSION=0.1.12
 ```
 
-The workspace `Taskfile.yml` (`task dry-run` / `task publish`) used to wrap
-`release.ps1`/`release.sh`, but those scripts were removed; publish directly
-as above.
+Both commands require a clean worktree and one consistent version across all
+nine release crates. `task publish` runs the locked workspace test and check
+suites, publishes in dependency order, waits for each crate to reach the
+crates.io index, and safely resumes by skipping exact versions already present.
 
 ## License
 

@@ -38,6 +38,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", 
 tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1"
 futures = "0.3"
+fs2 = "0.4"
 
 # Serialization / schemas
 serde = { version = "1", features = ["derive", "rc"] }
@@ -62,6 +63,7 @@ base64 = "0.22"
 png = "0.18"
 tempfile = "3"
 regex = "1"
+semver = "1"
 globset = "=0.4.15"
 dirs = "5"
 rpassword = "7"

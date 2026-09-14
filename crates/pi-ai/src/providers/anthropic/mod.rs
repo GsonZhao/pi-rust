@@ -55,6 +55,10 @@ pub struct AnthropicProvider {
     /// Default API key, used when `SimpleStreamOptions::api_key` is `None`.
     /// `None` here means "defer to opts + env at call time".
     api_key: Option<String>,
+    /// Whether a missing explicit/default key may fall back to the built-in
+    /// Anthropic environment variable. Custom provider identities must disable
+    /// this or an official Anthropic key could be sent to their endpoint.
+    allow_env_api_key: bool,
     http: reqwest::Client,
     models: Vec<Model>,
 }
@@ -66,6 +70,7 @@ impl AnthropicProvider {
     pub fn new(api_key: Option<String>, http: reqwest::Client) -> Self {
         Self {
             api_key,
+            allow_env_api_key: true,
             http,
             models: anthropic_models(),
         }
@@ -75,6 +80,26 @@ impl AnthropicProvider {
     pub fn with_models(api_key: Option<String>, http: reqwest::Client, models: Vec<Model>) -> Self {
         Self {
             api_key,
+            allow_env_api_key: true,
+            http,
+            models,
+        }
+    }
+
+    /// Build an Anthropic-wire provider for a non-Anthropic identity.
+    ///
+    /// Unlike [`Self::with_models`], this never consults `ANTHROPIC_API_KEY`
+    /// when the provider has no explicit key. Authentication must come from
+    /// the supplied provider key or request/model headers, preserving the
+    /// provider id as a credential boundary.
+    pub fn with_models_without_env_api_key(
+        api_key: Option<String>,
+        http: reqwest::Client,
+        models: Vec<Model>,
+    ) -> Self {
+        Self {
+            api_key,
+            allow_env_api_key: false,
             http,
             models,
         }
@@ -119,12 +144,22 @@ impl Provider for AnthropicProvider {
 
         let http = self.http.clone();
         let provider_key = self.api_key.clone();
+        let allow_env_api_key = self.allow_env_api_key;
         let model = model.clone();
         let ctx = Arc::new(ctx.clone());
         let opts = opts.clone();
 
         tokio::spawn(async move {
-            run_anthropic_stream(&mut prod, http, provider_key, &model, &ctx, &opts).await;
+            run_anthropic_stream(
+                &mut prod,
+                http,
+                provider_key,
+                allow_env_api_key,
+                &model,
+                &ctx,
+                &opts,
+            )
+            .await;
             // `prod` drops here, closing the mpsc sender so the consumer's
             // `next()` returns `None` after the terminal event.
         });
@@ -153,6 +188,7 @@ async fn run_anthropic_stream(
     prod: &mut AssistantMessageEventStreamProducer,
     http: reqwest::Client,
     provider_key: Option<String>,
+    allow_env_api_key: bool,
     model: &Model,
     ctx: &Context,
     opts: &SimpleStreamOptions,
@@ -165,7 +201,7 @@ async fn run_anthropic_stream(
     );
 
     // ---- resolve auth (assertRequestAuth) ----
-    let resolved_key = resolve_api_key(&provider_key, opts);
+    let resolved_key = resolve_api_key(&provider_key, opts, allow_env_api_key);
     // TS `assertRequestAuth(model.provider, options?.apiKey, options?.headers)`
     // checks `options.headers` alone — but upstream the model-resolution layer
     // has *already merged* `model.headers` into `options.headers` (models.ts
@@ -456,15 +492,28 @@ fn simplify_non_stream_request(value: &mut serde_json::Value) {
 /// Resolve the API key: `opts.api_key` wins, then the provider default, then
 /// `ANTHROPIC_API_KEY` from the environment. Mirrors the TS fallback chain
 /// (`options?.apiKey` → SDK's `apiKey: null` reads the env var internally).
-fn resolve_api_key(provider_key: &Option<String>, opts: &SimpleStreamOptions) -> Option<String> {
+fn resolve_api_key(
+    provider_key: &Option<String>,
+    opts: &SimpleStreamOptions,
+    allow_env_api_key: bool,
+) -> Option<String> {
+    resolve_api_key_with_env(provider_key, opts, allow_env_api_key, || {
+        std::env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty())
+    })
+}
+
+fn resolve_api_key_with_env(
+    provider_key: &Option<String>,
+    opts: &SimpleStreamOptions,
+    allow_env_api_key: bool,
+    read_env_api_key: impl FnOnce() -> Option<String>,
+) -> Option<String> {
     opts.api_key
         .clone()
         .or_else(|| provider_key.clone())
-        .or_else(|| {
-            std::env::var("ANTHROPIC_API_KEY")
-                .ok()
-                .filter(|s| !s.is_empty())
-        })
+        .or_else(|| allow_env_api_key.then(read_env_api_key).flatten())
 }
 
 /// True when `headers` carries an `authorization`, `x-api-key`, or
@@ -583,6 +632,7 @@ mod tests {
     use super::*;
     use crate::providers::anthropic::models::claude_haiku_4_5;
     use crate::types::{Api, InputModality, ModelCost};
+    use std::collections::BTreeMap;
 
     /// Build a minimal model for header/auth tests (no network).
     fn test_model() -> Model {
@@ -745,14 +795,51 @@ mod tests {
     fn resolve_api_key_prefers_opts_then_provider_then_env() {
         let opts = SimpleStreamOptions::default().with_api_key("opts-key");
         assert_eq!(
-            resolve_api_key(&Some("provider-key".into()), &opts),
+            resolve_api_key(&Some("provider-key".into()), &opts, true),
             Some("opts-key".into())
         );
 
         let opts = SimpleStreamOptions::default();
         assert_eq!(
-            resolve_api_key(&Some("provider-key".into()), &opts),
+            resolve_api_key(&Some("provider-key".into()), &opts, true),
             Some("provider-key".into())
+        );
+    }
+
+    #[test]
+    fn isolated_custom_provider_never_adds_anthropic_env_key_to_headers() {
+        let mut model = test_model();
+        model.provider = "gateway".into();
+        model.base_url = "https://gateway.example.com".into();
+        model.headers = Some(BTreeMap::from([(
+            "authorization".into(),
+            "Bearer gateway-key".into(),
+        )]));
+        let opts = SimpleStreamOptions::default();
+        let env_read = std::cell::Cell::new(false);
+
+        let resolved = resolve_api_key_with_env(&None, &opts, false, || {
+            env_read.set(true);
+            Some("official-anthropic-key".into())
+        });
+        let headers = assemble_headers(&model, &opts, None, resolved.as_deref());
+
+        assert!(
+            !env_read.get(),
+            "isolated providers must not read Anthropic env auth"
+        );
+        assert!(
+            headers.iter().all(|(name, value)| {
+                !name.eq_ignore_ascii_case("x-api-key") && value != "official-anthropic-key"
+            }),
+            "the official key must never reach a custom provider request"
+        );
+        assert_eq!(
+            headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                .map(|(_, value)| value.as_str()),
+            Some("Bearer gateway-key")
         );
     }
 

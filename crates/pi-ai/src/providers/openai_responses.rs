@@ -24,6 +24,7 @@ use std::sync::Arc;
 pub struct OpenAiResponsesProvider {
     id: String,
     api_key: Option<String>,
+    allow_env_api_key: bool,
     http: reqwest::Client,
     models: Vec<Model>,
 }
@@ -55,9 +56,29 @@ impl OpenAiResponsesProvider {
         http: reqwest::Client,
         models: Vec<Model>,
     ) -> Self {
+        let id = id.into();
+        let allow_env_api_key = id == "openai";
+        Self {
+            id,
+            api_key,
+            allow_env_api_key,
+            http,
+            models,
+        }
+    }
+
+    /// Build a compatible custom provider without inheriting OpenAI's
+    /// process-wide credential.
+    pub fn with_models_without_env_api_key(
+        id: impl Into<String>,
+        api_key: Option<String>,
+        http: reqwest::Client,
+        models: Vec<Model>,
+    ) -> Self {
         Self {
             id: id.into(),
             api_key,
+            allow_env_api_key: false,
             http,
             models,
         }
@@ -80,11 +101,21 @@ impl Provider for OpenAiResponsesProvider {
         let (mut producer, stream) = create_assistant_message_event_stream();
         let http = self.http.clone();
         let key = self.api_key.clone();
+        let allow_env_api_key = self.allow_env_api_key;
         let model = model.clone();
         let ctx = Arc::new(ctx.clone());
         let opts = opts.clone();
         tokio::spawn(async move {
-            run_stream(&mut producer, http, key, &model, &ctx, &opts).await;
+            run_stream(
+                &mut producer,
+                http,
+                key,
+                allow_env_api_key,
+                &model,
+                &ctx,
+                &opts,
+            )
+            .await;
         });
         stream
     }
@@ -983,10 +1014,45 @@ fn apply_message_phase(out: &mut AssistantMessage, item: &Value) {
     }
 }
 
+fn resolve_api_key(
+    provider_key: &Option<String>,
+    opts: &SimpleStreamOptions,
+    allow_env_api_key: bool,
+) -> Option<String> {
+    resolve_api_key_with_env(provider_key, opts, allow_env_api_key, || {
+        std::env::var("OPENAI_API_KEY")
+            .ok()
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn resolve_api_key_with_env(
+    provider_key: &Option<String>,
+    opts: &SimpleStreamOptions,
+    allow_env_api_key: bool,
+    read_env_api_key: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    opts.api_key
+        .clone()
+        .or_else(|| provider_key.clone())
+        .or_else(|| allow_env_api_key.then(read_env_api_key).flatten())
+}
+
+fn apply_api_key(
+    headers: &mut std::collections::BTreeMap<String, String>,
+    api_key: Option<String>,
+) {
+    if let Some(key) = api_key {
+        headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
+        headers.insert("authorization".into(), format!("Bearer {key}"));
+    }
+}
+
 async fn run_stream(
     p: &mut AssistantMessageEventStreamProducer,
     http: reqwest::Client,
     provider_key: Option<String>,
+    allow_env_api_key: bool,
     model: &Model,
     ctx: &Context,
     opts: &SimpleStreamOptions,
@@ -1003,15 +1069,8 @@ async fn run_stream(
             headers.insert(k.clone(), v.clone());
         }
     }
-    let key = opts.api_key.clone().or(provider_key).or_else(|| {
-        std::env::var("OPENAI_API_KEY")
-            .ok()
-            .filter(|v| !v.is_empty())
-    });
-    if let Some(key) = key {
-        headers.retain(|k, _| !k.eq_ignore_ascii_case("authorization"));
-        headers.insert("authorization".into(), format!("Bearer {key}"));
-    }
+    let key = resolve_api_key(&provider_key, opts, allow_env_api_key);
+    apply_api_key(&mut headers, key);
     if !headers
         .keys()
         .any(|k| k.eq_ignore_ascii_case("authorization") || k.eq_ignore_ascii_case("x-api-key"))
@@ -2219,6 +2278,49 @@ mod tests {
             "openai",
             "https://example.test/v1",
         )
+    }
+
+    #[test]
+    fn isolated_custom_provider_never_overwrites_auth_with_openai_env_key() {
+        let opts = SimpleStreamOptions::default();
+        let env_read = std::cell::Cell::new(false);
+        let resolved = resolve_api_key_with_env(&None, &opts, false, || {
+            env_read.set(true);
+            Some("official-openai-key".into())
+        });
+        let mut headers = BTreeMap::from([("authorization".into(), "Bearer gateway-key".into())]);
+        apply_api_key(&mut headers, resolved);
+
+        assert!(
+            !env_read.get(),
+            "isolated providers must not read OpenAI env auth"
+        );
+        assert_eq!(
+            headers.get("authorization").map(String::as_str),
+            Some("Bearer gateway-key")
+        );
+        assert!(headers
+            .values()
+            .all(|value| value != "Bearer official-openai-key"));
+    }
+
+    #[test]
+    fn only_exact_openai_provider_id_inherits_the_environment_key() {
+        let official = OpenAiResponsesProvider::with_models(
+            "openai",
+            None,
+            reqwest::Client::new(),
+            Vec::new(),
+        );
+        let case_variant = OpenAiResponsesProvider::with_models(
+            "OpenAI",
+            None,
+            reqwest::Client::new(),
+            Vec::new(),
+        );
+
+        assert!(official.allow_env_api_key);
+        assert!(!case_variant.allow_env_api_key);
     }
 
     fn assistant_with_call(id: &str) -> AssistantMessage {

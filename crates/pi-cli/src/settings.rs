@@ -14,6 +14,61 @@ use std::path::{Path, PathBuf};
 
 use crate::config::{self, strip_line_comments, ConfigError};
 
+/// A package entry from Pi's `packages` setting.
+///
+/// The string form loads every resource exposed by the package. The object
+/// form can restrict individual resource kinds through [`PackageFilter`].
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum PackageSetting {
+    Source(String),
+    Filtered(PackageFilter),
+}
+
+impl PackageSetting {
+    /// Return the npm, git, or local source spec regardless of entry form.
+    pub fn source(&self) -> &str {
+        match self {
+            Self::Source(source) => source,
+            Self::Filtered(filter) => &filter.source,
+        }
+    }
+}
+
+impl From<String> for PackageSetting {
+    fn from(source: String) -> Self {
+        Self::Source(source)
+    }
+}
+
+impl From<&str> for PackageSetting {
+    fn from(source: &str) -> Self {
+        Self::Source(source.to_string())
+    }
+}
+
+/// Resource filters for Pi's object-form package setting.
+///
+/// Additional properties are retained so loading and saving settings with a
+/// newer Pi package schema never discards fields rpi does not yet understand.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct PackageFilter {
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autoload: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extensions: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skills: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompts: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub themes: Option<Vec<String>>,
+    #[serde(flatten)]
+    pub unknown: serde_json::Map<String, serde_json::Value>,
+}
+
 /// The honored subset of pi's `Settings`. Unknown fields are ignored.
 #[derive(serde::Deserialize, Default, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
@@ -38,9 +93,14 @@ pub struct Settings {
     #[serde(default)]
     pub scoped_models: Option<Vec<String>>,
     /// Pi-compatible static package specs. Entries may be local package
-    /// directories, `package.json` files, or installed package names.
+    /// directories, `package.json` files, installed package names, or filtered
+    /// package objects.
     #[serde(default)]
-    pub packages: Option<Vec<String>>,
+    pub packages: Option<Vec<PackageSetting>>,
+    /// Command used by native Pi for npm package lookup/install operations.
+    /// Stored argv-style so launchers such as `mise exec -- npm` need no shell.
+    #[serde(default)]
+    pub npm_command: Option<Vec<String>>,
     /// Additional skill directories. Relative paths are resolved against the
     /// settings file's owner (project root for project settings, agent dir for
     /// global settings). `skills` is accepted as a compatibility shorthand.
@@ -65,7 +125,8 @@ pub struct Settings {
     /// Hide the body of thinking blocks while retaining a compact label.
     #[serde(default)]
     pub hide_thinking_block: Option<bool>,
-    /// Suppress interactive startup notices and update checks.
+    /// Suppress the interactive startup header and resource summary.
+    /// Update checks remain enabled, matching native Pi.
     #[serde(default)]
     pub quiet_startup: Option<bool>,
     /// Show the global terminal progress indicator while a run is active.
@@ -119,12 +180,11 @@ pub fn load_settings() -> Result<Settings, ConfigError> {
     }
 }
 
-/// Load project-local settings in precedence order: `.rpi/settings.json`,
-/// then legacy `.pi/settings.json`. Both files may contribute additional
-/// resource paths; the preferred `.rpi` file is returned first so its paths
-/// register before legacy Pi paths. Malformed or unreadable optional project
-/// settings are ignored, matching the best-effort behavior of resource-dir
-/// discovery; global settings remain available through [`load_settings`].
+/// Load the single active project settings document. `.rpi/settings.json`
+/// takes precedence; native Pi's `.pi/settings.json` is consulted only when
+/// the rpi-owned file does not exist. A malformed preferred file masks the
+/// fallback and yields no project settings, keeping project configuration
+/// fail-closed instead of executing entries from a stale lower-priority file.
 pub fn load_project_settings(cwd: &Path) -> Vec<Settings> {
     load_project_settings_with_paths(cwd)
         .into_iter()
@@ -132,21 +192,74 @@ pub fn load_project_settings(cwd: &Path) -> Vec<Settings> {
         .collect()
 }
 
-/// Load project settings together with their source paths. The path is kept
-/// so callers can preserve `.rpi` before `.pi` ordering even when only one of
-/// the two files exists.
+/// Load the active project settings together with its source path.
 pub fn load_project_settings_with_paths(cwd: &Path) -> Vec<(PathBuf, Settings)> {
-    [
-        cwd.join(".rpi").join("settings.json"),
-        cwd.join(".pi").join("settings.json"),
-    ]
-    .into_iter()
-    .filter_map(|path| {
-        load_settings_file(&path)
-            .ok()
-            .map(|settings| (path, settings))
-    })
-    .collect()
+    load_active_project_settings(cwd)
+        .ok()
+        .flatten()
+        .into_iter()
+        .collect()
+}
+
+/// Load the active project settings while preserving parse/read failures for
+/// callers that must fail closed, such as package install/update preflight.
+pub fn load_active_project_settings(
+    cwd: &Path,
+) -> Result<Option<(PathBuf, Settings)>, ConfigError> {
+    let preferred = cwd.join(".rpi/settings.json");
+    match load_settings_file(&preferred) {
+        Ok(settings) => Ok(Some((preferred, settings))),
+        Err(ConfigError::Read { source, .. }) if source.kind() == std::io::ErrorKind::NotFound => {
+            let fallback = cwd.join(".pi/settings.json");
+            match load_settings_file(&fallback) {
+                Ok(settings) => Ok(Some((fallback, settings))),
+                Err(ConfigError::Read { source, .. })
+                    if source.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    Ok(None)
+                }
+                Err(error) => Err(error),
+            }
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Load model-selection settings with native Pi's global -> trusted-project
+/// precedence. Only fields consumed during provider resolution are overlaid;
+/// package and resource loading keeps its own scope-aware merge semantics.
+pub fn load_effective_model_settings(
+    cwd: &Path,
+    project_trusted: bool,
+) -> Result<Settings, ConfigError> {
+    let mut effective = load_settings()?;
+    if project_trusted {
+        if let Some((_, project)) = load_active_project_settings(cwd)? {
+            if project.default_provider.is_some() {
+                effective.default_provider = project.default_provider;
+            }
+            if project.default_model.is_some() {
+                effective.default_model = project.default_model;
+            }
+            if project.default_thinking_level.is_some() {
+                effective.default_thinking_level = project.default_thinking_level;
+            }
+            if project.theme.is_some() {
+                effective.theme = project.theme;
+            }
+        }
+    }
+    Ok(effective)
+}
+
+/// Load the project settings document that rpi may safely update. The
+/// preferred `.rpi` file wins; when it does not exist, native Pi's `.pi` file
+/// seeds the first rpi-owned save so package changes do not discard fields rpi
+/// does not model.
+pub fn load_project_settings_for_write(cwd: &Path) -> Result<Settings, ConfigError> {
+    Ok(load_active_project_settings(cwd)?
+        .map(|(_, settings)| settings)
+        .unwrap_or_default())
 }
 
 fn load_settings_file(path: &Path) -> Result<Settings, ConfigError> {
@@ -188,23 +301,75 @@ fn parse_settings(text: &str) -> Result<Settings, serde_json::Error> {
     }
 }
 
+/// Parse an existing settings document while retaining fields that rpi does
+/// not model. Native Pi permits `//` line comments in `settings.json`, so use
+/// the same strict-then-comment-stripped strategy as [`parse_settings`].
+/// Keeping this separate from `parse_settings` is important: deserializing
+/// into [`Settings`] would discard unknown fields before a save/merge.
+fn parse_settings_value(text: &str) -> Result<serde_json::Value, serde_json::Error> {
+    match serde_json::from_str::<serde_json::Value>(text) {
+        Ok(value) => Ok(value),
+        Err(first) => {
+            let stripped = strip_line_comments(text);
+            serde_json::from_str::<serde_json::Value>(&stripped).map_err(|_| first)
+        }
+    }
+}
+
 /// Persist the honored settings back to `~/.rpi/agent/settings.json`.
 /// Unknown pi fields (which `Settings` doesn't model) are **preserved**: the
 /// current file is read as raw JSON, the known fields are overlaid, and the
 /// merged object is written — so a copied pi `settings.json` survives edits
-/// without losing pi-only keys. Missing file ⇒ a fresh object. Best-effort
-/// errors are returned as strings for the caller to surface.
+/// without losing pi-only keys. `//` comments are accepted using the same
+/// parser as [`load_settings`]. Missing file ⇒ a fresh object. Existing files
+/// that cannot be parsed safely are left untouched and reported as errors.
 pub fn save_settings(settings: &Settings) -> Result<(), String> {
     let path = config::settings_path().map_err(|e| e.to_string())?;
+    let fallback = if std::env::var_os(config::CONFIG_DIR_ENV).is_some() {
+        None
+    } else {
+        dirs::home_dir().map(|home| home.join(".pi/agent/settings.json"))
+    };
+    save_settings_to_path(settings, &path, fallback.as_deref())
+}
+
+/// Persist project-scoped settings under `.rpi/settings.json`, preserving an
+/// existing native `.pi/settings.json` as the raw fallback on the first save.
+pub fn save_project_settings(cwd: &Path, settings: &Settings) -> Result<(), String> {
+    save_settings_to_path(
+        settings,
+        &cwd.join(".rpi/settings.json"),
+        Some(&cwd.join(".pi/settings.json")),
+    )
+}
+
+fn save_settings_to_path(
+    settings: &Settings,
+    path: &Path,
+    fallback: Option<&Path>,
+) -> Result<(), String> {
     // Read the existing file as a raw object to preserve unknown fields.
-    let mut merged = match std::fs::read_to_string(&path) {
-        Ok(text) => serde_json::from_str::<serde_json::Value>(&text)
-            .unwrap_or(serde_json::Value::Object(Default::default())),
-        Err(_) => serde_json::Value::Object(Default::default()),
+    let mut merged = match std::fs::read_to_string(path) {
+        Ok(text) => parse_settings_value(&text).map_err(|error| {
+            format!(
+                "cannot parse existing settings file {}: {error}",
+                path.display()
+            )
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            read_fallback_settings_value(path, fallback)?
+                .unwrap_or_else(|| serde_json::Value::Object(Default::default()))
+        }
+        Err(error) => {
+            return Err(format!(
+                "cannot read existing settings file {}: {error}",
+                path.display()
+            ));
+        }
     };
     let obj = merged
         .as_object_mut()
-        .ok_or("settings file is not an object")?;
+        .ok_or_else(|| format!("settings file {} is not an object", path.display()))?;
     for (key, val) in [
         ("defaultProvider", settings.default_provider.as_ref()),
         ("defaultModel", settings.default_model.as_ref()),
@@ -242,15 +407,22 @@ pub fn save_settings(settings: &Settings) -> Result<(), String> {
         Some(list) if !list.is_empty() => {
             obj.insert(
                 "packages".to_string(),
-                serde_json::Value::Array(
-                    list.iter()
-                        .map(|p| serde_json::Value::String(p.clone()))
-                        .collect(),
-                ),
+                serde_json::to_value(list).map_err(|e| e.to_string())?,
             );
         }
         _ => {
             obj.remove("packages");
+        }
+    }
+    match &settings.npm_command {
+        Some(command) => {
+            obj.insert(
+                "npmCommand".to_string(),
+                serde_json::to_value(command).map_err(|e| e.to_string())?,
+            );
+        }
+        None => {
+            obj.remove("npmCommand");
         }
     }
     for (key, values) in [
@@ -335,7 +507,35 @@ pub fn save_settings(settings: &Settings) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let text = serde_json::to_string_pretty(&merged).map_err(|e| e.to_string())?;
-    std::fs::write(&path, text).map_err(|e| e.to_string())
+    config::atomic_write(path, text.as_bytes()).map_err(|e| e.to_string())
+}
+
+/// When rpi is still reading native Pi's settings fallback, seed the first
+/// rpi-owned save from that complete raw object. Otherwise a modeled-field
+/// save could shadow the native file and silently drop fields added by Pi.
+fn read_fallback_settings_value(
+    target: &Path,
+    fallback: Option<&Path>,
+) -> Result<Option<serde_json::Value>, String> {
+    let Some(path) = fallback else {
+        return Ok(None);
+    };
+    if path == target {
+        return Ok(None);
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(text) => parse_settings_value(&text).map(Some).map_err(|error| {
+            format!(
+                "cannot parse fallback settings file {}: {error}",
+                path.display()
+            )
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(format!(
+            "cannot read fallback settings file {}: {error}",
+            path.display()
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -379,6 +579,8 @@ mod tests {
         assert!(s.default_model.is_none());
         assert!(s.default_thinking_level.is_none());
         assert!(s.theme.is_none());
+        assert!(s.packages.is_none());
+        assert!(s.npm_command.is_none());
         assert!(s.skill_dirs.is_none());
         assert!(s.prompt_dirs.is_none());
         assert!(s.extension_dirs.is_none());
@@ -404,7 +606,19 @@ mod tests {
                 "editorPaddingX": 3,
                 "autocompleteMaxVisible": 7,
                 "compaction": { "threshold": 100 },
-                "packages": ["some-pkg"]
+                "npmCommand": ["mise", "exec", "node@20", "--", "npm"],
+                "packages": [
+                    "some-pkg",
+                    {
+                        "source": "npm:filtered-pkg",
+                        "autoload": false,
+                        "extensions": ["dist/index.js"],
+                        "skills": ["skills/review"],
+                        "prompts": ["prompts/review.md"],
+                        "themes": ["themes/dark.json"],
+                        "futureFilter": { "enabled": true }
+                    }
+                ]
             }"#,
         )
         .unwrap();
@@ -413,7 +627,38 @@ mod tests {
         assert_eq!(s.default_model.as_deref(), Some("claude-sonnet-5"));
         assert_eq!(s.default_thinking_level.as_deref(), Some("high"));
         assert_eq!(s.theme.as_deref(), Some("dark"));
-        assert_eq!(s.packages, Some(vec!["some-pkg".to_string()]));
+        assert_eq!(
+            s.npm_command.as_deref(),
+            Some(
+                ["mise", "exec", "node@20", "--", "npm"]
+                    .map(String::from)
+                    .as_slice()
+            )
+        );
+        let packages = s.packages.as_deref().unwrap();
+        assert_eq!(packages[0], PackageSetting::from("some-pkg"));
+        assert_eq!(packages[1].source(), "npm:filtered-pkg");
+        let PackageSetting::Filtered(filter) = &packages[1] else {
+            panic!("expected an object-form package setting");
+        };
+        assert_eq!(filter.autoload, Some(false));
+        assert_eq!(
+            filter.extensions.as_deref(),
+            Some(["dist/index.js".into()].as_slice())
+        );
+        assert_eq!(
+            filter.skills.as_deref(),
+            Some(["skills/review".into()].as_slice())
+        );
+        assert_eq!(
+            filter.prompts.as_deref(),
+            Some(["prompts/review.md".into()].as_slice())
+        );
+        assert_eq!(
+            filter.themes.as_deref(),
+            Some(["themes/dark.json".into()].as_slice())
+        );
+        assert_eq!(filter.unknown["futureFilter"]["enabled"], true);
         assert_eq!(s.hide_thinking_block, Some(true));
         assert_eq!(s.quiet_startup, Some(true));
         assert_eq!(s.show_terminal_progress, Some(false));
@@ -422,7 +667,7 @@ mod tests {
     }
 
     #[test]
-    fn loads_project_settings_in_rpi_then_pi_order() {
+    fn rpi_project_settings_mask_native_pi_settings() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join(".rpi")).unwrap();
         std::fs::create_dir_all(tmp.path().join(".pi")).unwrap();
@@ -438,7 +683,7 @@ mod tests {
         .unwrap();
 
         let settings = load_project_settings(tmp.path());
-        assert_eq!(settings.len(), 2);
+        assert_eq!(settings.len(), 1);
         assert_eq!(
             settings[0].skill_dirs.as_deref(),
             Some(["rpi-skills".to_string()].as_slice())
@@ -447,14 +692,69 @@ mod tests {
             settings[0].extension_dirs.as_deref(),
             Some(["rpi-ext".to_string()].as_slice())
         );
+    }
+
+    #[test]
+    fn native_pi_project_settings_are_a_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".pi")).unwrap();
+        std::fs::write(
+            tmp.path().join(".pi/settings.json"),
+            r#"{"defaultProvider":"native-provider","defaultModel":"native-model"}"#,
+        )
+        .unwrap();
+
+        let settings = load_project_settings_with_paths(tmp.path());
+        assert_eq!(settings.len(), 1);
+        assert!(settings[0].0.ends_with(".pi/settings.json"));
         assert_eq!(
-            settings[1].skill_dirs.as_deref(),
-            Some(["pi-skills".to_string()].as_slice())
+            settings[0].1.default_provider.as_deref(),
+            Some("native-provider")
         );
-        assert_eq!(
-            settings[1].extension_dirs.as_deref(),
-            Some(["pi-ext".to_string()].as_slice())
-        );
+    }
+
+    #[test]
+    fn malformed_rpi_project_settings_mask_native_pi_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".rpi")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".pi")).unwrap();
+        std::fs::write(tmp.path().join(".rpi/settings.json"), "{ malformed").unwrap();
+        std::fs::write(
+            tmp.path().join(".pi/settings.json"),
+            r#"{"packages":["npm:must-not-load"]}"#,
+        )
+        .unwrap();
+
+        assert!(load_project_settings_with_paths(tmp.path()).is_empty());
+        assert!(load_active_project_settings(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn trusted_project_model_defaults_override_global_defaults() {
+        let _cfg = TempConfig::new();
+        let global = config::settings_path().unwrap();
+        std::fs::create_dir_all(global.parent().unwrap()).unwrap();
+        std::fs::write(
+            global,
+            r#"{"defaultProvider":"global","defaultModel":"global-model","theme":"dark"}"#,
+        )
+        .unwrap();
+        let project = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(project.path().join(".rpi")).unwrap();
+        std::fs::write(
+            project.path().join(".rpi/settings.json"),
+            r#"{"defaultProvider":"project","defaultModel":"project-model"}"#,
+        )
+        .unwrap();
+
+        let trusted = load_effective_model_settings(project.path(), true).unwrap();
+        assert_eq!(trusted.default_provider.as_deref(), Some("project"));
+        assert_eq!(trusted.default_model.as_deref(), Some("project-model"));
+        assert_eq!(trusted.theme.as_deref(), Some("dark"));
+
+        let untrusted = load_effective_model_settings(project.path(), false).unwrap();
+        assert_eq!(untrusted.default_provider.as_deref(), Some("global"));
+        assert_eq!(untrusted.default_model.as_deref(), Some("global-model"));
     }
 
     #[test]
@@ -513,11 +813,48 @@ mod scoped_tests {
     }
 
     #[test]
+    fn save_uses_atomic_sibling_replacement() {
+        let (_tmp, _guard) = with_temp_env();
+        let path = config::settings_path().unwrap();
+        std::fs::write(&path, r#"{"theme":"dark","piOnlyField":true}"#).unwrap();
+
+        let mut settings = load_settings().unwrap();
+        settings.theme = Some("light".into());
+        save_settings(&settings).unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["theme"], "light");
+        assert_eq!(saved["piOnlyField"], true);
+        // `config::atomic_write` cleans up its sibling by replacing the
+        // target in one rename; a successful save leaves no staging file.
+        let temp = path.with_file_name(format!(
+            ".{}.tmp",
+            path.file_name().and_then(|name| name.to_str()).unwrap()
+        ));
+        assert!(!temp.exists(), "atomic staging file should not remain");
+    }
+
+    #[test]
     fn save_preserves_unknown_fields() {
         let (_tmp, _guard) = with_temp_env();
         let path = config::settings_path().unwrap();
-        std::fs::write(&path, r#"{"piOnlyField":"keep-me","theme":"dark"}"#).unwrap();
+        std::fs::write(
+            &path,
+            r#"{
+                "piOnlyField": "keep-me",
+                "theme": "dark",
+                "npmCommand": ["pnpm"],
+                "packages": [{
+                    "source": "npm:future-package",
+                    "autoload": false,
+                    "futureFilter": { "enabled": true }
+                }]
+            }"#,
+        )
+        .unwrap();
         let mut s = load_settings().unwrap();
+        assert_eq!(s.npm_command, Some(vec!["pnpm".to_string()]));
         s.scoped_models = Some(vec!["m1".into()]);
         save_settings(&s).unwrap();
         let raw: serde_json::Value =
@@ -525,5 +862,100 @@ mod scoped_tests {
         assert_eq!(raw["piOnlyField"], "keep-me");
         assert_eq!(raw["scopedModels"][0], "m1");
         assert_eq!(raw["theme"], "dark");
+        assert_eq!(raw["npmCommand"][0], "pnpm");
+        assert_eq!(raw["packages"][0]["source"], "npm:future-package");
+        assert_eq!(raw["packages"][0]["autoload"], false);
+        assert_eq!(raw["packages"][0]["futureFilter"]["enabled"], true);
+    }
+
+    #[test]
+    fn save_preserves_unknown_fields_and_packages_with_line_comments() {
+        let (_tmp, _guard) = with_temp_env();
+        let path = config::settings_path().unwrap();
+        let original = r#"{
+            // Native Pi permits comments in settings files.
+            "piOnlyField": { "keep": true },
+            "theme": "dark",
+            "packages": [
+                // Keep the package object and fields that rpi does not use.
+                {
+                    "source": "npm:future-package",
+                    "autoload": false,
+                    "futureFilter": { "enabled": true }
+                }
+            ]
+        }
+        "#;
+        std::fs::write(&path, original).unwrap();
+
+        let mut settings = load_settings().unwrap();
+        settings.scoped_models = Some(vec!["m1".into()]);
+        save_settings(&settings).unwrap();
+
+        // The comments may be normalized away by pretty-printing, but every
+        // unknown field and package property must survive the merge.
+        let raw: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(raw["piOnlyField"]["keep"], true);
+        assert_eq!(raw["theme"], "dark");
+        assert_eq!(raw["packages"][0]["source"], "npm:future-package");
+        assert_eq!(raw["packages"][0]["autoload"], false);
+        assert_eq!(raw["packages"][0]["futureFilter"]["enabled"], true);
+        assert_eq!(raw["scopedModels"][0], "m1");
+    }
+
+    #[test]
+    fn save_fails_closed_for_unparseable_existing_settings() {
+        let (_tmp, _guard) = with_temp_env();
+        let path = config::settings_path().unwrap();
+        // This is not recoverable by stripping comments (the closing brace is
+        // missing). Saving must leave the user's file byte-for-byte intact.
+        let original = b"{\n  // keep this file intact\n  \"piOnlyField\": \"keep-me\"\n";
+        std::fs::write(&path, original).unwrap();
+
+        let mut settings = Settings::default();
+        settings.theme = Some("light".into());
+        let error =
+            save_settings(&settings).expect_err("malformed settings must not be overwritten");
+        assert!(error.contains("cannot parse existing settings file"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn project_save_seeds_from_native_pi_without_losing_unknown_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy = tmp.path().join(".pi/settings.json");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(
+            &legacy,
+            r#"{
+                // Preserve fields from native Pi on the first rpi save.
+                "piOnlyField": { "keep": true },
+                "packages": ["npm:existing"]
+            }"#,
+        )
+        .unwrap();
+
+        let mut settings = load_project_settings_for_write(tmp.path()).unwrap();
+        settings.theme = Some("dark".into());
+        save_project_settings(tmp.path(), &settings).unwrap();
+
+        let preferred = tmp.path().join(".rpi/settings.json");
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(preferred).unwrap()).unwrap();
+        assert_eq!(saved["piOnlyField"]["keep"], true);
+        assert_eq!(saved["packages"][0], "npm:existing");
+        assert_eq!(saved["theme"], "dark");
+    }
+
+    #[test]
+    fn project_save_fails_closed_for_malformed_native_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        let legacy = tmp.path().join(".pi/settings.json");
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, "{ malformed").unwrap();
+
+        assert!(load_project_settings_for_write(tmp.path()).is_err());
+        assert!(!tmp.path().join(".rpi/settings.json").exists());
     }
 }

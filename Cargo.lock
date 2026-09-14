@@ -480,6 +480,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9564fc758e15025b46aa6643b1b77d047d1a56a1aea6e01002ac0c7026876213"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "futures"
 version = "0.3.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1720,7 +1730,9 @@ dependencies = [
  "base64",
  "crossterm",
  "dirs",
+ "fs2",
  "futures",
+ "globset",
  "indexmap 2.11.4",
  "png 0.18.1",
  "reqwest",
@@ -1734,6 +1746,7 @@ dependencies = [
  "rpi-tools",
  "rpi-tui",
  "schemars",
+ "semver",
  "serde",
  "serde_json",
  "tempfile",
@@ -1742,6 +1755,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "uuid",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -1962,6 +1976,12 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "semver"
+version = "1.0.28"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a7852d02fc848982e0c167ef163aaff9cd91dc640ba85e263cb1ce46fae51cd"
 
 [[package]]
 name = "serde"

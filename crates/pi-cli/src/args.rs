@@ -26,6 +26,48 @@ use std::path::PathBuf;
 
 use rpi_ai::ThinkingLevel;
 
+/// Native Pi's process-wide offline flag. The CLI normalizes a truthy value
+/// to `1` before dispatch so early subcommands and the regular app path share
+/// the same network gate.
+pub(crate) const PI_OFFLINE_ENV: &str = "PI_OFFLINE";
+
+/// Match native Pi's environment-flag contract exactly: empty values and
+/// values other than `1`, `true`, or `yes` are false; words are ASCII
+/// case-insensitive.
+pub(crate) fn is_truthy_env_flag(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+    })
+}
+
+pub(crate) fn offline_env_enabled() -> bool {
+    is_truthy_env_flag(std::env::var(PI_OFFLINE_ENV).ok().as_deref())
+}
+
+pub(crate) fn offline_mode_enabled(cli_offline: bool) -> bool {
+    cli_offline || offline_env_enabled()
+}
+
+/// Resolve and normalize offline mode before top-level subcommand dispatch.
+/// This mirrors native Pi setting `PI_OFFLINE=1` after either input enables it,
+/// allowing downstream code to use the same process-wide gate.
+pub(crate) fn normalize_offline_mode(args: &[String]) -> bool {
+    let enabled = offline_mode_enabled(args.iter().any(|arg| arg == "--offline"));
+    if enabled {
+        std::env::set_var(PI_OFFLINE_ENV, "1");
+    }
+    enabled
+}
+
+/// Remove the global offline flag before an early-dispatched subcommand parses
+/// its own options. The process-wide gate has already retained its meaning.
+pub(crate) fn without_offline_flag(args: &[String]) -> Vec<String> {
+    args.iter()
+        .filter(|arg| arg.as_str() != "--offline")
+        .cloned()
+        .collect()
+}
+
 /// Output mode. Mirrors TS `Mode = "text" | "json" | "rpc"`. `rpc` is parsed
 /// (so `--mode rpc` doesn't error) but v1 does not implement it; `main`
 /// reports an error if selected.
@@ -209,6 +251,7 @@ fn file_arg(arg: &str) -> Option<PathBuf> {
 /// ergonomics). Short flags use a single leading `-`.
 pub fn parse_args(args: &[String]) -> Args {
     let mut result = Args::default();
+    result.offline = offline_env_enabled();
     // `RPI_EXTENSIONS_DIR` env: an extra list of plugin dirs prepended to any
     // `--extensions-dir` flags. Semicolon-separated on Windows, colon-separated
     // on Unix (PATH-style). Empty entries skipped. `--no-extensions` still wins.
@@ -524,7 +567,7 @@ pub fn print_help() {
   --mode <mode>                  Output mode: text (default), json, or rpc
   --tui-mode <mode>              Interactive TUI buffer: regular or fullscreen
   --list-models [search]         List available models (with optional fuzzy search)
-  --offline                      Disable startup network checks
+  --offline                      Disable startup network operations (same as PI_OFFLINE=1)
   --export <file>                Export a JSONL session to HTML and exit
   --approve, -a                  Trust the current project for local resources
   --no-approve, -na              Do not trust the current project
@@ -598,6 +641,7 @@ pub fn print_help() {
   ANTHROPIC_AUTH_TOKEN           Bearer token (Authorization: Bearer) for third-party gateways
   ANTHROPIC_BASE_URL             Override the Anthropic endpoint (e.g. a compatible proxy)
   OPENAI_API_KEY                 Bearer token for openai-completions/responses
+  PI_OFFLINE                     Disable startup network operations when set to 1/true/yes
   RPI_CODING_AGENT_DIR           Override the ~/.rpi config directory (auth.json + models.json)
 
 {u}Notes:{r}
@@ -624,6 +668,17 @@ pub fn print_version() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct RestoreOfflineEnv(Option<std::ffi::OsString>);
+
+    impl Drop for RestoreOfflineEnv {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var(PI_OFFLINE_ENV, value),
+                None => std::env::remove_var(PI_OFFLINE_ENV),
+            }
+        }
+    }
 
     fn s(args: &[&str]) -> Vec<String> {
         args.iter().map(|a| a.to_string()).collect()
@@ -728,6 +783,47 @@ mod tests {
         let args = parse_args(&s(&["--offline"]));
         assert!(args.offline);
         assert!(args.ignored.is_empty());
+    }
+
+    #[test]
+    fn native_pi_offline_truthy_values_are_case_insensitive() {
+        for value in [
+            Some("1"),
+            Some("true"),
+            Some("TRUE"),
+            Some("Yes"),
+            Some("yEs"),
+        ] {
+            assert!(is_truthy_env_flag(value), "value={value:?}");
+        }
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("no"),
+            Some(" true "),
+        ] {
+            assert!(!is_truthy_env_flag(value), "value={value:?}");
+        }
+    }
+
+    #[test]
+    fn pi_offline_env_and_cli_flag_share_one_normalized_gate() {
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore = RestoreOfflineEnv(std::env::var_os(PI_OFFLINE_ENV));
+
+        std::env::set_var(PI_OFFLINE_ENV, "YeS");
+        assert!(parse_args(&[]).offline);
+        assert!(normalize_offline_mode(&[]));
+        assert_eq!(std::env::var(PI_OFFLINE_ENV).as_deref(), Ok("1"));
+
+        std::env::set_var(PI_OFFLINE_ENV, "0");
+        assert!(!parse_args(&[]).offline);
+        let argv = s(&["package", "update", "--offline"]);
+        assert!(normalize_offline_mode(&argv));
+        assert_eq!(std::env::var(PI_OFFLINE_ENV).as_deref(), Ok("1"));
+        assert_eq!(without_offline_flag(&argv), s(&["package", "update"]));
     }
 
     #[test]

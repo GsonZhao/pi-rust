@@ -31,7 +31,7 @@ use std::path::Path;
 use rpi_ai::types::{ImageContent, ImageContentType};
 
 use crate::args::{parse_args, print_help, print_version, resolve_mode, Args, RunMode};
-use crate::provider::{resolve, ResolveError};
+use crate::provider::{resolve_for_cwd, ResolveError};
 use crate::session::{build, BuildError};
 
 /// The exit code for a usage/parse error. (TS `main.ts` uses `process.exit(1)`
@@ -55,6 +55,11 @@ pub async fn run() -> i32 {
     if argv.first().map(String::as_str) == Some("__rpi_dev_cleanup") {
         return crate::dev_extension::run_cleanup_helper(&argv[1..]);
     }
+
+    // Native Pi resolves offline mode before dispatching top-level commands.
+    // Normalize the CLI flag into PI_OFFLINE so early package/update commands
+    // and the regular parsed path all observe the same process-wide gate.
+    crate::args::normalize_offline_mode(&argv);
 
     // `rpi dev` wraps the normal CLI: consume only development-specific
     // options, then pass every remaining argument through the regular parser.
@@ -217,26 +222,6 @@ pub async fn run() -> i32 {
         }
     }
 
-    // Update checks are interactive-only and best-effort. They write to
-    // stderr so print/JSON modes remain machine-readable, and the checker
-    // itself uses a short timeout plus a cache.
-    let quiet_startup = crate::settings::load_settings()
-        .ok()
-        .and_then(|settings| settings.quiet_startup)
-        .unwrap_or(false);
-    if !quiet_startup
-        && !parsed.offline
-        && !parsed.print
-        && std::io::stdin().is_terminal()
-        && std::io::stdout().is_terminal()
-    {
-        let package_resources = crate::session::should_load_js_packages(&parsed)
-            .then(|| crate::session::package_resources_for(&parsed, &cwd));
-        let report =
-            crate::updates::check_startup_with_package_resources(package_resources.as_ref()).await;
-        crate::updates::print_startup_notices(&report);
-    }
-
     // `-r/--resume` is an interactive picker, unlike `-c/--continue` which
     // immediately opens the latest session. Resolve the picker result before
     // building the harness so cancelling does not create or modify a session.
@@ -289,12 +274,15 @@ pub async fn run() -> i32 {
     let (initial, extra) = build_initial_message(&parsed, stdin_text.as_deref(), file_text_opt);
 
     // ---- provider + model resolution ----
-    let resolved = match resolve(
+    let project_trusted = crate::session::resolve_project_trust(&parsed, &cwd);
+    let resolved = match resolve_for_cwd(
         parsed.provider.as_deref(),
         parsed.model.as_deref(),
         parsed.thinking,
         parsed.api_key.as_deref(),
         parsed.base_url.as_deref(),
+        &cwd,
+        project_trusted,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -339,13 +327,14 @@ pub async fn run() -> i32 {
     }
 
     // ---- harness build ----
-    let (harness, event_rx, mut reload_context) = match build(&resolved, &parsed, &cwd).await {
-        Ok(triple) => triple,
-        Err(e) => {
-            print_build_error(&e);
-            return EXIT_RUNTIME;
-        }
-    };
+    let (harness, event_rx, mut reload_context) =
+        match build(&resolved, &parsed, &cwd, project_trusted).await {
+            Ok(triple) => triple,
+            Err(e) => {
+                print_build_error(&e);
+                return EXIT_RUNTIME;
+            }
+        };
     reload_context.dev_extension = dev_extension;
 
     // ---- mode dispatch (TS resolveAppMode → runPrintMode / InteractiveMode / runRpcMode) ----

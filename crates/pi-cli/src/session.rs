@@ -78,15 +78,41 @@ pub(crate) fn should_load_js_packages(args: &Args) -> bool {
 /// Resolve configured package resources once for this session. Keeping the
 /// boundary here ensures disabled package loading never parses settings or
 /// starts the Node host, including during reload.
-pub(crate) fn package_resources_for(args: &Args, cwd: &Path) -> crate::packages::PackageResources {
+pub(crate) fn package_resources_for(
+    args: &Args,
+    cwd: &Path,
+    project_trusted: bool,
+) -> crate::packages::PackageResources {
     if should_load_js_packages(args) {
-        if resolve_project_trust(args, cwd) {
-            crate::packages::discover_from_settings(cwd)
+        if crate::args::offline_mode_enabled(args.offline) {
+            if project_trusted {
+                crate::packages::resolve_offline_from_settings(cwd)
+            } else {
+                crate::packages::resolve_offline_from_global_settings(cwd)
+            }
+        } else if project_trusted {
+            crate::packages::resolve_from_settings(cwd)
         } else {
-            crate::packages::discover_from_global_settings(cwd)
+            crate::packages::resolve_from_global_settings(cwd)
         }
     } else {
         crate::packages::PackageResources::default()
+    }
+}
+
+/// Resolve package manifests for a metadata-only update check. Unlike runtime
+/// loading, this does not require `--enable-pi-packages`: reading package names
+/// and versions neither starts Node nor executes package code. Project-local
+/// settings remain behind the same trust decision as the runtime loader.
+pub(crate) fn package_resources_for_update_check(
+    _args: &Args,
+    cwd: &Path,
+    project_trusted: bool,
+) -> crate::packages::PackageResources {
+    if project_trusted {
+        crate::packages::discover_from_settings(cwd)
+    } else {
+        crate::packages::discover_from_global_settings(cwd)
     }
 }
 
@@ -199,6 +225,7 @@ pub async fn build(
     resolved: &ResolvedModel,
     args: &Args,
     cwd: &Path,
+    project_trusted: bool,
 ) -> Result<
     (
         AgentHarness,
@@ -208,7 +235,6 @@ pub async fn build(
     BuildError,
 > {
     let cwd_str = cwd.to_string_lossy().to_string();
-    let project_trusted = resolve_project_trust(args, cwd);
     if !project_trusted && args.verbose {
         eprintln!(
             "warning: project is not trusted; local settings, resources, and discovered extensions are disabled (use --approve or /trust)"
@@ -217,7 +243,7 @@ pub async fn build(
     // Pi packages are explicitly opt-in because discovery can start Node and
     // execute package code. Trust additionally limits discovery to global
     // settings when the current project has not been approved.
-    let package_resources = package_resources_for(args, cwd);
+    let package_resources = package_resources_for(args, cwd, project_trusted);
 
     // ---- B5a: build the action bridge BEFORE extension load ----
     // Extensions load before `AgentHarness::create` (extensions provide tools the
@@ -748,11 +774,13 @@ pub async fn build(
     let reload_context = ReloadContext {
         extension_session: Arc::new(Mutex::new(extension_session)),
         js_extension_session: js_extension_session.clone(),
+        package_resources: Arc::new(package_resources.clone()),
         action_bridge: Arc::new(Mutex::new(Some(Arc::clone(&action_bridge)))),
         catalog,
         gateway: resolved.provider.clone(),
         runtime: runtime.clone(),
         cwd: cwd.to_path_buf(),
+        project_trusted,
         args: args.clone(),
         resolved_model: resolved.model.clone(),
         broadcast: broadcast_for_context,
@@ -828,6 +856,10 @@ pub struct ReloadContext {
     pub extension_session: ExtensionSessionCell,
     /// JS/TS Pi extension host kept alive for the interactive session.
     pub js_extension_session: Option<crate::js_extensions::JsExtensionSession>,
+    /// The exact trust-gated package set resolved during initial build. The TUI
+    /// reuses this snapshot so failed startup remediation is not retried or
+    /// accidentally exposed by a second best-effort discovery pass.
+    pub package_resources: Arc<crate::packages::PackageResources>,
     /// The live action-bridge cell (swapped + old invalidated on reload).
     pub action_bridge: ActionBridgeCell,
     /// The model catalog (read-only) the host uses to resolve `set_model(id)`.
@@ -844,6 +876,10 @@ pub struct ReloadContext {
     pub runtime: tokio::runtime::Handle,
     /// The cwd (for static resource-dir resolution + context-file walk).
     pub cwd: PathBuf,
+    /// The project-trust decision captured before provider and session setup.
+    /// Startup consumers reuse this value so extension code cannot change the
+    /// effective policy by mutating the process cwd while it is loading.
+    pub project_trusted: bool,
     /// The parsed args (cloned) — `--no-*`/`--tools`/`--exclude-tools`/
     /// `--extensions-dir`/`--no-extensions`/`--system-prompt`/etc all apply on
     /// reload exactly as at startup (a reload re-reads the same flags; it does
@@ -882,6 +918,13 @@ pub struct ReloadOutcome {
     pub had_warnings: bool,
 }
 
+struct PreparedReloadInputs {
+    package_resources: crate::packages::PackageResources,
+    extension_dirs: Vec<PathBuf>,
+    skill_base_dirs: Vec<PathBuf>,
+    prompt_base_dirs: Vec<PathBuf>,
+}
+
 /// Append the resource sources that are specific to a reload after the
 /// conventional project/global directories. Keep this order aligned with the
 /// initial build: explicit CLI paths must remain available after `/reload`,
@@ -915,6 +958,17 @@ pub async fn reload_extension_resources(
     harness: &AgentHarness,
     ctx: &ReloadContext,
 ) -> ReloadOutcome {
+    reload_extension_resources_inner(harness, ctx, || {}).await
+}
+
+async fn reload_extension_resources_inner<F>(
+    harness: &AgentHarness,
+    ctx: &ReloadContext,
+    after_prepare: F,
+) -> ReloadOutcome
+where
+    F: FnOnce() + Send,
+{
     // Resolve the arguments once for this reload. `rpi dev` may append its
     // freshly staged extension directory; every subsequent loader and policy
     // decision must observe that same effective set rather than falling back
@@ -936,7 +990,24 @@ pub async fn reload_extension_resources(
     }
     let cwd_str = ctx.cwd.to_string_lossy().to_string();
     let project_trusted = resolve_project_trust(&effective_args, &ctx.cwd);
-    let package_resources = package_resources_for(&effective_args, &ctx.cwd);
+    let prepared = match prepare_reload_inputs(&effective_args, &ctx.cwd, project_trusted) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return ReloadOutcome {
+                summary: format!(
+                    "Settings reload failed: {error}. Keeping the currently loaded resources."
+                ),
+                had_warnings: true,
+            };
+        }
+    };
+    after_prepare();
+    let PreparedReloadInputs {
+        package_resources,
+        extension_dirs,
+        skill_base_dirs,
+        prompt_base_dirs,
+    } = prepared;
     let mut warnings = false;
 
     // ---- 1. Build a fresh ActionBridge + ExtensionSession ----
@@ -971,10 +1042,9 @@ pub async fn reload_extension_resources(
     let extension_session = if effective_args.no_extensions {
         rpi_extensions::ExtensionSession::none()
     } else {
-        load_extensions(
+        load_extensions_from_dirs(
             &effective_args,
-            &ctx.cwd,
-            project_trusted,
+            &extension_dirs,
             Some(Arc::clone(&fresh_bridge)),
         )
     };
@@ -1050,7 +1120,7 @@ pub async fn reload_extension_resources(
             .unwrap_or(&[]);
         let package_paths = package_resources.skill_dirs();
         let dirs = append_reload_resource_paths(
-            skill_dirs(&ctx.cwd),
+            skill_base_dirs,
             &effective_args.skill,
             &discovered.skill_paths,
             js_paths,
@@ -1071,7 +1141,7 @@ pub async fn reload_extension_resources(
             .unwrap_or(&[]);
         let package_paths = package_resources.prompt_dirs();
         let dirs = append_reload_resource_paths(
-            prompt_template_dirs(&ctx.cwd),
+            prompt_base_dirs,
             &effective_args.prompt_template,
             &discovered.prompt_paths,
             js_paths,
@@ -1237,6 +1307,138 @@ pub async fn reload_extension_resources(
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReloadSettingsFields {
+    packages: Option<Vec<crate::settings::PackageSetting>>,
+    npm_command: Option<Vec<String>>,
+    skill_dirs: Option<Vec<String>>,
+    prompt_dirs: Option<Vec<String>>,
+    extension_dirs: Option<Vec<String>>,
+}
+
+impl From<crate::settings::Settings> for ReloadSettingsFields {
+    fn from(settings: crate::settings::Settings) -> Self {
+        Self {
+            packages: settings.packages,
+            npm_command: settings.npm_command,
+            skill_dirs: settings.skill_dirs,
+            prompt_dirs: settings.prompt_dirs,
+            extension_dirs: settings.extension_dirs,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReloadSettingsSnapshot {
+    global: ReloadSettingsFields,
+    project: Option<ReloadSettingsFields>,
+}
+
+fn reload_reads_settings(args: &Args) -> bool {
+    should_load_js_packages(args)
+        || !args.no_extensions
+        || !args.no_skills
+        || !args.no_prompt_templates
+}
+
+/// Strictly read the settings fields consumed while preparing a reload. The
+/// snapshot intentionally excludes UI/model fields that `/reload` does not
+/// use, so an unrelated settings save does not invalidate the operation.
+fn load_reload_settings_snapshot(
+    args: &Args,
+    cwd: &Path,
+    project_trusted: bool,
+) -> Result<Option<ReloadSettingsSnapshot>, String> {
+    if !reload_reads_settings(args) {
+        return Ok(None);
+    }
+    let global = crate::settings::load_settings()
+        .map_err(|error| format!("could not load global settings: {error}"))?
+        .into();
+    let project = if project_trusted {
+        crate::settings::load_active_project_settings(cwd)
+            .map_err(|error| format!("could not load project settings: {error}"))?
+            .map(|(_, settings)| settings.into())
+    } else {
+        None
+    };
+    Ok(Some(ReloadSettingsSnapshot { global, project }))
+}
+
+/// Validate every settings document that this reload will consume before
+/// replacing any live extension, bridge, or harness resource.
+fn validate_settings_for_reload(
+    args: &Args,
+    cwd: &Path,
+    project_trusted: bool,
+) -> Result<(), String> {
+    load_reload_settings_snapshot(args, cwd, project_trusted).map(|_| ())
+}
+
+fn prepare_reload_inputs(
+    args: &Args,
+    cwd: &Path,
+    project_trusted: bool,
+) -> Result<PreparedReloadInputs, String> {
+    prepare_reload_inputs_inner(args, cwd, project_trusted, || {})
+}
+
+fn prepare_reload_inputs_inner<F>(
+    args: &Args,
+    cwd: &Path,
+    project_trusted: bool,
+    before_verify: F,
+) -> Result<PreparedReloadInputs, String>
+where
+    F: FnOnce(),
+{
+    let settings_before = load_reload_settings_snapshot(args, cwd, project_trusted)?;
+
+    let package_resources = package_resources_for(args, cwd, project_trusted);
+
+    let mut extension_dirs = if args.no_extensions {
+        Vec::new()
+    } else if project_trusted {
+        extension_dirs(cwd)
+    } else {
+        global_extension_dirs()
+    };
+    if !args.no_extensions {
+        extension_dirs.extend(args.extensions_dir.iter().cloned());
+    }
+
+    let skill_base_dirs = if args.no_skills {
+        Vec::new()
+    } else if project_trusted {
+        skill_dirs(cwd)
+    } else {
+        global_skill_dirs()
+    };
+
+    let prompt_base_dirs = if args.no_prompt_templates {
+        Vec::new()
+    } else if project_trusted {
+        prompt_template_dirs(cwd)
+    } else {
+        global_prompt_template_dirs()
+    };
+
+    before_verify();
+    let settings_after = load_reload_settings_snapshot(args, cwd, project_trusted)?;
+    if settings_before != settings_after {
+        return Err(
+            "settings changed while reload inputs were being prepared; retry /reload".to_string(),
+        );
+    }
+
+    Ok(PreparedReloadInputs {
+        package_resources,
+        extension_dirs,
+        skill_base_dirs,
+        prompt_base_dirs,
+    })
+}
+
 /// `build_models_with_extensions` for the reload path: the resolved gateway
 /// (NOT `resolved` — the reload context carries the gateway `Arc<dyn Provider>`
 /// directly, since the provider/auth did not change) first, then one
@@ -1334,7 +1536,7 @@ pub fn project_has_local_resources(cwd: &Path) -> bool {
 /// win; otherwise a stored `trust.json` decision is honored. An absent or
 /// malformed decision fails closed so untrusted project files cannot execute
 /// during startup.
-fn resolve_project_trust(args: &Args, cwd: &Path) -> bool {
+pub(crate) fn resolve_project_trust(args: &Args, cwd: &Path) -> bool {
     if let Some(override_value) = args.trust_override {
         return override_value;
     }
@@ -1363,6 +1565,14 @@ fn load_extensions(
         global_extension_dirs()
     };
     dirs.extend(args.extensions_dir.iter().cloned());
+    load_extensions_from_dirs(args, &dirs, action_bridge)
+}
+
+fn load_extensions_from_dirs(
+    args: &Args,
+    dirs: &[PathBuf],
+    action_bridge: Option<Arc<rpi_extensions::ActionBridge>>,
+) -> ExtensionSession {
     let diagnostics: Arc<dyn PluginDiagnostics> = Arc::new(NullDiagnostics);
     // B5a: the action bridge is cloned into every loaded plugin's vtable
     // `user_data` so post-register `runtime_action` calls recover the harness
@@ -1370,7 +1580,7 @@ fn load_extensions(
     // `!no_extensions` and threads `Some(bridge)`; `None` is only passed by the
     // `--no-extensions` branch (which calls `ExtensionSession::none()` directly)
     // and tests. Explicit `--extension`/`-e` files load after the dirs.
-    rpi_extensions::load_session_mixed(&dirs, &args.extension, diagnostics, action_bridge)
+    rpi_extensions::load_session_mixed(dirs, &args.extension, diagnostics, action_bridge)
 }
 
 fn js_extension_paths(
@@ -1909,7 +2119,7 @@ mod tests {
     fn pi_package_loading_is_opt_in_and_respects_no_extensions() {
         let args = Args::default();
         assert!(!should_load_js_packages(&args));
-        let resources = package_resources_for(&args, Path::new("."));
+        let resources = package_resources_for(&args, Path::new("."), false);
         assert!(resources.packages.is_empty());
 
         let args = Args {
@@ -1924,9 +2134,385 @@ mod tests {
             ..Args::default()
         };
         assert!(!should_load_js_packages(&args));
-        assert!(package_resources_for(&args, Path::new("."))
+        assert!(package_resources_for(&args, Path::new("."), false)
             .packages
             .is_empty());
+    }
+
+    #[test]
+    fn pi_offline_env_disables_startup_package_remediation() {
+        struct RestoreEnv {
+            name: &'static str,
+            value: Option<std::ffi::OsString>,
+        }
+
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                match self.value.take() {
+                    Some(value) => std::env::set_var(self.name, value),
+                    None => std::env::remove_var(self.name),
+                }
+            }
+        }
+
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore_config = RestoreEnv {
+            name: crate::config::CONFIG_DIR_ENV,
+            value: std::env::var_os(crate::config::CONFIG_DIR_ENV),
+        };
+        let _restore_offline = RestoreEnv {
+            name: crate::args::PI_OFFLINE_ENV,
+            value: std::env::var_os(crate::args::PI_OFFLINE_ENV),
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        let cwd = tmp.path().join("project");
+        let package = agent.join("npm/node_modules/demo");
+        std::fs::create_dir_all(package.join("extensions")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"name":"demo","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("extensions/index.js"),
+            "export default () => {};",
+        )
+        .unwrap();
+        std::fs::write(
+            agent.join("settings.json"),
+            r#"{"npmCommand":[""],"packages":["npm:demo@2.0.0"]}"#,
+        )
+        .unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+        std::env::set_var(crate::args::PI_OFFLINE_ENV, "TrUe");
+        let args = Args {
+            enable_pi_packages: true,
+            offline: false,
+            ..Args::default()
+        };
+
+        let resources = package_resources_for(&args, &cwd, false);
+
+        assert!(resources.packages.is_empty());
+        assert_eq!(resources.diagnostics.len(), 1);
+        assert!(resources.diagnostics[0].message.contains("offline"));
+        assert_eq!(
+            std::fs::read(package.join("package.json")).unwrap(),
+            br#"{"name":"demo","version":"1.0.0"}"#
+        );
+    }
+
+    #[test]
+    fn package_discovery_uses_the_callers_trust_snapshot() {
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let previous = std::env::var_os(crate::config::CONFIG_DIR_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        let cwd = tmp.path().join("project");
+        let package = cwd.join("package");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(cwd.join(".rpi")).unwrap();
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(agent.join("settings.json"), "{}").unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"name":"snapshot-package","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cwd.join(".rpi/settings.json"),
+            serde_json::json!({"packages": [package]}).to_string(),
+        )
+        .unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+
+        let args = Args {
+            enable_pi_packages: true,
+            ..Args::default()
+        };
+        assert_eq!(package_resources_for(&args, &cwd, true).packages.len(), 1);
+        assert!(package_resources_for(&args, &cwd, false)
+            .packages
+            .is_empty());
+        assert_eq!(
+            package_resources_for_update_check(&args, &cwd, true)
+                .packages
+                .len(),
+            1
+        );
+        assert!(package_resources_for_update_check(&args, &cwd, false)
+            .packages
+            .is_empty());
+
+        match previous {
+            Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+            None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+        }
+    }
+
+    #[test]
+    fn reload_settings_preflight_is_independent_of_packages_and_respects_trust() {
+        struct RestoreConfigDir(Option<std::ffi::OsString>);
+
+        impl Drop for RestoreConfigDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        let cwd = tmp.path().join("project");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(cwd.join(".rpi")).unwrap();
+        std::fs::write(agent.join("settings.json"), "{}").unwrap();
+        std::fs::write(cwd.join(".rpi/settings.json"), "{ malformed").unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+        let packages_disabled = Args::default();
+        let packages_enabled = Args {
+            enable_pi_packages: true,
+            ..Args::default()
+        };
+
+        for args in [&packages_disabled, &packages_enabled] {
+            let trusted = validate_settings_for_reload(args, &cwd, true);
+            let untrusted = validate_settings_for_reload(args, &cwd, false);
+            assert!(trusted
+                .unwrap_err()
+                .contains("could not load project settings"));
+            assert!(untrusted.is_ok());
+        }
+
+        std::fs::write(agent.join("settings.json"), "{ malformed").unwrap();
+        for args in [&packages_disabled, &packages_enabled] {
+            assert!(validate_settings_for_reload(args, &cwd, false)
+                .unwrap_err()
+                .contains("could not load global settings"));
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reload_with_packages_disabled_preserves_live_resources_when_settings_break() {
+        struct RestoreConfigDir(Option<std::ffi::OsString>);
+
+        impl Drop for RestoreConfigDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        let cwd = tmp.path().join("project");
+        let skill_dir = tmp.path().join("configured-skills");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: keep-me\ndescription: Reload sentinel\n---\nKeep this skill loaded.",
+        )
+        .unwrap();
+        std::fs::write(
+            agent.join("settings.json"),
+            serde_json::json!({"skillDirs": [skill_dir]}).to_string(),
+        )
+        .unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+
+        let resolved = crate::provider::resolve(
+            Some("anthropic"),
+            Some(crate::provider::DEFAULT_MODEL_ID),
+            None,
+            Some("test-key"),
+            None,
+        )
+        .unwrap();
+        let args = Args {
+            trust_override: Some(false),
+            no_session: true,
+            no_extensions: true,
+            no_prompt_templates: true,
+            no_context_files: true,
+            system_prompt: Some("stable system prompt".into()),
+            ..Args::default()
+        };
+        assert!(!should_load_js_packages(&args));
+
+        let (harness, _events, context) = build(&resolved, &args, &cwd, false).await.unwrap();
+        let before_resources = harness.get_resources().await.unwrap();
+        assert_eq!(before_resources.skills.as_ref().unwrap().len(), 1);
+        assert_eq!(before_resources.skills.as_ref().unwrap()[0].name, "keep-me");
+        let before_prompt = harness.get_system_prompt().await.unwrap();
+        let before_tools: Vec<String> = harness
+            .get_tools()
+            .await
+            .unwrap()
+            .iter()
+            .map(|tool| tool.tool.schema().name.clone())
+            .collect();
+        let before_bridge = context
+            .action_bridge
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .clone();
+
+        std::fs::write(agent.join("settings.json"), "{ malformed").unwrap();
+        let outcome = reload_extension_resources(&harness, &context).await;
+
+        assert!(outcome.had_warnings);
+        assert!(outcome.summary.contains("Settings reload failed"));
+        assert!(outcome.summary.contains("could not load global settings"));
+        assert_eq!(harness.get_resources().await.unwrap(), before_resources);
+        assert_eq!(harness.get_system_prompt().await.unwrap(), before_prompt);
+        let after_tools: Vec<String> = harness
+            .get_tools()
+            .await
+            .unwrap()
+            .iter()
+            .map(|tool| tool.tool.schema().name.clone())
+            .collect();
+        assert_eq!(after_tools, before_tools);
+        let after_bridge = context
+            .action_bridge
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert!(Arc::ptr_eq(&after_bridge, &before_bridge));
+    }
+
+    #[test]
+    fn reload_preparation_rejects_settings_changed_during_derivation() {
+        struct RestoreConfigDir(Option<std::ffi::OsString>);
+
+        impl Drop for RestoreConfigDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        let cwd = tmp.path().join("project");
+        let first_skill_dir = tmp.path().join("first-skills");
+        let second_skill_dir = tmp.path().join("second-skills");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(
+            agent.join("settings.json"),
+            serde_json::json!({"skillDirs": [first_skill_dir]}).to_string(),
+        )
+        .unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+        let args = Args {
+            trust_override: Some(false),
+            no_extensions: true,
+            no_prompt_templates: true,
+            ..Args::default()
+        };
+
+        let result = prepare_reload_inputs_inner(&args, &cwd, false, || {
+            std::fs::write(
+                agent.join("settings.json"),
+                serde_json::json!({"skillDirs": [second_skill_dir]}).to_string(),
+            )
+            .unwrap();
+        });
+
+        let error = result
+            .err()
+            .expect("settings mutation must fail preparation");
+        assert!(error.contains("settings changed while reload inputs were being prepared"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reload_uses_frozen_settings_inputs_after_preparation() {
+        struct RestoreConfigDir(Option<std::ffi::OsString>);
+
+        impl Drop for RestoreConfigDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        let cwd = tmp.path().join("project");
+        let skill_dir = tmp.path().join("configured-skills");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: frozen-skill\ndescription: Reload sentinel\n---\nFrozen input.",
+        )
+        .unwrap();
+        std::fs::write(
+            agent.join("settings.json"),
+            serde_json::json!({"skillDirs": [skill_dir]}).to_string(),
+        )
+        .unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+
+        let resolved = crate::provider::resolve(
+            Some("anthropic"),
+            Some(crate::provider::DEFAULT_MODEL_ID),
+            None,
+            Some("test-key"),
+            None,
+        )
+        .unwrap();
+        let args = Args {
+            trust_override: Some(false),
+            no_session: true,
+            no_extensions: true,
+            no_prompt_templates: true,
+            no_context_files: true,
+            system_prompt: Some("stable system prompt".into()),
+            ..Args::default()
+        };
+        let (harness, _events, context) = build(&resolved, &args, &cwd, false).await.unwrap();
+
+        let outcome = reload_extension_resources_inner(&harness, &context, || {
+            std::fs::write(agent.join("settings.json"), "{ malformed").unwrap();
+        })
+        .await;
+
+        assert!(!outcome.summary.contains("Settings reload failed"));
+        assert_eq!(
+            outcome.summary,
+            "Reloaded 0 plugin(s), 1 skill(s), 0 prompt(s)."
+        );
+        let resources = harness.get_resources().await.unwrap();
+        let skills = resources.skills.as_ref().unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "frozen-skill");
     }
 
     #[tokio::test]
@@ -2032,6 +2618,54 @@ mod tests {
             &approved,
             Path::new("C:/definitely-not-a-project")
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_preserves_the_supplied_startup_project_snapshot() {
+        struct RestoreConfigDir(Option<std::ffi::OsString>);
+
+        impl Drop for RestoreConfigDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        let cwd = tmp.path().join("project");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+
+        let resolved = crate::provider::resolve(
+            Some("anthropic"),
+            Some(crate::provider::DEFAULT_MODEL_ID),
+            None,
+            Some("test-key"),
+            None,
+        )
+        .unwrap();
+        let args = Args {
+            trust_override: Some(false),
+            no_session: true,
+            no_tools: true,
+            no_extensions: true,
+            no_skills: true,
+            no_prompt_templates: true,
+            no_context_files: true,
+            system_prompt: Some("test prompt".into()),
+            ..Args::default()
+        };
+
+        let (_, _, context) = build(&resolved, &args, &cwd, true).await.unwrap();
+
+        assert_eq!(context.cwd, cwd);
+        assert!(context.project_trusted);
     }
 
     #[test]
