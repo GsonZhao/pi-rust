@@ -181,7 +181,7 @@ under `.pi/npm` and `.pi/git`, while `--global` uses the configured rpi agent
 directory's `npm` and `git` stores. Local directories are enabled in place and
 are never copied or deleted. Existing legacy `.rpi/packages`, `.pi/packages`,
 and native `~/.pi/agent` installs remain discoverable. Package-manager argv is
-selected from trusted `.rpi/settings.json`, trusted `.pi/settings.json`, then
+selected from project `.rpi/settings.json`, project `.pi/settings.json`, then
 global `settings.json`; the default is npm. rpi treats the setting as structured
 argv rather than a shell command string, applies hardened encoding to Windows
 `.cmd` shims, and uses the native Pi flags for npm, pnpm, or bun.

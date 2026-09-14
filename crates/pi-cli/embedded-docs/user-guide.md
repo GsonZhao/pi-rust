@@ -255,7 +255,7 @@ rpi package update         # 兼容入口：同时更新 Rust 原生扩展和 Pi
 
 npm 和 Git 安装使用与原生 Pi 一致的托管布局：项目范围分别写入 `.pi/npm`、`.pi/git`，`--global` 则写入当前 rpi agent 配置目录下的 `npm`、`git`。本地目录只记录到 settings，不会复制，也不会在卸载时删除。旧版 `.rpi/packages`、`.pi/packages` 以及 `~/.pi/agent` 下的原生 Pi 安装仍可发现和迁移。
 
-`npmCommand` 是 argv 数组，不是 shell 字符串；依次选择已信任项目的 `.rpi/settings.json`、`.pi/settings.json`、全局 `settings.json`，都未配置时使用 npm。rpi 会按识别到的 npm、pnpm 或 bun 生成与原生 Pi 一致的 install/uninstall 参数。未信任项目的 settings 和 package 路径不会参与解析；无法安全验证的路径、来源或 manifest 会直接拒绝。Node.js 是运行 JS/TS extension 的必要条件。普通 rpi 命令不会加载这些 package，需显式传 `--enable-pi-packages`。
+`npmCommand` 是 argv 数组，不是 shell 字符串；依次选择项目 `.rpi/settings.json`、`.pi/settings.json`、全局 `settings.json`，都未配置时使用 npm。项目资源默认直接加载，不会弹出确认；需要临时禁用时使用 `--no-approve`，或在 TUI 中执行 `/trust no`。rpi 会按识别到的 npm、pnpm 或 bun 生成与原生 Pi 一致的 install/uninstall 参数。无法安全验证的路径、来源或 manifest 会直接拒绝。Node.js 是运行 JS/TS extension 的必要条件。普通 rpi 命令不会加载这些 package，需显式传 `--enable-pi-packages`。
 
 ### 静态资源
 

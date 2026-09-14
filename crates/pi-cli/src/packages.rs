@@ -1362,7 +1362,7 @@ fn run_top_level_update(args: &[String], scope: UpdateScope) -> i32 {
 
 fn print_help() {
     println!(
-        "Usage: rpi package <command>\n\nCommands:\n  list [--json] [--approve|--no-approve]\n                     List enabled TS packages and installed Rust extensions\n  add <path-or-name> Enable a local/package.json package\n  remove <path-or-name>\n                     Disable a Pi package\n  update [--approve|--no-approve] [--offline]\n                     Update TS npm/git packages and Rust crates.io extensions\n\nProject packages are read only when the project has a saved trust decision or --approve is supplied. TS package resources are loaded from skills/, prompts/, themes/, SYSTEM.md, APPEND_SYSTEM.md, and extensions. Rust-native extensions are installed with `rpi install`."
+        "Usage: rpi package <command>\n\nCommands:\n  list [--json] [--approve|--no-approve]\n                     List enabled TS packages and installed Rust extensions\n  add <path-or-name> Enable a local/package.json package\n  remove <path-or-name>\n                     Disable a Pi package\n  update [--approve|--no-approve] [--offline]\n                     Update TS npm/git packages and Rust crates.io extensions\n\nProject packages load by default without confirmation; use --no-approve to disable project package access. TS package resources are loaded from skills/, prompts/, themes/, SYSTEM.md, APPEND_SYSTEM.md, and extensions. Rust-native extensions are installed with `rpi install`."
     );
 }
 
@@ -1404,7 +1404,7 @@ fn package_command_project_trusted(cwd: &Path, args: &[String]) -> Result<bool, 
     }
     Ok(crate::config::project_trust_decision(cwd)
         .map_err(|error| error.to_string())?
-        .unwrap_or(false))
+        .unwrap_or(true))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

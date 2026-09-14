@@ -582,8 +582,8 @@ pub fn print_help() {
   --list-models [search]         List available models (with optional fuzzy search)
   --offline                      Disable startup network operations (same as PI_OFFLINE=1)
   --export <file>                Export a JSONL session to HTML and exit
-  --approve, -a                  Trust the current project for local resources
-  --no-approve, -na              Do not trust the current project
+  --approve, -a                  Force-enable current-project resources
+  --no-approve, -na              Disable current-project resources
   --print, -p                    Non-interactive: process prompt(s) and exit
   --continue, -c                 Continue the most recent session
   --resume, -r                   Browse and select a session to resume
