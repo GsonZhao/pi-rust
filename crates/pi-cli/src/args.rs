@@ -608,8 +608,9 @@ pub fn print_help() {
   --version, -v                  Show version
 
 {u}Subcommands:{r}
-  update                       Update installed Rust and npm packages
-  pi-update                    Update the rpi CLI from crates.io
+  update                       Update installed Rust-native extensions
+  pi-update                    Update configured Pi npm/Git packages
+  self-update                  Update the rpi CLI from crates.io
   auth login|check|logout        Manage persisted credentials in ~/.rpi/auth.json
                                 (see `rpi auth --help`)
   package list|add|remove|update Manage TS packages and Rust extensions

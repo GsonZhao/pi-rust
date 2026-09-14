@@ -145,8 +145,9 @@ rpi install <crate>
 rpi install-pi <spec>
 rpi uninstall <crate>
 rpi uninstall-pi <spec>
-rpi update                 # 更新 Rust/npm package
-rpi pi-update              # 更新 rpi CLI 自身
+rpi update                 # 只更新 Rust 原生扩展
+rpi pi-update              # 只更新 Pi npm/Git package
+rpi self-update            # 更新 rpi CLI 自身
 ```
 
 ## 4. 内置工具
@@ -249,7 +250,7 @@ rpi uninstall pi npm:@scope/package
 rpi package add ../my-pi-package
 rpi package list
 rpi package remove ../my-pi-package
-rpi package update
+rpi package update         # 兼容入口：同时更新 Rust 原生扩展和 Pi package
 ```
 
 npm 和 Git 安装使用与原生 Pi 一致的托管布局：项目范围分别写入 `.pi/npm`、`.pi/git`，`--global` 则写入当前 rpi agent 配置目录下的 `npm`、`git`。本地目录只记录到 settings，不会复制，也不会在卸载时删除。旧版 `.rpi/packages`、`.pi/packages` 以及 `~/.pi/agent` 下的原生 Pi 安装仍可发现和迁移。

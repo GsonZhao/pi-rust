@@ -97,14 +97,12 @@ pub async fn run() -> i32 {
         return crate::packages::run_cli(&argv[1..]);
     }
     if argv.first().map(|s| s.as_str()) == Some("update") {
-        // The top-level update command owns Rust/npm package updates.
-        // `pi-update` is the explicit self-update command for rpi itself.
-        let mut package_args = Vec::with_capacity(argv.len());
-        package_args.push("update".to_string());
-        package_args.extend_from_slice(&argv[1..]);
-        return crate::packages::run_cli(&package_args);
+        return crate::packages::run_native_update(&argv[1..]);
     }
     if argv.first().map(|s| s.as_str()) == Some("pi-update") {
+        return crate::packages::run_pi_update(&argv[1..]);
+    }
+    if argv.first().map(|s| s.as_str()) == Some("self-update") {
         return crate::updates::run_self_update(&argv[1..]);
     }
     if argv.first().map(|s| s.as_str()) == Some("install") {
