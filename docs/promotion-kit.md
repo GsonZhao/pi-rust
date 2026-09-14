@@ -5,7 +5,8 @@
 ## 统一信息
 
 - 项目：rpi，基于 Pi agent 的 Rust 原生 Agent SDK 和终端 coding agent
-- 版本：0.1.6
+- 稳定版本：0.1.10
+- Beta：Node/TypeScript 扩展加载、TUI 原生技能渲染（来自 dev 分支，暂不建议生产使用）
 - GitHub：https://github.com/bigfish1913/pi-rust
 - 官网：https://rpi.laofu.online/
 - 文档：https://rpi.laofu.online/docs.html
@@ -28,10 +29,12 @@
 > 目前包含：
 > - 异步、流式的 Agent loop
 > - Anthropic Messages、OpenAI-compatible 和 faux provider
-> - `read`、`write`、`edit`、`bash`、`grep`、`find`、`ls` 等 coding-agent 工具
+> - 与 Pi 对齐的 `read`、`write`、`edit`、`bash` coding-agent 工具
 > - session、JSONL 持久化、上下文压缩和 prompt templates
 > - `rpi-plugin-sdk` 与稳定 ABI 扩展能力
 > - `rpi-cli` 终端编码 Agent
+>
+> Node/TypeScript 扩展加载和 TUI 原生技能渲染目前属于 Beta，建议仅用于本地评估。
 >
 > 直接安装：
 >
@@ -59,9 +62,11 @@
 > Highlights:
 > - Async, streaming agent runtime
 > - Anthropic Messages, OpenAI-compatible chat completions, and a faux provider
-> - Built-in coding tools: read, write, edit, bash, grep, find, and ls
+> - Built-in coding tools: read, write, edit, and bash (Pi-compatible defaults)
 > - Durable JSONL sessions, context compaction, hooks, queues, and prompt templates
 > - Plugin SDK and stable ABI registration for tools, providers, events, and resources
+>
+> Node/TypeScript extension loading and native skill rendering are beta compatibility features and are not recommended for production.
 >
 > ```bash
 > cargo install rpi-cli
@@ -72,7 +77,7 @@
 >
 > Website: https://rpi.laofu.online/
 >
-> The project is MIT licensed and currently at version 0.1.6.
+> The project is MIT licensed. The current stable release is v0.1.10; the Node/TypeScript and native skill rendering updates are beta work on the dev branch.
 
 ## Reddit
 
@@ -96,11 +101,11 @@
 
 建议 Release 标题：
 
-> rpi v0.1.6 — Rust-native Pi agent SDK and CLI
+> rpi v0.1.10 — Rust-native Pi agent SDK and CLI
 
 Release 摘要：
 
-> rpi v0.1.6 provides the first complete path from provider and agent loop to built-in coding tools, sessions, harness, plugins, and the `rpi` terminal CLI.
+> rpi v0.1.10 provides the complete path from provider and agent loop to Pi-compatible coding tools, sessions, harness, plugins, and the `rpi` terminal CLI.
 >
 > Install the CLI with:
 >
@@ -127,7 +132,7 @@ Issue body:
 > Highlights:
 > - Async, streaming Agent runtime with tool calls, hooks, queues, and cancellation.
 > - Anthropic Messages, OpenAI-compatible Chat Completions, and a deterministic faux provider.
-> - Built-in `read`, `write`, `edit`, `bash`, `grep`, `find`, and `ls` tools.
+> - Built-in Pi-compatible `read`, `write`, `edit`, and `bash` tools.
 > - JSONL session persistence, branching, prompt templates, and context compaction.
 > - A stable `#[repr(C)]` plugin ABI through `rpi-plugin-sdk`, with a host-side dynamic loader.
 > - A terminal CLI that can be installed with `cargo install rpi-cli`.
@@ -166,10 +171,73 @@ entry as a focused PR rather than opening multiple issues.
 > GitHub: https://github.com/bigfish1913/pi-rust
 > Website: https://rpi.laofu.online/
 
+## 其他渠道（RustCC 已发布）
+
+RustCC 已有项目介绍后，不再重复投放同一篇文章。后续按平台调整内容角度：
+
+### OSCHINA
+
+标题：
+
+> rpi：用 Rust 构建可嵌入的 coding-agent runtime
+
+文章角度：
+
+> 重点介绍 `rpi-ai`、`rpi-agent`、`rpi-tools`、`rpi-harness` 的单向依赖，解释为什么采用 library-first 设计，以及如何从 faux provider 开始做离线测试。结尾放 CLI 安装命令和 GitHub 链接。不要把 Beta 的 Node/TypeScript 扩展或 TUI 技能渲染当作稳定卖点。
+
+### 掘金
+
+标题：
+
+> 从 Prompt 到工具循环：一个 Rust Agent SDK 的分层实践
+
+文章结构：
+
+> 1. Agent runtime 需要解决哪些问题；
+> 2. Provider、Agent loop、Tool 和 Session 如何分层；
+> 3. 用 `InMemoryExecutionEnv` 写不依赖网络的测试；
+> 4. 用 `cargo run -p minimal` 跑通第一个 Agent；
+> 5. rpi 与 CLI、插件 ABI 的关系。
+>
+> 文章主体写技术实践，项目介绍放在末尾，避免被识别为纯广告。
+
+### 知乎
+
+建议采用问答形式，不直接复制项目公告：
+
+> 问题方向：Rust 适合用来构建 LLM Agent 吗？
+>
+> 回答重点：Rust 的 trait、异步流式、可测试执行环境和稳定 ABI 如何帮助构建长期运行的 coding agent。用 rpi 的四层代码示例说明，再附项目链接。Node/TypeScript 扩展和 TUI 技能渲染只作为实验性兼容工作的补充说明。
+
+### DEV.to / Hashnode
+
+标题：
+
+> Building a Testable Coding Agent in Rust with rpi
+
+重点展示：
+
+> Start with the offline faux provider, add `read`/`write`/`edit`/`bash`, subscribe to streaming events, then introduce sessions. Keep the Node/TypeScript bridge and native skill rendering in a clearly marked Beta section.
+
+### Lobsters
+
+标题：
+
+> rpi: a Rust-native, library-first coding-agent runtime
+
+正文保持短小，强调 crate 分层、离线测试和 `rpi-plugin-sdk` 的 ABI 设计；附 GitHub、架构文档和最小运行命令。先确认账号满足社区发帖要求。
+
+### 发布节奏
+
+- RustCC 已发布，不在相邻几天内重复同类中文文章。
+- OSCHINA 和掘金间隔 3 至 5 天，使用不同标题和文章主体。
+- 知乎、DEV.to/Hashnode 作为技术跟进，间隔 5 至 7 天。
+- This Week in Rust 和 Awesome Rust 采用项目提交/PR 形式，不要当作普通软文重复发布。
+
 ## 发布检查清单
 
 - 确认链接使用 `https://github.com/bigfish1913/pi-rust`，不要使用旧仓库地址。
-- 确认版本号为 `0.1.6`，不要写成 `0.1.x`。
+- 稳定版宣传使用 `0.1.10`；Beta 功能须标注来自 dev 分支，不要写成已发布的稳定版本。
 - 确认安装命令是 `cargo install rpi-cli`。
 - 每个平台使用一张最相关的截图，正文中说明截图展示的是 CLI 启动或工作状态。
 - Hacker News 和 Reddit 使用英文；中文社区使用中文，并按版规选择分类。

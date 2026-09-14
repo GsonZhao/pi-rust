@@ -7,7 +7,7 @@
 | 目标 | Pi JS/TS package | Rust 原生扩展 |
 | --- | --- | --- |
 | 安装 | `rpi install-pi npm:...` | `rpi install crate-name` |
-| 入口 | `package.json` 的 `pi.extensions` / `rpi.extensions` | `rpi_plugin_register` C ABI 符号 |
+| 入口 | `package.json` 的 `pi.extensions` / `rpi.extensions` | `rpi_plugin_register_v2` C ABI 符号 |
 | 开发反馈 | 退出并重新启动 rpi | `rpi dev` watch + 热重载 |
 | 静态资源 | skills、prompts、themes、SYSTEM.md | `resources_discover` 或随项目放入 `.rpi` |
 | 运行环境 | Node.js，当前用户权限 | 本机动态库，当前用户权限 |
@@ -155,21 +155,18 @@ serde_json = "1"
 ### ABI 入口原则
 
 ```rust
-use rpi_plugin_sdk::{register_entrypoint, PluginApiVt};
-
-#[no_mangle]
-pub extern "C" fn rpi_plugin_register(api: *const PluginApiVt, abi: u32) -> i32 {
-    register_entrypoint(api, abi, |api| {
-        let Some(register_tool) = api.register_tool else {
-            return -1;
-        };
-        // 构建 StableToolSchema 和 execute/poll/cancel/destroy 函数表，
-        // 然后调用 register_tool。完整实现参考 examples/plugin-stub。
-        let _ = register_tool;
-        0
-    })
-}
+rpi_plugin_sdk::export_plugin_v2!(|api| {
+    let Some(register_tool) = api.register_tool else {
+        return -1;
+    };
+    // 构建 StableToolSchema 和 execute/poll/cancel/destroy 函数表，
+    // 然后调用 register_tool。完整实现参考 examples/plugin-stub。
+    let _ = register_tool;
+    0
+});
 ```
+
+新插件只导出 `rpi_plugin_register_v2`。宿主优先加载该符号；仅当它不存在时，才兼容加载 ABI v1 的 `rpi_plugin_register`，并传入版本 `1`。如果一个动态库同时导出两者，宿主只调用 v2；v2 返回错误时也不会回退调用 v1，避免重复注册产生副作用。ABI v1 的 runtime action 仅允许 ID `0..=15`，ABI v2 允许当前定义的 `0..=16`；未知 ID 会返回结构化错误，不会进入宿主分发。
 
 工具生命周期是 `execute -> poll -> cancel -> destroy`：
 
@@ -215,8 +212,11 @@ rpi dev -P rpi-webfetch
 ```bash
 rpi dev --release
 rpi dev --no-watch
+rpi dev-local
 rpi dev --package rpi-todo -- --model gateway/model
 ```
+
+调试单个扩展时使用 `rpi dev-local`（等价于 `rpi dev --local-only`）。它只加载当前编译的扩展、当前项目目录的 skill/prompt，以及该扩展发现的 skill/prompt；不会扫描全局扩展、已安装 Pi 包或其他项目资源，避免同名命令和无关命令干扰调试。内置命令（包括 `/reload`）仍然可用。
 
 TUI 中执行 `/reload` 会强制重新运行 Cargo build，再加载新阶段产物。Windows 上已加载 DLL 无法原地覆盖，因此不要手工把 Cargo target DLL 复制到固定文件名；`rpi dev` 的版本化 staging 会安全地完成切换，并在会话退出、loader 释放后清理。
 
@@ -277,7 +277,7 @@ rpi --extensions-dir ./target/debug
 ### Rust 扩展
 
 - `cargo fmt --check`、`cargo clippy --all-targets`、`cargo test` 通过。
-- `crate-type` 包含 `cdylib`，导出符号严格命名为 `rpi_plugin_register`。
+- `crate-type` 包含 `cdylib`，使用 `export_plugin_v2!` 导出 `rpi_plugin_register_v2`。
 - 依赖已发布的 `rpi-plugin-sdk` 兼容版本，不链接宿主私有 crate。
 - `rpi dev --no-watch` 能编译、加载并注册预期工具。
 - `rpi install <crate> --force` 的干净安装路径通过。

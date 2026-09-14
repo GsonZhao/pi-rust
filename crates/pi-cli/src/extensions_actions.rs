@@ -37,6 +37,7 @@
 //! `Model`, not an id) and the `cwd` for session create/fork/switch. Both are
 //! held by `rpi-cli` at build time and moved into the host.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
@@ -68,6 +69,8 @@ pub struct HarnessActionHost {
     /// The session cwd — `new_session`/`fork`/`switch_session` need it to
     /// locate the session dir.
     cwd: PathBuf,
+    /// Parsed unknown long flags retained for extension consumption.
+    cli_flags: BTreeMap<String, serde_json::Value>,
     #[allow(dead_code)]
     runtime: Handle,
 }
@@ -83,6 +86,7 @@ impl HarnessActionHost {
         catalog: Vec<rpi_ai::Model>,
         cwd: PathBuf,
         runtime: Handle,
+        cli_flags: BTreeMap<String, serde_json::Value>,
     ) -> (Self, Arc<OnceLock<Arc<AgentHarness>>>) {
         let harness = Arc::new(OnceLock::new());
         (
@@ -90,6 +94,7 @@ impl HarnessActionHost {
                 harness: Arc::clone(&harness),
                 catalog,
                 cwd,
+                cli_flags,
                 runtime,
             },
             harness,
@@ -235,6 +240,13 @@ fn assistant_text(msg: &rpi_ai::types::AssistantMessage) -> String {
 
 #[async_trait::async_trait]
 impl RuntimeActionHost for HarnessActionHost {
+    async fn get_cli_flag(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
+        let name = arg_str(&args, "name")?;
+        Ok(serde_json::json!({
+            "value": self.cli_flags.get(&name).cloned().unwrap_or(serde_json::Value::Null)
+        }))
+    }
+
     async fn send_message(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
         // `{"message": <AgentMessage json>}` — drive a full run from any message
         // kind. Falls back to `{"text": "..."}` as a user-text shorthand.

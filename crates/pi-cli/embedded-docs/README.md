@@ -42,6 +42,14 @@ The registry pages are the canonical entry points for installing the CLI or
 embedding the SDK. The repository may contain unreleased changes; check the
 published version shown on crates.io before depending on a new API.
 
+### Extension package repository
+
+Ready-to-install Rust-native extensions are maintained in the companion
+[`pi-rust/rpi-package`](https://github.com/pi-rust/rpi-package) repository.
+Browse its [`packages/`](https://github.com/pi-rust/rpi-package/tree/master/packages)
+directory for package source, usage documentation, and release metadata, or use
+the [online package catalog](https://rpi.laofu.online/packages.html).
+
 ## Relationship to the TypeScript source
 
 The TypeScript reference is checked out under `.reference/pi/` (read-only). Every
@@ -144,6 +152,11 @@ Rust extension and Pi JS/TS package templates, safety rules, testing, and
 release checklists.
 
 ### Load static Pi packages
+
+> **Beta notice:** JavaScript/TypeScript package loading through the Node host
+> and skill-invocation rendering in the TUI are experimental compatibility
+> features. They are suitable for local evaluation and feedback, but are not
+> recommended for production workloads and may change before stabilization.
 
 rpi can load Pi packages, including their static resources and executable
 JavaScript/TypeScript extensions. Install a package with:
@@ -310,6 +323,10 @@ Both commands require a clean worktree and one consistent version across all
 nine release crates. `task publish` runs the locked workspace test and check
 suites, publishes in dependency order, waits for each crate to reach the
 crates.io index, and safely resumes by skipping exact versions already present.
+
+## Star history
+
+[![Star History Chart](https://api.star-history.com/svg?repos=bigfish1913/pi-rust,pi-rust/rpi-package&type=Date)](https://www.star-history.com/#bigfish1913/pi-rust&pi-rust/rpi-package&Date)
 
 ## License
 

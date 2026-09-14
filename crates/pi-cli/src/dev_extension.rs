@@ -22,6 +22,7 @@ pub struct DevOptions {
     pub package: Option<String>,
     pub release: bool,
     pub watch: bool,
+    pub local_only: bool,
     pub passthrough: Vec<String>,
     pub help: bool,
 }
@@ -43,6 +44,7 @@ pub fn parse_args(args: &[String]) -> Result<DevOptions, String> {
                 "--help" | "-h" => options.help = true,
                 "--release" => options.release = true,
                 "--no-watch" => options.watch = false,
+                "--local-only" => options.local_only = true,
                 "--package" | "-P" => {
                     index += 1;
                     let package = args
@@ -61,15 +63,17 @@ pub fn parse_args(args: &[String]) -> Result<DevOptions, String> {
 
 pub fn print_help() {
     println!(
-        "Usage: rpi dev [dev options] [--] [rpi options/messages...]\n\n\
+        "Usage: rpi dev [dev options] [--] [rpi options/messages...]\n       rpi dev-local [dev options] [--] [rpi options/messages...]\n\n\
 Build the current Rust rpi extension, load it, and watch for changes.\n\n\
 Dev options:\n  \
 --package, -P <name>  Select a cdylib package in a multi-package workspace\n  \
 --release              Build with Cargo's release profile\n  \
 --no-watch             Build once; /reload still rebuilds manually\n  \
+--local-only           Load only this extension and its discovered resources\n  \
 --help, -h             Show this help\n\n\
 Examples:\n  \
 rpi dev\n  \
+rpi dev-local\n  \
 rpi dev --package my-extension\n  \
 rpi dev --release -- --model gateway/model\n"
     );
@@ -107,6 +111,7 @@ pub struct DevExtension {
     project: ExtensionProject,
     release: bool,
     watch: bool,
+    local_only: bool,
     stage_root: PathBuf,
     current_stage: Mutex<Option<PathBuf>>,
     build_lock: Mutex<()>,
@@ -135,6 +140,7 @@ impl DevExtension {
             project,
             release: options.release,
             watch: options.watch,
+            local_only: options.local_only,
             stage_root,
             current_stage: Mutex::new(None),
             build_lock: Mutex::new(()),
@@ -184,8 +190,16 @@ impl DevExtension {
             .unwrap()
             .clone()
             .ok_or("development extension has not been built")?;
-        args.extensions_dir
-            .retain(|path| !path.starts_with(&self.stage_root));
+        if self.local_only {
+            args.dev_local_only = true;
+            args.extensions_dir.clear();
+            args.extension.clear();
+            args.skill.clear();
+            args.prompt_template.clear();
+        } else {
+            args.extensions_dir
+                .retain(|path| !path.starts_with(&self.stage_root));
+        }
         args.extensions_dir.push(current);
         Ok(())
     }
@@ -526,6 +540,56 @@ mod tests {
     fn no_watch_is_honored() {
         let options = parse_args(&["--no-watch".into()]).unwrap();
         assert!(!options.watch);
+    }
+
+    #[test]
+    fn local_only_is_honored_without_leaking_to_passthrough() {
+        let options = parse_args(&[
+            "--local-only".into(),
+            "--model".into(),
+            "gateway/model".into(),
+        ])
+        .unwrap();
+        assert!(options.local_only);
+        assert_eq!(options.passthrough, ["--model", "gateway/model"]);
+    }
+
+    #[test]
+    fn local_only_apply_keeps_only_the_current_stage() {
+        let stage_root = PathBuf::from("workspace/.rpi/extensions/.dev/demo-123");
+        let current_stage = stage_root.join("1");
+        let dev = DevExtension {
+            project: ExtensionProject {
+                package: "demo".into(),
+                target: "demo".into(),
+                manifest: PathBuf::from("workspace/Cargo.toml"),
+                package_root: PathBuf::from("workspace"),
+                workspace_root: PathBuf::from("workspace"),
+            },
+            release: false,
+            watch: true,
+            local_only: true,
+            stage_root,
+            current_stage: Mutex::new(Some(current_stage.clone())),
+            build_lock: Mutex::new(()),
+            generation: AtomicU64::new(1),
+            stop: AtomicBool::new(false),
+        };
+        let mut args = Args {
+            extensions_dir: vec![PathBuf::from("global/extensions")],
+            extension: vec![PathBuf::from("other.dll")],
+            skill: vec![PathBuf::from("other-skill")],
+            prompt_template: vec![PathBuf::from("other-prompt.md")],
+            ..Args::default()
+        };
+
+        dev.apply_to_args(&mut args).unwrap();
+
+        assert!(args.dev_local_only);
+        assert_eq!(args.extensions_dir, [current_stage]);
+        assert!(args.extension.is_empty());
+        assert!(args.skill.is_empty());
+        assert!(args.prompt_template.is_empty());
     }
 
     #[test]

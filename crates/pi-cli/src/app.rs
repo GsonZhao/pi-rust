@@ -63,13 +63,17 @@ pub async fn run() -> i32 {
 
     // `rpi dev` wraps the normal CLI: consume only development-specific
     // options, then pass every remaining argument through the regular parser.
-    let dev_options = if argv.first().map(String::as_str) == Some("dev") {
+    let dev_command = argv.first().map(String::as_str);
+    let dev_options = if matches!(dev_command, Some("dev" | "dev-local")) {
         match crate::dev_extension::parse_args(&argv[1..]) {
             Ok(options) if options.help => {
                 crate::dev_extension::print_help();
                 return 0;
             }
-            Ok(options) => {
+            Ok(mut options) => {
+                if dev_command == Some("dev-local") {
+                    options.local_only = true;
+                }
                 argv = options.passthrough.clone();
                 Some(options)
             }
@@ -93,6 +97,14 @@ pub async fn run() -> i32 {
         return crate::packages::run_cli(&argv[1..]);
     }
     if argv.first().map(|s| s.as_str()) == Some("update") {
+        // The top-level update command owns Rust/npm package updates.
+        // `pi-update` is the explicit self-update command for rpi itself.
+        let mut package_args = Vec::with_capacity(argv.len());
+        package_args.push("update".to_string());
+        package_args.extend_from_slice(&argv[1..]);
+        return crate::packages::run_cli(&package_args);
+    }
+    if argv.first().map(|s| s.as_str()) == Some("pi-update") {
         return crate::updates::run_self_update(&argv[1..]);
     }
     if argv.first().map(|s| s.as_str()) == Some("install") {

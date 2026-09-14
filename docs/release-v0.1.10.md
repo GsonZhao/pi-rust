@@ -4,6 +4,10 @@
 interactive agent and adds the development workflow needed to iterate on
 Rust extensions quickly.
 
+> **Beta notice:** The Node/TypeScript extension bridge remains an experimental
+> compatibility feature in this release. Use it for local evaluation and
+> feedback only; it is not recommended for production workloads yet.
+
 ## Highlights
 
 - Multiplexed Node extension transport allows concurrent requests and accepts

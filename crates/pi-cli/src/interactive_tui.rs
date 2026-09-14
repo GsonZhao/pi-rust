@@ -8185,18 +8185,18 @@ mod tests {
                     name: "rpi".into(),
                     current: "0.1.10".into(),
                     latest: "0.1.11".into(),
-                    command: "rpi update".into(),
+                    command: "rpi pi-update".into(),
                 },
                 crate::updates::UpdateNotice {
                     name: "rpi-search".into(),
                     current: "0.1.0".into(),
                     latest: "0.1.1".into(),
-                    command: "rpi package update".into(),
+                    command: "rpi update".into(),
                 },
             ],
             warnings: vec![crate::updates::UpdateWarning {
                 message: "The previously scheduled rpi self-update failed: access denied".into(),
-                command: "rpi update".into(),
+                command: "rpi pi-update".into(),
             }],
         };
 
@@ -8213,7 +8213,7 @@ mod tests {
         assert!(plain.contains("New version 0.1.11 is available"), "{plain}");
         assert!(plain.contains("rpi update"), "{plain}");
         assert!(plain.contains("Package Updates Available"), "{plain}");
-        assert!(plain.contains("rpi package update"), "{plain}");
+        assert!(plain.contains("rpi pi-update"), "{plain}");
         assert!(plain.contains("- rpi-search 0.1.0 -> 0.1.1"), "{plain}");
     }
 
