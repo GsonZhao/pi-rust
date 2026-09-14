@@ -1287,6 +1287,13 @@ pub fn run_cli(args: &[String]) -> i32 {
             0
         }
         "update" => {
+            if args
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+            {
+                print_update_help();
+                return 0;
+            }
             let project_trusted = match package_command_project_trusted(&cwd, &args[1..]) {
                 Ok(trusted) => trusted,
                 Err(error) => {
@@ -1311,6 +1318,12 @@ pub fn run_cli(args: &[String]) -> i32 {
 fn print_help() {
     println!(
         "Usage: rpi package <command>\n\nCommands:\n  list [--json] [--approve|--no-approve]\n                     List enabled TS packages and installed Rust extensions\n  add <path-or-name> Enable a local/package.json package\n  remove <path-or-name>\n                     Disable a Pi package\n  update [--approve|--no-approve] [--offline]\n                     Update TS npm/git packages and Rust crates.io extensions\n\nProject packages are read only when the project has a saved trust decision or --approve is supplied. TS package resources are loaded from skills/, prompts/, themes/, SYSTEM.md, APPEND_SYSTEM.md, and extensions. Rust-native extensions are installed with `rpi install`."
+    );
+}
+
+fn print_update_help() {
+    println!(
+        "Usage: rpi update [--approve|--no-approve] [--offline]\n\nUpdate installed Rust-native and npm/Git Pi packages.\n\nThe legacy `rpi package update` spelling remains supported."
     );
 }
 
@@ -3801,6 +3814,11 @@ mod tests {
         // registry preflight.
         std::env::set_var(crate::args::PI_OFFLINE_ENV, "0");
         assert_eq!(update_packages(tmp.path(), false), 1);
+    }
+
+    #[test]
+    fn top_level_update_help_is_handled_by_package_updater() {
+        assert_eq!(run_cli(&["update".into(), "--help".into()]), 0);
     }
 
     #[test]

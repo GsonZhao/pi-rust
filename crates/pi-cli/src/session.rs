@@ -58,8 +58,8 @@ use crate::provider::ResolvedModel;
 use crate::resource_dirs::{
     discover_append_system_prompt_file_with_packages, discover_system_prompt_file_with_packages,
     extension_dirs, global_extension_dirs, global_prompt_template_dirs, global_skill_dirs,
-    load_prompt_templates_with_precedence, load_skills_with_precedence, prompt_template_dirs,
-    skill_dirs,
+    load_prompt_templates_with_precedence, load_skills_with_precedence,
+    project_prompt_template_dirs, project_skill_dirs, prompt_template_dirs, skill_dirs,
 };
 use rpi_extensions::{
     emit_resources_discover, ExtensionEmitter, ExtensionSession, NullDiagnostics,
@@ -105,11 +105,13 @@ pub(crate) fn package_resources_for(
 /// and versions neither starts Node nor executes package code. Project-local
 /// settings remain behind the same trust decision as the runtime loader.
 pub(crate) fn package_resources_for_update_check(
-    _args: &Args,
+    args: &Args,
     cwd: &Path,
     project_trusted: bool,
 ) -> crate::packages::PackageResources {
-    if project_trusted {
+    if args.dev_local_only {
+        crate::packages::PackageResources::default()
+    } else if project_trusted {
         crate::packages::discover_from_settings(cwd)
     } else {
         crate::packages::discover_from_global_settings(cwd)
@@ -243,7 +245,11 @@ pub async fn build(
     // Pi packages are explicitly opt-in because discovery can start Node and
     // execute package code. Trust additionally limits discovery to global
     // settings when the current project has not been approved.
-    let package_resources = package_resources_for(args, cwd, project_trusted);
+    let package_resources = if args.dev_local_only {
+        crate::packages::PackageResources::default()
+    } else {
+        package_resources_for(args, cwd, project_trusted)
+    };
 
     // ---- B5a: build the action bridge BEFORE extension load ----
     // Extensions load before `AgentHarness::create` (extensions provide tools the
@@ -267,6 +273,7 @@ pub async fn build(
         catalog.clone(),
         cwd.to_path_buf(),
         runtime.clone(),
+        args.unknown_flags.clone(),
     );
     let host_arc: Arc<dyn rpi_extensions::RuntimeActionHost> = Arc::new(action_host);
     // `runtime` is reused below (B5c: `PluggableProvider` needs a captured
@@ -500,7 +507,9 @@ pub async fn build(
     let mut skills: Vec<rpi_harness::types::Skill> = Vec::new();
     let mut skill_diags: Vec<rpi_harness::skills::SkillDiagnostic> = Vec::new();
     if !args.no_skills {
-        let mut dirs = if project_trusted {
+        let mut dirs = if args.dev_local_only {
+            project_skill_dirs(cwd)
+        } else if project_trusted {
             skill_dirs(cwd)
         } else {
             global_skill_dirs()
@@ -519,7 +528,9 @@ pub async fn build(
     let mut prompt_templates: Vec<rpi_harness::types::PromptTemplate> = Vec::new();
     let mut prompt_diags: Vec<rpi_harness::prompt_templates::PromptTemplateDiagnostic> = Vec::new();
     if !args.no_prompt_templates {
-        let mut dirs = if project_trusted {
+        let mut dirs = if args.dev_local_only {
+            project_prompt_template_dirs(cwd)
+        } else if project_trusted {
             prompt_template_dirs(cwd)
         } else {
             global_prompt_template_dirs()
@@ -1026,6 +1037,7 @@ where
                 ctx.catalog.clone(),
                 ctx.cwd.clone(),
                 ctx.runtime.clone(),
+                ctx.args.unknown_flags.clone(),
             );
             crate::extensions_actions::HarnessActionHost::set_harness(
                 &_cell,
@@ -1335,10 +1347,11 @@ struct ReloadSettingsSnapshot {
 }
 
 fn reload_reads_settings(args: &Args) -> bool {
-    should_load_js_packages(args)
-        || !args.no_extensions
-        || !args.no_skills
-        || !args.no_prompt_templates
+    !args.dev_local_only
+        && (should_load_js_packages(args)
+            || !args.no_extensions
+            || !args.no_skills
+            || !args.no_prompt_templates)
 }
 
 /// Strictly read the settings fields consumed while preparing a reload. The
@@ -1394,9 +1407,13 @@ where
 {
     let settings_before = load_reload_settings_snapshot(args, cwd, project_trusted)?;
 
-    let package_resources = package_resources_for(args, cwd, project_trusted);
+    let package_resources = if args.dev_local_only {
+        crate::packages::PackageResources::default()
+    } else {
+        package_resources_for(args, cwd, project_trusted)
+    };
 
-    let mut extension_dirs = if args.no_extensions {
+    let mut extension_dirs = if args.no_extensions || args.dev_local_only {
         Vec::new()
     } else if project_trusted {
         extension_dirs(cwd)
@@ -1409,6 +1426,8 @@ where
 
     let skill_base_dirs = if args.no_skills {
         Vec::new()
+    } else if args.dev_local_only {
+        project_skill_dirs(cwd)
     } else if project_trusted {
         skill_dirs(cwd)
     } else {
@@ -1417,6 +1436,8 @@ where
 
     let prompt_base_dirs = if args.no_prompt_templates {
         Vec::new()
+    } else if args.dev_local_only {
+        project_prompt_template_dirs(cwd)
     } else if project_trusted {
         prompt_template_dirs(cwd)
     } else {
@@ -1559,7 +1580,9 @@ fn load_extensions(
     project_trusted: bool,
     action_bridge: Option<Arc<rpi_extensions::ActionBridge>>,
 ) -> ExtensionSession {
-    let mut dirs = if project_trusted {
+    let mut dirs = if args.dev_local_only {
+        Vec::new()
+    } else if project_trusted {
         extension_dirs(cwd)
     } else {
         global_extension_dirs()
@@ -1589,6 +1612,9 @@ fn js_extension_paths(
     project_trusted: bool,
     packages: &crate::packages::PackageResources,
 ) -> Vec<PathBuf> {
+    if args.dev_local_only {
+        return Vec::new();
+    }
     let mut paths = packages.extension_paths();
     let discovered_dirs = if project_trusted {
         extension_dirs(cwd)
@@ -2296,6 +2322,12 @@ mod tests {
                 .unwrap_err()
                 .contains("could not load global settings"));
         }
+
+        let local_only = Args {
+            dev_local_only: true,
+            ..Args::default()
+        };
+        assert!(validate_settings_for_reload(&local_only, &cwd, true).is_ok());
     }
 
     #[tokio::test(flavor = "current_thread")]

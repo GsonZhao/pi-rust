@@ -6,8 +6,8 @@
 //! dep) that collects `messages`, `@file` attachments, known flags, and a map
 //! of *unknown* `--flags` (for extensions to claim later). This port keeps the
 //! same shape so the help text and flag semantics line up 1:1 with the
-//! reference. Unknown flags are *not* stored (there is no extension system in
-//! v1); they produce a warning diagnostic instead.
+//! reference. Unknown long flags are retained in [`Args::unknown_flags`] so a
+//! native extension can claim and consume its own CLI options after loading.
 //!
 //! Divergences from the TS parser (all deliberate v1 scope cuts, documented in
 //! `docs/m6-cli-open-questions.md`):
@@ -22,6 +22,7 @@
 //! - `--print`/`-p` may consume a following positional as its prompt (the TS
 //!   parser's `next !== undefined && !startsWith('@')` heuristic) — preserved.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use rpi_ai::ThinkingLevel;
@@ -88,9 +89,8 @@ pub enum TuiMode {
     Regular,
 }
 
-/// The parsed argument set. Mirrors TS `Args`. Fields absent in v1
-/// (`unknownFlags`, extension/resource discovery) are omitted; everything here
-/// is either honored or explicitly ignored-with-warning.
+/// The parsed argument set. Mirrors TS `Args`. Unknown long flags are retained
+/// for extension consumption; unknown short flags remain hard errors.
 #[derive(Debug, Clone, Default)]
 pub struct Args {
     pub provider: Option<String>,
@@ -184,6 +184,12 @@ pub struct Args {
     /// directory (repeated).
     pub prompt_template: Vec<PathBuf>,
 
+    /// Internal scope set by `rpi dev-local` / `rpi dev --local-only`.
+    /// Only the freshly staged development extension and resources it
+    /// discovers are loaded; normal project/global/package discovery is
+    /// skipped. This is intentionally not parsed by the regular CLI parser.
+    pub dev_local_only: bool,
+
     pub verbose: bool,
     pub help: bool,
     pub version: bool,
@@ -202,6 +208,10 @@ pub struct Args {
     /// expand. Mirrors TS `fileArgs`.
     pub file_args: Vec<PathBuf>,
 
+    /// Extension-declared or otherwise unknown long flags. Values are either
+    /// JSON booleans (a bare flag) or strings (a flag with a value), matching
+    /// Pi's `unknownFlags` contract so an extension can claim its own options.
+    pub unknown_flags: BTreeMap<String, serde_json::Value>,
     /// Warnings about recognized-but-ignored flags (v1 scope cuts). Surfaced
     /// to the user on startup when `--verbose`.
     pub ignored: Vec<String>,
@@ -472,21 +482,24 @@ pub fn parse_args(args: &[String]) -> Args {
                 result.theme = take_value(&mut result, "--theme");
             }
             "--no-themes" => result.no_themes = true,
-            // Unknown long flag (with or without `=`). `flag_key` already holds
-            // the bare name, so both `--frobnicate` and `--frobnicate=x` land
-            // here; consume a value if the next token isn't a flag/file.
+            // Unknown long flag (with or without `=`). Preserve it for an
+            // extension to claim after extension registration, matching Pi's
+            // `unknownFlags` behavior. A bare flag is boolean true; a following
+            // non-flag token is its string value.
             other if other.starts_with("--") => {
                 let name = &flag_key;
-                if inline.is_none()
-                    && i + 1 < args.len()
+                let value = if let Some(value) = inline {
+                    serde_json::Value::String(value)
+                } else if i + 1 < args.len()
                     && !args[i + 1].starts_with('-')
                     && !args[i + 1].starts_with('@')
                 {
                     i += 1;
-                }
-                result
-                    .ignored
-                    .push(format!("{name} is not a recognized flag (ignored)"));
+                    serde_json::Value::String(args[i].clone())
+                } else {
+                    serde_json::Value::Bool(true)
+                };
+                result.unknown_flags.insert(name[2..].to_string(), value);
             }
             // Unknown short flag → hard error (mirrors TS).
             other if other.starts_with('-') && other.len() > 1 => {
@@ -595,7 +608,8 @@ pub fn print_help() {
   --version, -v                  Show version
 
 {u}Subcommands:{r}
-  update                       Update the rpi CLI from crates.io
+  update                       Update installed Rust and npm packages
+  pi-update                    Update the rpi CLI from crates.io
   auth login|check|logout        Manage persisted credentials in ~/.rpi/auth.json
                                 (see `rpi auth --help`)
   package list|add|remove|update Manage TS packages and Rust extensions
@@ -610,6 +624,8 @@ pub fn print_help() {
                                 (see `rpi uninstall-pi --help`)
   dev [options]                  Build, watch, and hot-reload a Rust extension
                                 (see `rpi dev --help`)
+  dev-local [options]            Debug only the current Rust extension
+                                (shortcut for `rpi dev --local-only`)
 
 {u}Built-in Tools:{r}
   {builtin}  (enabled by default; Pi-compatible default set)
@@ -744,10 +760,36 @@ mod tests {
     }
 
     #[test]
-    fn unknown_long_flag_warns_not_errors() {
+    fn unknown_long_flag_is_retained_for_extensions() {
         let a = parse_args(&s(&["--frobnicate", "value"]));
         assert!(a.errors.is_empty());
-        assert!(!a.ignored.is_empty());
+        assert_eq!(
+            a.unknown_flags.get("frobnicate"),
+            Some(&serde_json::Value::String("value".into()))
+        );
+        assert!(a.ignored.is_empty());
+    }
+
+    #[test]
+    fn unknown_long_boolean_flag_is_retained() {
+        let a = parse_args(&s(&["--server"]));
+        assert_eq!(
+            a.unknown_flags.get("server"),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn unknown_long_flags_keep_string_and_equals_values() {
+        let a = parse_args(&s(&["--port", "8080", "--bind=127.0.0.1"]));
+        assert_eq!(
+            a.unknown_flags.get("port"),
+            Some(&serde_json::Value::String("8080".into()))
+        );
+        assert_eq!(
+            a.unknown_flags.get("bind"),
+            Some(&serde_json::Value::String("127.0.0.1".into()))
+        );
     }
 
     #[test]

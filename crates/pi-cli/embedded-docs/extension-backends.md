@@ -1,5 +1,9 @@
 # Extension Backends
 
+> **Beta:** The Node backend and TUI skill-invocation rendering are experimental
+> compatibility features. Use them for local evaluation and feedback only; do
+> not rely on them for production workloads until this notice is removed.
+
 RPI keeps extension orchestration independent from the extension implementation.
 The CLI exposes a small capability contract in `pi-cli::extension_api` and
 adapts each backend to it.
@@ -22,6 +26,13 @@ adapts each backend to it.
 Every backend reports an API version and explicit capabilities. Unsupported
 capabilities should be reported as structured `unsupported_capability` errors;
 they must not appear as JavaScript `undefined` failures.
+
+The native loader uses a symbol-based ABI handshake. It prefers
+`rpi_plugin_register_v2` with ABI version 2 and only looks for legacy
+`rpi_plugin_register` with ABI version 1 when the v2 symbol is absent. A chosen
+entrypoint is called once; registration failure never triggers cross-version
+fallback. The frozen v1 action range is `0..=15`, while v2 currently accepts
+`0..=16`; raw numeric ids are validated before host dispatch.
 
 ## Compatibility progression
 

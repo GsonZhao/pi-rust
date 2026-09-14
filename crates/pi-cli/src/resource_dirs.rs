@@ -289,12 +289,19 @@ pub async fn load_prompt_templates_with_precedence(
 /// configured and conventional global paths.
 /// The global dir is omitted when `agent_dir()` can't be resolved (no home dir).
 pub fn skill_dirs(cwd: &Path) -> Vec<PathBuf> {
-    let mut dirs = project_resource_dirs(cwd, "skills", ResourceKind::Skills);
+    let mut dirs = project_skill_dirs(cwd);
     if let Some(g) = global_dir("skills") {
         dirs.extend(configured_global_dirs(g.clone(), ResourceKind::Skills));
         dirs.push(g);
     }
     dirs
+}
+
+/// Project-only skill directories, excluding user/global configuration. This
+/// is used by `rpi dev-local` so the current extension can be debugged with
+/// the skills in the current checkout without importing unrelated skills.
+pub fn project_skill_dirs(cwd: &Path) -> Vec<PathBuf> {
+    project_resource_dirs(cwd, "skills", ResourceKind::Skills)
 }
 
 /// Resource directories that do not depend on the current project. Used when
@@ -306,12 +313,17 @@ pub fn global_skill_dirs() -> Vec<PathBuf> {
 /// The ordered prompt-template paths for a project: configured paths, then
 /// `[<cwd>/.rpi/prompts, <cwd>/.pi/prompts, <agent_dir>/prompts]`.
 pub fn prompt_template_dirs(cwd: &Path) -> Vec<PathBuf> {
-    let mut dirs = project_resource_dirs(cwd, "prompts", ResourceKind::Prompts);
+    let mut dirs = project_prompt_template_dirs(cwd);
     if let Some(g) = global_dir("prompts") {
         dirs.extend(configured_global_dirs(g.clone(), ResourceKind::Prompts));
         dirs.push(g);
     }
     dirs
+}
+
+/// Project-only prompt-template directories, excluding user/global settings.
+pub fn project_prompt_template_dirs(cwd: &Path) -> Vec<PathBuf> {
+    project_resource_dirs(cwd, "prompts", ResourceKind::Prompts)
 }
 
 pub fn global_prompt_template_dirs() -> Vec<PathBuf> {
@@ -534,5 +546,23 @@ mod tests {
         let extensions = extension_dirs(tmp.path());
         assert_eq!(extensions[0], tmp.path().join("target/debug"));
         assert!(extensions.contains(&tmp.path().join(".rpi/extensions")));
+    }
+
+    #[test]
+    fn local_resource_dirs_exclude_global_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".rpi")).unwrap();
+        std::fs::write(
+            tmp.path().join(".rpi/settings.json"),
+            r#"{"skills":["local-skills"],"promptDirs":["local-prompts"]}"#,
+        )
+        .unwrap();
+
+        let skills = project_skill_dirs(tmp.path());
+        let prompts = project_prompt_template_dirs(tmp.path());
+        assert!(skills.contains(&tmp.path().join("local-skills")));
+        assert!(skills.contains(&tmp.path().join(".rpi/skills")));
+        assert!(prompts.contains(&tmp.path().join("local-prompts")));
+        assert!(prompts.contains(&tmp.path().join(".rpi/prompts")));
     }
 }

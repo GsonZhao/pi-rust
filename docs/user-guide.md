@@ -145,7 +145,8 @@ rpi install <crate>
 rpi install-pi <spec>
 rpi uninstall <crate>
 rpi uninstall-pi <spec>
-rpi update
+rpi update                 # 更新 Rust/npm package
+rpi pi-update              # 更新 rpi CLI 自身
 ```
 
 ## 4. 内置工具
@@ -200,6 +201,10 @@ RPI_CODING_AGENT_DIR=/work/rpi-agent rpi
 会话默认保存到 agent 配置目录下的 sessions；`--no-session` 可使用临时会话。
 
 ## 6. Pi package
+
+> **Beta 功能提示：** Pi package 的 Node/JavaScript/TypeScript 扩展加载，以及
+> TUI 中的原生技能调用渲染，目前属于实验性兼容功能。建议仅用于本地评估和
+> 反馈收集，暂不建议用于生产环境；接口和行为可能在稳定前调整。
 
 ### 安装和管理
 

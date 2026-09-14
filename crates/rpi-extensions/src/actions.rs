@@ -2,7 +2,8 @@
 //!
 //! A plugin invokes `PluginApiVt::runtime_action` to drive the harness (send a
 //! message, switch models, fork a session, reload extensions, …). Unlike the
-//! register trampolines — which run synchronously inside `rpi_plugin_register`
+//! register trampolines — which run synchronously inside the selected register
+//! entrypoint
 //! and recover host state via the thread-local `CURRENT_HOST_API` —
 //! `runtime_action` is called **post-register**, from (a) a `spawn_blocking`
 //! pool thread mid-tool-drive, or (b) a foreign thread the plugin spawned
@@ -52,7 +53,7 @@ use tokio::runtime::Handle;
 /// to/from JSON at the impl boundary. Errors are `String` (become the action's
 /// nonzero `i32` + `{"error": msg}` JSON on the plugin side).
 ///
-/// The 16 methods map 1:1 to [`RuntimeActionId`]; `dispatch` below is the
+/// The 17 methods map 1:1 to [`RuntimeActionId`]; `dispatch` below is the
 /// exhaustive switch that connects the FFI id to the method.
 #[async_trait::async_trait]
 pub trait RuntimeActionHost: Send + Sync {
@@ -98,6 +99,12 @@ pub trait RuntimeActionHost: Send + Sync {
     /// concern; the host impl wires it to the `ActionBridge.reload` callback in
     /// B5d — until then this returns an "unsupported" error string).
     async fn reload(&self, args: serde_json::Value) -> Result<serde_json::Value, String>;
+
+    /// `GetCliFlag` — read a parsed extension CLI flag. Args are
+    /// `{"name":"flag"}` and the result is `{"value": <bool|string|null>}`.
+    async fn get_cli_flag(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+        Err("CLI flag lookup is not configured".to_string())
+    }
 }
 
 /// The host-side bridge carried in [`PluginApiVt::user_data`] so
@@ -273,7 +280,7 @@ pub fn reload_callback_from_mailbox(
 // naturally Send+Sync; no manual unsafe impl needed.
 
 /// Dispatch one action to the host. Async — runs on the bridge's runtime.
-/// Handles all 16 ids; `Reload` delegates to [`RuntimeActionHost::reload`]
+/// Handles all 17 ids; `Reload` delegates to [`RuntimeActionHost::reload`]
 /// (the "no callback configured" fallback). When the bridge has a reload
 /// callback, the spawn site intercepts `Reload` and awaits the callback
 /// instead (a CLI concern, not a harness op) — this helper is the plain
@@ -300,6 +307,7 @@ async fn dispatch(
         RuntimeActionId::NavigateTree => host.navigate_tree(args).await,
         RuntimeActionId::SwitchSession => host.switch_session(args).await,
         RuntimeActionId::Reload => host.reload(args).await,
+        RuntimeActionId::GetCliFlag => host.get_cli_flag(args).await,
     }
 }
 
@@ -317,6 +325,8 @@ async fn dispatch(
 ///   [`StbString`]; the plugin frees it via the host `free_string` from the
 ///   vtable).
 /// - `1` — host-level error; `*out` written with `{"error": msg}` JSON.
+/// - `2` — unknown numeric action id; `*out` contains a structured error and
+///   no host method is dispatched.
 /// - `-1` — no bridge present (`user_data` null; should not happen when wired).
 /// - `-2` — the spawned task dropped its sender without sending (runtime
 ///   shutdown / dispatch panic); no result available.
@@ -324,13 +334,19 @@ async fn dispatch(
 /// The whole body is `catch_unwind`-wrapped — a panic across FFI ⇒ abort (same
 /// policy as the tool partial callback, `tool.rs:206`).
 pub extern "C" fn trampoline_runtime_action(
-    action: RuntimeActionId,
+    action_id: u32,
     args_json: StbStringRef,
     out: *mut StbString,
     user_data: *mut c_void,
 ) -> i32 {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        run_action(action, args_json, out, user_data)
+        run_action(
+            action_id,
+            u32::from(RuntimeActionId::GetCliFlag),
+            args_json,
+            out,
+            user_data,
+        )
     }));
     match outcome {
         Ok(rc) => rc,
@@ -343,13 +359,64 @@ pub extern "C" fn trampoline_runtime_action(
     }
 }
 
-/// Inner synchronous driver (split out so the `catch_unwind` wrapper is clean).
-fn run_action(
-    action: RuntimeActionId,
+/// ABI v1 runtime-action trampoline. The legacy vtable has the same physical
+/// slot shape, but only the historical action ids `0..=15` are valid.
+pub extern "C" fn trampoline_runtime_action_v1(
+    action_id: u32,
     args_json: StbStringRef,
     out: *mut StbString,
     user_data: *mut c_void,
 ) -> i32 {
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_action(
+            action_id,
+            u32::from(RuntimeActionId::Reload),
+            args_json,
+            out,
+            user_data,
+        )
+    }));
+    match outcome {
+        Ok(rc) => rc,
+        Err(_) => {
+            tracing::error!(
+                "ABI v1 runtime_action trampoline panicked - aborting (cannot unwind across FFI)"
+            );
+            std::process::abort();
+        }
+    }
+}
+
+/// Inner synchronous driver (split out so the `catch_unwind` wrapper is clean).
+fn run_action(
+    action_id: u32,
+    max_action_id: u32,
+    args_json: StbStringRef,
+    out: *mut StbString,
+    user_data: *mut c_void,
+) -> i32 {
+    // Validate the raw FFI integer before dereferencing host state or entering
+    // the enum-based dispatch. Unknown values are ordinary protocol errors;
+    // they never become invalid Rust enum discriminants.
+    let action = match RuntimeActionId::try_from(action_id) {
+        Ok(action) if action_id <= max_action_id => action,
+        Ok(_) | Err(_) => {
+            if !out.is_null() {
+                let json = serde_json::json!({
+                    "error": format!("unknown runtime action id {action_id}")
+                })
+                .to_string();
+                // SAFETY: `out` is non-null and points to the caller-provided
+                // output slot. The plugin reclaims this host allocation via
+                // `host_free_string` from the vtable.
+                unsafe {
+                    *out = StbString::from_string(json);
+                }
+            }
+            return 2;
+        }
+    };
+
     if user_data.is_null() {
         return -1;
     }
@@ -556,6 +623,10 @@ mod tests {
             self.saw.lock().unwrap().push(RuntimeActionId::Reload);
             Ok(serde_json::Value::Null)
         }
+        async fn get_cli_flag(&self, _: serde_json::Value) -> Result<serde_json::Value, String> {
+            self.saw.lock().unwrap().push(RuntimeActionId::GetCliFlag);
+            Ok(serde_json::json!({ "value": true }))
+        }
     }
 
     /// NOTE: these tests use `flavor = "multi_thread"`. The trampoline parks the
@@ -584,7 +655,7 @@ mod tests {
 
         let mut out = StbString::empty();
         let rc = trampoline_runtime_action(
-            RuntimeActionId::GetSystemPrompt,
+            RuntimeActionId::GetSystemPrompt.into(),
             args_ref,
             &mut out as *mut StbString,
             user_data,
@@ -608,7 +679,7 @@ mod tests {
         let args_ref = StbStringRef::from_str("{}");
         let mut out = StbString::empty();
         let rc = trampoline_runtime_action(
-            RuntimeActionId::GetSystemPrompt,
+            RuntimeActionId::GetSystemPrompt.into(),
             args_ref,
             &mut out as *mut StbString,
             std::ptr::null_mut(),
@@ -644,7 +715,7 @@ mod tests {
         let args_ref = StbStringRef::from_str("{}");
         let mut out = StbString::empty();
         let rc = trampoline_runtime_action(
-            RuntimeActionId::Reload,
+            RuntimeActionId::Reload.into(),
             args_ref,
             &mut out as *mut StbString,
             user_data,
@@ -679,7 +750,7 @@ mod tests {
         let args_ref = StbStringRef::from_str("{}");
         let mut out = StbString::empty();
         let rc = trampoline_runtime_action(
-            RuntimeActionId::GetSystemPrompt,
+            RuntimeActionId::GetSystemPrompt.into(),
             args_ref,
             &mut out as *mut StbString,
             user_data,
@@ -695,6 +766,107 @@ mod tests {
         assert!(
             host_for_assert.saw.lock().unwrap().is_empty(),
             "host dispatch must NOT run on a stale bridge"
+        );
+    }
+
+    #[tokio::test]
+    async fn trampoline_rejects_unknown_numeric_id_without_dispatch() {
+        let host = Arc::new(MockHost {
+            prompt: String::new(),
+            saw: Mutex::new(Vec::new()),
+        });
+        let host_for_assert = Arc::clone(&host);
+        let host_dyn: Arc<dyn RuntimeActionHost> = host;
+        let bridge = ActionBridge::new(tokio::runtime::Handle::current(), host_dyn);
+        let user_data = Arc::as_ptr(&bridge) as *mut c_void;
+
+        let mut out = StbString::empty();
+        let rc = trampoline_runtime_action(
+            0xFFFF_FFFE,
+            StbStringRef::from_str("{}"),
+            &mut out,
+            user_data,
+        );
+
+        assert_eq!(rc, 2, "unknown action id must be a protocol error");
+        let payload: serde_json::Value =
+            serde_json::from_str(&out.to_string_lossy()).expect("structured error JSON");
+        assert_eq!(payload["error"], "unknown runtime action id 4294967294");
+        crate::host_free_string(out);
+        assert!(
+            host_for_assert.saw.lock().unwrap().is_empty(),
+            "unknown action id must not reach host dispatch"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_trampoline_rejects_v2_action_without_dispatch() {
+        let host = Arc::new(MockHost {
+            prompt: String::new(),
+            saw: Mutex::new(Vec::new()),
+        });
+        let host_for_assert = Arc::clone(&host);
+        let host_dyn: Arc<dyn RuntimeActionHost> = host;
+        let bridge = ActionBridge::new(tokio::runtime::Handle::current(), host_dyn);
+        let user_data = Arc::as_ptr(&bridge) as *mut c_void;
+
+        let mut out = StbString::empty();
+        let rc = trampoline_runtime_action_v1(
+            RuntimeActionId::GetCliFlag.into(),
+            StbStringRef::from_str("{}"),
+            &mut out,
+            user_data,
+        );
+
+        assert_eq!(rc, 2);
+        let payload: serde_json::Value =
+            serde_json::from_str(&out.to_string_lossy()).expect("structured error JSON");
+        assert_eq!(payload["error"], "unknown runtime action id 16");
+        crate::host_free_string(out);
+        assert!(host_for_assert.saw.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn legacy_accepts_v1_action_and_v2_accepts_new_action() {
+        let host = Arc::new(MockHost {
+            prompt: "legacy".to_string(),
+            saw: Mutex::new(Vec::new()),
+        });
+        let host_for_assert = Arc::clone(&host);
+        let host_dyn: Arc<dyn RuntimeActionHost> = host;
+        let bridge = ActionBridge::new(tokio::runtime::Handle::current(), host_dyn);
+        let user_data = Arc::as_ptr(&bridge) as *mut c_void;
+
+        let mut legacy_out = StbString::empty();
+        assert_eq!(
+            trampoline_runtime_action_v1(
+                RuntimeActionId::GetSystemPrompt.into(),
+                StbStringRef::from_str("{}"),
+                &mut legacy_out,
+                user_data,
+            ),
+            0
+        );
+        crate::host_free_string(legacy_out);
+
+        let mut v2_out = StbString::empty();
+        assert_eq!(
+            trampoline_runtime_action(
+                RuntimeActionId::GetCliFlag.into(),
+                StbStringRef::from_str(r#"{"name":"flag"}"#),
+                &mut v2_out,
+                user_data,
+            ),
+            0
+        );
+        crate::host_free_string(v2_out);
+
+        assert_eq!(
+            *host_for_assert.saw.lock().unwrap(),
+            vec![
+                RuntimeActionId::GetSystemPrompt,
+                RuntimeActionId::GetCliFlag
+            ]
         );
     }
 

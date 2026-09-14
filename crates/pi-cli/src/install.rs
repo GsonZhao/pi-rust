@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 const INSTALLER_MANIFEST: &str = "rpi-extension-installer";
 const NATIVE_PACKAGES_FILE: &str = "native-packages.json";
 const NATIVE_PACKAGES_LOCK_FILE: &str = "native-packages.lock";
+const CDYLIB_EXTENSION_HINT: &str = "hint: the crate must declare `crate-type = [\"cdylib\"]` and export `rpi_plugin_register_v2` (legacy `rpi_plugin_register` remains supported for ABI v1 plugins)";
 
 /// A Rust-native extension installed through `rpi install`.
 ///
@@ -196,9 +197,7 @@ pub fn run(args: &[String]) -> i32 {
             "error: `{}` is not an rpi extension crate; it has no `cdylib` target",
             options.package
         );
-        eprintln!(
-            "hint: the crate must declare `crate-type = [\"cdylib\"]` and export `rpi_plugin_register`"
-        );
+        eprintln!("{CDYLIB_EXTENSION_HINT}");
         return 1;
     }
 
@@ -1218,6 +1217,13 @@ mod tests {
         assert!(parse_args(&args(&["my.extension"])).is_err());
         assert!(parse_args(&args(&["my-extension", "--unknown"])).is_err());
         assert!(parse_args(&args(&["my-extension", "--path", ".", "--version", "1"])).is_err());
+    }
+
+    #[test]
+    fn cdylib_hint_recommends_v2_and_documents_legacy_compatibility() {
+        assert!(CDYLIB_EXTENSION_HINT.contains("rpi_plugin_register_v2"));
+        assert!(CDYLIB_EXTENSION_HINT.contains("legacy `rpi_plugin_register`"));
+        assert!(CDYLIB_EXTENSION_HINT.contains("ABI v1"));
     }
 
     #[test]
