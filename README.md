@@ -1,12 +1,21 @@
-# rpi — Rust port of the Pi agent SDK
+# rpi (pi-rust) — Rust-native coding-agent runtime
 
 [![rpi-cli on crates.io](https://img.shields.io/crates/v/rpi-cli.svg)](https://crates.io/crates/rpi-cli)
 [![rpi-plugin-sdk docs](https://docs.rs/rpi-plugin-sdk/badge.svg)](https://docs.rs/rpi-plugin-sdk)
 [![CI](https://github.com/bigfish1913/pi-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/bigfish1913/pi-rust/actions)
+[![GitHub stars](https://img.shields.io/github/stars/bigfish1913/pi-rust?style=flat)](https://github.com/bigfish1913/pi-rust/stargazers)
+[![Latest release](https://img.shields.io/github/v/release/bigfish1913/pi-rust)](https://github.com/bigfish1913/pi-rust/releases/latest)
 
-A Rust port of [earendil-works/pi](https://github.com/earendil-works/pi)'s SDK
-layer — a library-first, multi-crate workspace for building personal LLM coding
-agents in Rust, plus an `rpi` CLI built on top.
+`rpi` is a Rust-native, library-first coding-agent runtime and terminal CLI.
+It is a multi-crate Rust implementation of the
+[earendil-works/pi](https://github.com/earendil-works/pi) SDK layer for building
+composable LLM agents with providers, tools, sessions, and plugins.
+
+Repository: `bigfish1913/pi-rust` · Website: <https://rpi.laofu.online/>
+
+The project is useful both as a Rust Agent SDK and as a ready-to-run terminal
+coding agent. Core crates can be embedded independently; the `rpi` CLI provides
+the fastest way to try the complete loop.
 
 > **Naming.** The published crates use the `rpi-` prefix (the upstream `pi-*`
 > names are owned on crates.io by a parallel port). The on-disk directories stay
@@ -315,8 +324,8 @@ The workspace `Taskfile.yml` is the canonical release entry point. Run
 publish-scoped token; crates.io records are permanent.
 
 ```bash
-task dry-run RELEASE_VERSION=0.1.12
-task publish RELEASE_VERSION=0.1.12
+task dry-run RELEASE_VERSION=0.1.13
+task publish RELEASE_VERSION=0.1.13
 ```
 
 Both commands require a clean worktree and one consistent version across all
