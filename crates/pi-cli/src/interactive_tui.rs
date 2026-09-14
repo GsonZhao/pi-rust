@@ -4333,6 +4333,18 @@ pub async fn interactive_tui(
     // return defensive clones, so rendering this summary does not retain a
     // harness lock or trigger a second resource scan.
     let mut active_tool_names = lane.get_active_tools().await.unwrap_or_default();
+    // AgentHarness uses an empty active-name list as the default "all tools"
+    // state. Do not expose that implementation sentinel as `Tools (0) none`
+    // in the welcome banner (it is especially visible on the first prompt).
+    if active_tool_names.is_empty() {
+        active_tool_names = harness
+            .get_tools()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tool| tool.tool.schema().name.clone())
+            .collect();
+    }
     let resources_snapshot = harness.get_resources().await.unwrap_or_default();
     let skill_names: Vec<String> = resources_snapshot
         .skills
@@ -6229,7 +6241,6 @@ async fn handle_agent_event(
                 for c in &a.content {
                     if let Content::ToolCall(tc) = c {
                         if tc.name == "bash" {
-                            saw_bash_tool_call = true;
                             // Bash has a dedicated component. Create it here as
                             // well as on ToolExecutionStart because the tool
                             // call can become visible in a MessageUpdate first.
@@ -6240,6 +6251,16 @@ async fn handle_agent_event(
                                 .get("command")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("");
+                            // Streaming tool-call arguments may still be `{}`
+                            // here. Do not create a running bash panel until
+                            // the lifecycle start event provides the command;
+                            // otherwise the spinner renders first and the
+                            // actual `$ command` header appears one frame
+                            // later.
+                            if command.trim().is_empty() {
+                                continue;
+                            }
+                            saw_bash_tool_call = true;
                             let mut bash = state.bash_components.lock().unwrap();
                             if !bash.contains_key(&tc.id) {
                                 let comp = Arc::new(BashExecutionComponent::new(command));
@@ -6387,25 +6408,24 @@ async fn handle_agent_event(
             args,
             partial_result,
         } => {
+            let partial_text = tool_result_text(&partial_result);
+            let has_partial_payload = tool_update_has_payload(&partial_text, &partial_result);
             if tool_name == "bash" {
                 // Append the streamed chunk to the bash component's preview.
                 // RAW text (no single-line collapsing) — the old
                 // `summarize_tool_result` folded every newline into a `⏎`
                 // glyph, cramming e.g. `ls -la`'s listing onto one line.
-                let chunk = tool_result_text(&partial_result);
+                let chunk = partial_text;
                 if let Some(bash) = state.bash_components.lock().unwrap().get(&tool_call_id) {
-                    bash.append_output(&chunk);
-                } else {
-                    // No component yet — create a running bash one so the
-                    // partial shows (command unknown at Update time; leave blank).
-                    let comp = Arc::new(BashExecutionComponent::new(""));
-                    comp.append_output(&chunk);
-                    chat.add_child(comp.clone());
-                    state
-                        .bash_components
-                        .lock()
-                        .unwrap()
-                        .insert(tool_call_id.clone(), comp);
+                    if has_partial_payload {
+                        bash.append_output(&chunk);
+                    }
+                } else if has_partial_payload {
+                    // ToolExecutionStart is emitted before a tool can run.
+                    // Ignore an out-of-order partial until that event gives us
+                    // the real command, rather than showing a spinner above an
+                    // empty `$ ` header. Normal updates are handled by the
+                    // component created in ToolExecutionStart.
                 }
             } else if let Some(comp) = state.tool_components.lock().unwrap().get(&tool_call_id) {
                 if let Some(skill) = skill_tool_name(&tool_name, &args) {
@@ -6413,17 +6433,22 @@ async fn handle_agent_event(
                 }
                 // Raw multi-line text — read/ls-style tools must show their
                 // full content, not the single-line ⏎-folded summary.
-                comp.set_result(&tool_result_text(&partial_result), false);
-                apply_edit_diff(comp, &tool_name, &partial_result.details, &tui);
-            } else {
+                if has_partial_payload {
+                    comp.set_result(&partial_text, false);
+                    apply_edit_diff(comp, &tool_name, &partial_result.details, &tui);
+                }
+            } else if has_partial_payload {
                 // No component yet — create a running one so the partial shows.
-                let comp = Arc::new(ToolExecutionComponent::new(&tool_name, ""));
+                // Empty callbacks are common before ToolExecutionStart; wait
+                // for Start so the first panel has the real arguments instead
+                // of an empty `TOOLS` box.
+                let comp = Arc::new(ToolExecutionComponent::new(&tool_name, &args.to_string()));
                 comp.set_expanded(*state.tool_outputs_expanded.lock().unwrap());
                 if let Some(skill) = skill_tool_name(&tool_name, &args) {
                     comp.set_skill_name(skill);
                 }
                 comp.set_running();
-                comp.set_result(&tool_result_text(&partial_result), false);
+                comp.set_result(&partial_text, false);
                 apply_edit_diff(&comp, &tool_name, &partial_result.details, &tui);
                 chat.add_child(comp.clone());
                 state
@@ -6609,6 +6634,13 @@ fn tool_result_text(result: &rpi_agent::AgentToolResult) -> String {
         }
     }
     parts.join("\n")
+}
+
+/// Empty progress callbacks are valid (notably before a tool's start event),
+/// but they do not contain anything useful to render. Defer those callbacks so
+/// the first tool panel is created from `ToolExecutionStart` with real args.
+fn tool_update_has_payload(text: &str, result: &rpi_agent::AgentToolResult) -> bool {
+    !text.trim().is_empty() || !result.details.is_null()
 }
 
 // ===========================================================================
@@ -7178,12 +7210,22 @@ fn open_tools_selector(
     // runtime (it's called from the main loop's channel dispatch or the submit
     // closure that lives on the blocking thread — but `handle.block_on` is safe
     // because `get_active_tools` is std-Mutex-backed and finishes quickly).
-    let active = match tokio::runtime::Handle::try_current() {
+    let mut active = match tokio::runtime::Handle::try_current() {
         Ok(h) => h
             .block_on(async { lane.get_active_tools().await })
             .unwrap_or_default(),
         Err(_) => Vec::new(),
     };
+    // An empty active set is the harness sentinel for "all registered tools"
+    // (the selector only exposes built-ins). Expand it before rendering and
+    // toggling so the first `/tools` visit does not show every tool as off or
+    // accidentally reduce the active set to the one item selected.
+    if active.is_empty() {
+        active = crate::session::BUILTIN_TOOL_NAMES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+    }
     let mut items: Vec<SelectItem> = Vec::new();
     for name in crate::session::BUILTIN_TOOL_NAMES {
         let on = active.iter().any(|a| a == name);
@@ -8185,18 +8227,18 @@ mod tests {
                     name: "rpi".into(),
                     current: "0.1.10".into(),
                     latest: "0.1.11".into(),
-                    command: "rpi pi-update".into(),
+                    command: "rpi self-update".into(),
                 },
                 crate::updates::UpdateNotice {
                     name: "rpi-search".into(),
                     current: "0.1.0".into(),
                     latest: "0.1.1".into(),
-                    command: "rpi update".into(),
+                    command: "rpi pi-update".into(),
                 },
             ],
             warnings: vec![crate::updates::UpdateWarning {
                 message: "The previously scheduled rpi self-update failed: access denied".into(),
-                command: "rpi pi-update".into(),
+                command: "rpi self-update".into(),
             }],
         };
 
@@ -8211,7 +8253,7 @@ mod tests {
         );
         assert!(plain.contains("Update Available"), "{plain}");
         assert!(plain.contains("New version 0.1.11 is available"), "{plain}");
-        assert!(plain.contains("rpi update"), "{plain}");
+        assert!(plain.contains("rpi self-update"), "{plain}");
         assert!(plain.contains("Package Updates Available"), "{plain}");
         assert!(plain.contains("rpi pi-update"), "{plain}");
         assert!(plain.contains("- rpi-search 0.1.0 -> 0.1.1"), "{plain}");
@@ -8245,6 +8287,21 @@ mod tests {
     fn welcome_capabilities_show_empty_state() {
         let plain = strip_ansi(&welcome_capability_line("Skills", &[]));
         assert_eq!(plain, "Skills (0) none");
+    }
+
+    #[test]
+    fn empty_tool_progress_is_deferred_until_start() {
+        let empty = rpi_agent::AgentToolResult::default();
+        assert!(!tool_update_has_payload("", &empty));
+
+        let text = rpi_agent::AgentToolResult::text("partial output");
+        assert!(tool_update_has_payload("partial output", &text));
+
+        let details = rpi_agent::AgentToolResult {
+            details: serde_json::json!({"path": "src/lib.rs"}),
+            ..Default::default()
+        };
+        assert!(tool_update_has_payload("", &details));
     }
 
     /// Reproduction for "Tab 补全了但显示没刷新": after `accept_top_suggestion`

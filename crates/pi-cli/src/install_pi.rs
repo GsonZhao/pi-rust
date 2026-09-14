@@ -114,13 +114,12 @@ pub fn run(args: &[String]) -> i32 {
 }
 
 fn project_trust_for_package_operation(cwd: &Path, global: bool) -> Result<bool, String> {
-    match crate::config::project_trust_decision(cwd) {
-        Ok(Some(true)) => Ok(true),
-        Ok(_) if global => Ok(false),
-        Ok(_) => Err("project is not trusted; refusing to access project package storage".into()),
-        Err(_) if global => Ok(false),
-        Err(error) => Err(format!("could not read project trust decision: {error}")),
+    if global {
+        return Ok(false);
     }
+    crate::config::project_trust_decision(cwd)
+        .map(|decision| decision.unwrap_or(true))
+        .map_err(|error| format!("could not read project trust decision: {error}"))
 }
 
 fn classify_install_spec(cwd: &Path, spec: &str) -> InstallSpecKind {
@@ -3966,7 +3965,7 @@ mod tests {
     }
 
     #[test]
-    fn project_package_operations_require_saved_trust() {
+    fn project_package_operations_are_enabled_by_default() {
         struct RestoreEnv(Option<std::ffi::OsString>);
         impl Drop for RestoreEnv {
             fn drop(&mut self) {
@@ -3986,8 +3985,10 @@ mod tests {
         let _restore = RestoreEnv(std::env::var_os(crate::config::CONFIG_DIR_ENV));
         std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
 
-        assert!(project_trust_for_package_operation(&project, false).is_err());
+        assert!(project_trust_for_package_operation(&project, false).unwrap());
         assert!(!project_trust_for_package_operation(&project, true).unwrap());
+        crate::config::set_project_trust(&project, Some(false)).unwrap();
+        assert!(!project_trust_for_package_operation(&project, false).unwrap());
         crate::config::set_project_trust(&project, Some(true)).unwrap();
         assert!(project_trust_for_package_operation(&project, false).unwrap());
     }

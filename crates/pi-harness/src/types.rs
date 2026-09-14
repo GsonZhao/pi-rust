@@ -254,9 +254,12 @@ pub struct RetryPolicy {
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
-            enabled: false,
-            max_retries: 0,
-            base_delay_ms: 1000,
+            // Pi retries transient assistant failures by default. Provider
+            // SDK retries remain disabled separately in the agent stream
+            // options so one failure is not retried twice.
+            enabled: true,
+            max_retries: 3,
+            base_delay_ms: 2000,
             max_agent_delay_ms: 60_000,
         }
     }

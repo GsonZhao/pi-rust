@@ -497,7 +497,7 @@ where
 /// Conservative substring port of `isRetryableAssistantError`. Returns false
 /// for quota/billing errors (non-retryable) and true only for clearly-transient
 /// transport/server text. See module doc for the divergence note.
-fn is_retryable_assistant_error(message: &AssistantMessage) -> bool {
+pub fn is_retryable_assistant_error(message: &AssistantMessage) -> bool {
     if message.stop_reason != StopReason::Error {
         return false;
     }

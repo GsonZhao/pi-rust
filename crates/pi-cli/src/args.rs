@@ -582,8 +582,8 @@ pub fn print_help() {
   --list-models [search]         List available models (with optional fuzzy search)
   --offline                      Disable startup network operations (same as PI_OFFLINE=1)
   --export <file>                Export a JSONL session to HTML and exit
-  --approve, -a                  Trust the current project for local resources
-  --no-approve, -na              Do not trust the current project
+  --approve, -a                  Force-enable current-project resources
+  --no-approve, -na              Disable current-project resources
   --print, -p                    Non-interactive: process prompt(s) and exit
   --continue, -c                 Continue the most recent session
   --resume, -r                   Browse and select a session to resume
@@ -608,8 +608,9 @@ pub fn print_help() {
   --version, -v                  Show version
 
 {u}Subcommands:{r}
-  update                       Update installed Rust and npm packages
-  pi-update                    Update the rpi CLI from crates.io
+  update                       Update installed Rust-native extensions
+  pi-update                    Update configured Pi npm/Git packages
+  self-update                  Update the rpi CLI from crates.io
   auth login|check|logout        Manage persisted credentials in ~/.rpi/auth.json
                                 (see `rpi auth --help`)
   package list|add|remove|update Manage TS packages and Rust extensions

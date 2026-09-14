@@ -701,7 +701,7 @@ fn report_from_cache_scope(
                     name: "rpi".into(),
                     current: crate::VERSION.into(),
                     latest: latest.into(),
-                    command: "rpi pi-update".into(),
+                    command: "rpi self-update".into(),
                 });
             }
         }
@@ -723,7 +723,7 @@ fn report_from_cache_scope(
                         name: package.name.clone(),
                         current: current.into(),
                         latest: latest.into(),
-                        command: "rpi update".into(),
+                        command: "rpi pi-update".into(),
                     });
                 }
             }
@@ -750,7 +750,7 @@ fn report_from_cache_scope(
                     name: format!("{}/{}", git.host, git.path),
                     current: short_git_oid(&current),
                     latest: short_git_oid(&latest),
-                    command: "rpi update".into(),
+                    command: "rpi pi-update".into(),
                 });
             }
         }
@@ -1217,15 +1217,15 @@ pub fn run_self_update(args: &[String]) -> i32 {
         .iter()
         .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
     {
-        println!("Usage: rpi pi-update [--offline]\n\nUpdate the rpi CLI from crates.io.");
+        println!("Usage: rpi self-update [--offline]\n\nUpdate the rpi CLI from crates.io.");
         return 0;
     }
     if !args.is_empty() {
-        eprintln!("error: `rpi pi-update` does not accept arguments");
+        eprintln!("error: `rpi self-update` does not accept arguments");
         return 2;
     }
     if offline {
-        println!("rpi pi-update skipped: offline mode is enabled");
+        println!("rpi self-update skipped: offline mode is enabled");
         return 0;
     }
 
@@ -2098,7 +2098,7 @@ fn run_windows_self_update() -> i32 {
         Ok(_) => {
             let persisted_staging = staging.directory.keep();
             println!(
-                "rpi pi-update staged; it will be applied after this process exits\nStatus: {}",
+                "rpi self-update staged; it will be applied after this process exits\nStatus: {}",
                 plan.status_file.display()
             );
             debug_assert!(git_paths_equal(&persisted_staging, &plan.staging_dir));
@@ -2449,7 +2449,7 @@ fn consume_self_update_statuses(agent_dir: &Path) -> Vec<UpdateWarning> {
                     "The previously scheduled rpi self-update failed: {}",
                     sanitized_self_update_status_message(&status.message)
                 ),
-                command: "rpi pi-update".to_string(),
+                command: "rpi self-update".to_string(),
             });
         }
     }
@@ -2814,7 +2814,7 @@ mod tests {
             .message
             .contains("self-update failed: permission [31m denied"));
         assert!(!warnings[0].message.chars().any(char::is_control));
-        assert_eq!(warnings[0].command, "rpi pi-update");
+        assert_eq!(warnings[0].command, "rpi self-update");
         assert!(!failed.exists());
         assert!(!succeeded.exists());
         assert!(waiting.exists());

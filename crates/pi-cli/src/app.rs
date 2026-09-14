@@ -16,7 +16,7 @@
 //!
 //! # v1 scope cuts vs TS `main.ts` (in `docs/m6-cli-open-questions.md`)
 //!
-//! The TS `main` is enormous: HTTP proxy config, project-trust prompts,
+//! The TS `main` is enormous: HTTP proxy config, project-trust handling,
 //! first-time setup, migrations, and full npm package management remain
 //! outside this port. rpi does support local static package management via
 //! `rpi package` and Rust cdylib extension installation. The regular agent path
@@ -25,7 +25,7 @@
 //! but not attached to the prompt — the harness `prompt_text` accepts images,
 //! but v1 does not yet wire an image processor; binary/non-UTF-8 files error).
 
-use std::io::{IsTerminal, Read, Write};
+use std::io::{IsTerminal, Read};
 use std::path::Path;
 
 use rpi_ai::types::{ImageContent, ImageContentType};
@@ -97,14 +97,12 @@ pub async fn run() -> i32 {
         return crate::packages::run_cli(&argv[1..]);
     }
     if argv.first().map(|s| s.as_str()) == Some("update") {
-        // The top-level update command owns Rust/npm package updates.
-        // `pi-update` is the explicit self-update command for rpi itself.
-        let mut package_args = Vec::with_capacity(argv.len());
-        package_args.push("update".to_string());
-        package_args.extend_from_slice(&argv[1..]);
-        return crate::packages::run_cli(&package_args);
+        return crate::packages::run_native_update(&argv[1..]);
     }
     if argv.first().map(|s| s.as_str()) == Some("pi-update") {
+        return crate::packages::run_pi_update(&argv[1..]);
+    }
+    if argv.first().map(|s| s.as_str()) == Some("self-update") {
         return crate::updates::run_self_update(&argv[1..]);
     }
     if argv.first().map(|s| s.as_str()) == Some("install") {
@@ -214,25 +212,6 @@ pub async fn run() -> i32 {
     } else {
         None
     };
-
-    // Native Pi asks before loading project-local settings/resources. Only
-    // prompt when an interactive terminal is available and there is something
-    // project-owned to authorize; headless/print/json invocations remain
-    // fail-closed without blocking for input.
-    if parsed.trust_override.is_none()
-        && std::io::stdin().is_terminal()
-        && std::io::stdout().is_terminal()
-        && crate::session::project_has_local_resources(&cwd)
-    {
-        match prompt_project_trust(&cwd) {
-            Some(decision) => parsed.trust_override = Some(decision),
-            None => {
-                eprintln!(
-                    "warning: project trust prompt unavailable; local resources remain disabled"
-                );
-            }
-        }
-    }
 
     // `-r/--resume` is an interactive picker, unlike `-c/--continue` which
     // immediately opens the latest session. Resolve the picker result before
@@ -444,22 +423,6 @@ pub async fn run() -> i32 {
         dev.cleanup();
     }
     exit_code
-}
-
-fn prompt_project_trust(cwd: &Path) -> Option<bool> {
-    let display = cwd.display();
-    print!("Trust project {display} and load local resources? [y/N] ");
-    let _ = std::io::stdout().flush();
-    let mut answer = String::new();
-    if std::io::stdin().read_line(&mut answer).is_err() {
-        return None;
-    }
-    let normalized = answer.trim().to_ascii_lowercase();
-    let trusted = matches!(normalized.as_str(), "y" | "yes");
-    if let Err(error) = crate::config::set_project_trust(cwd, Some(trusted)) {
-        eprintln!("warning: could not persist project trust decision: {error}");
-    }
-    Some(trusted)
 }
 
 /// Print the merged model catalog, optionally filtered by a case-insensitive

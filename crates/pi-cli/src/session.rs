@@ -15,8 +15,8 @@
 //!   re-run through `load_skills`/`load_prompt_templates` (individual `.md` files
 //!   load too — `load_skills` accepts both dirs and files). Package themes are
 //!   parsed by the TUI when selected via settings or `--theme`.**
-//!   A project trust gate now fails closed by default; use `--approve` or a
-//!   stored `trust.json` decision to enable project-local resources.
+//!   Project resources load by default without a prompt. `--no-approve` or a
+//!   stored negative `trust.json` decision disables them explicitly.
 //! - **No `ModelRuntime`/multi-provider registry.** The resolver supports the
 //!   built-in Anthropic/OpenAI-compatible providers and `models.json`, but
 //!   runtime catalog mutation remains outside this layer.
@@ -239,12 +239,12 @@ pub async fn build(
     let cwd_str = cwd.to_string_lossy().to_string();
     if !project_trusted && args.verbose {
         eprintln!(
-            "warning: project is not trusted; local settings, resources, and discovered extensions are disabled (use --approve or /trust)"
+            "warning: current-project settings, resources, and discovered extensions are explicitly disabled (use --approve or /trust yes to re-enable)"
         );
     }
     // Pi packages are explicitly opt-in because discovery can start Node and
-    // execute package code. Trust additionally limits discovery to global
-    // settings when the current project has not been approved.
+    // execute package code. An explicit project opt-out limits discovery to
+    // global settings.
     let package_resources = if args.dev_local_only {
         crate::packages::PackageResources::default()
     } else {
@@ -1535,28 +1535,8 @@ fn build_models_with_extensions(
     models
 }
 
-/// Whether the cwd contains project-owned resources that warrant a trust
-/// decision prompt. Session storage alone is intentionally excluded so a
-/// normal launch does not repeatedly ask after creating `.rpi/sessions`.
-pub fn project_has_local_resources(cwd: &Path) -> bool {
-    const FILES: &[&str] = &[
-        "settings.json",
-        "SYSTEM.md",
-        "APPEND_SYSTEM.md",
-        "packages.json",
-    ];
-    const DIRS: &[&str] = &["skills", "prompts", "themes", "extensions", "packages"];
-    [".rpi", ".pi"].iter().any(|layout| {
-        let root = cwd.join(layout);
-        FILES.iter().any(|name| root.join(name).is_file())
-            || DIRS.iter().any(|name| root.join(name).is_dir())
-    })
-}
-
-/// Resolve the project trust gate without prompting. Explicit CLI overrides
-/// win; otherwise a stored `trust.json` decision is honored. An absent or
-/// malformed decision fails closed so untrusted project files cannot execute
-/// during startup.
+/// Resolve project resource loading without prompting. Explicit CLI overrides
+/// win, then a stored decision; projects with no decision load by default.
 pub(crate) fn resolve_project_trust(args: &Args, cwd: &Path) -> bool {
     if let Some(override_value) = args.trust_override {
         return override_value;
@@ -1564,7 +1544,7 @@ pub(crate) fn resolve_project_trust(args: &Args, cwd: &Path) -> bool {
     crate::config::project_trust_decision(cwd)
         .ok()
         .flatten()
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 /// Resolve the extension dirs to scan and load the cdylib plugins, returning
@@ -2635,19 +2615,19 @@ mod tests {
     }
 
     #[test]
-    fn project_trust_override_fails_closed_by_default() {
-        let denied = Args::default();
-        assert!(!resolve_project_trust(
-            &denied,
+    fn project_resources_load_by_default_and_allow_explicit_opt_out() {
+        let defaults = Args::default();
+        assert!(resolve_project_trust(
+            &defaults,
             Path::new("C:/definitely-not-a-project")
         ));
 
-        let approved = Args {
-            trust_override: Some(true),
+        let denied = Args {
+            trust_override: Some(false),
             ..Args::default()
         };
-        assert!(resolve_project_trust(
-            &approved,
+        assert!(!resolve_project_trust(
+            &denied,
             Path::new("C:/definitely-not-a-project")
         ));
     }
@@ -2698,16 +2678,6 @@ mod tests {
 
         assert_eq!(context.cwd, cwd);
         assert!(context.project_trusted);
-    }
-
-    #[test]
-    fn project_resource_probe_ignores_session_directory_but_detects_config() {
-        let root = tempfile::tempdir().unwrap();
-        let cwd = root.path();
-        std::fs::create_dir_all(cwd.join(".rpi/sessions")).unwrap();
-        assert!(!project_has_local_resources(cwd));
-        std::fs::write(cwd.join(".rpi/settings.json"), "{}").unwrap();
-        assert!(project_has_local_resources(cwd));
     }
 
     #[test]
