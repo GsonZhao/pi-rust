@@ -1468,11 +1468,11 @@ impl AgentHarness {
             thinking_level: snap.thinking_level,
             api_key: None,
             timeout: snap.stream_options.timeout,
-            max_retries: if snap.retry.enabled {
-                Some(snap.retry.max_retries)
-            } else {
-                None
-            },
+            // Pi's `retry.maxRetries` is an assistant-level retry budget. The
+            // provider/SDK retry budget is intentionally independent and
+            // defaults to zero, so transient failures are retried by the
+            // harness exactly once per agent attempt.
+            max_retries: None,
             max_retry_delay: Some(std::time::Duration::from_millis(
                 snap.retry.max_agent_delay_ms,
             )),
@@ -1503,7 +1503,43 @@ impl AgentHarness {
         // therefore persist ALL of them (skip 0). The old `skip(prompts_len)`
         // was a leftover from a design that passed `prompts` in; it wrongly
         // dropped the first real assistant message.
-        let result = run_agent_loop(Vec::new(), agent_context, config, emitter, stream_fn).await;
+        let retry_policy = snap.retry.clone();
+        let mut retry_attempt = 0u32;
+        let result = loop {
+            let attempt_result = run_agent_loop(
+                Vec::new(),
+                agent_context.clone(),
+                config.clone(),
+                Arc::clone(&emitter),
+                Arc::clone(&stream_fn),
+            )
+            .await;
+
+            let should_retry = retry_policy.enabled
+                && retry_attempt < retry_policy.max_retries
+                && attempt_result.as_ref().is_ok_and(|messages| {
+                    messages.iter().rev().find_map(|message| match message {
+                        AgentMessage::Assistant(assistant) => Some(
+                            assistant.stop_reason == StopReason::Error
+                                && crate::compaction::is_retryable_assistant_error(assistant),
+                        ),
+                        _ => None,
+                    }) == Some(true)
+                });
+            if !should_retry {
+                break attempt_result;
+            }
+
+            retry_attempt += 1;
+            let delay_ms = retry_policy
+                .base_delay_ms
+                .saturating_mul(1u64 << retry_attempt.saturating_sub(1))
+                .min(retry_policy.max_agent_delay_ms);
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(delay_ms)) => {}
+                _ = signal.cancelled() => break attempt_result,
+            }
+        };
 
         // Persist new messages + derive outcome.
         let (leaf_id, _final_entry_id, outcome, op_outcome, op_error) = match result {

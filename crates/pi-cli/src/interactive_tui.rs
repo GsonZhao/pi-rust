@@ -6241,7 +6241,6 @@ async fn handle_agent_event(
                 for c in &a.content {
                     if let Content::ToolCall(tc) = c {
                         if tc.name == "bash" {
-                            saw_bash_tool_call = true;
                             // Bash has a dedicated component. Create it here as
                             // well as on ToolExecutionStart because the tool
                             // call can become visible in a MessageUpdate first.
@@ -6252,6 +6251,16 @@ async fn handle_agent_event(
                                 .get("command")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("");
+                            // Streaming tool-call arguments may still be `{}`
+                            // here. Do not create a running bash panel until
+                            // the lifecycle start event provides the command;
+                            // otherwise the spinner renders first and the
+                            // actual `$ command` header appears one frame
+                            // later.
+                            if command.trim().is_empty() {
+                                continue;
+                            }
+                            saw_bash_tool_call = true;
                             let mut bash = state.bash_components.lock().unwrap();
                             if !bash.contains_key(&tc.id) {
                                 let comp = Arc::new(BashExecutionComponent::new(command));
@@ -6412,18 +6421,11 @@ async fn handle_agent_event(
                         bash.append_output(&chunk);
                     }
                 } else if has_partial_payload {
-                    // No component yet — create a running bash one so the
-                    // partial shows. Empty progress callbacks are deferred to
-                    // ToolExecutionStart, which supplies the command header;
-                    // this avoids a blank first tool panel.
-                    let comp = Arc::new(BashExecutionComponent::new(""));
-                    comp.append_output(&chunk);
-                    chat.add_child(comp.clone());
-                    state
-                        .bash_components
-                        .lock()
-                        .unwrap()
-                        .insert(tool_call_id.clone(), comp);
+                    // ToolExecutionStart is emitted before a tool can run.
+                    // Ignore an out-of-order partial until that event gives us
+                    // the real command, rather than showing a spinner above an
+                    // empty `$ ` header. Normal updates are handled by the
+                    // component created in ToolExecutionStart.
                 }
             } else if let Some(comp) = state.tool_components.lock().unwrap().get(&tool_call_id) {
                 if let Some(skill) = skill_tool_name(&tool_name, &args) {
