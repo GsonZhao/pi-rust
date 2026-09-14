@@ -179,29 +179,76 @@ fn validate_publish_field(crate_name: &str, package: &str) -> Result<(), String>
 }
 
 fn dry_run() -> Result<(), String> {
-    for (crate_name, _) in RELEASE_CRATES {
-        let fully_verifiable = matches!(*crate_name, "rpi-telemetry" | "rpi-plugin-sdk");
-        let mut args = vec![
-            "publish",
-            "--dry-run",
-            "--locked",
-            "--registry",
-            "crates-io",
-            "-p",
-            crate_name,
-        ];
-        if !fully_verifiable {
-            args.push("--no-verify");
-            println!(
-                "Dry-running {crate_name} without dependency verification because its release dependencies may not be indexed yet."
-            );
-        } else {
-            println!("Dry-running {crate_name} with full package verification.");
-        }
+    let workspace_root = env::current_dir()
+        .map_err(|error| format!("could not determine the workspace root: {error}"))?;
+    for (crate_name, manifest_path) in RELEASE_CRATES {
+        let manifest = read(manifest_path)?;
+        let args = dry_run_args(crate_name, &manifest, &workspace_root)?;
+        let patch_count = args.iter().filter(|arg| *arg == "--config").count();
+        println!(
+            "Dry-running {crate_name} with full package verification and {} local release dependency patch(es).",
+            patch_count
+        );
+        let args = args.iter().map(String::as_str).collect::<Vec<_>>();
         command_status("cargo", &args)
             .map_err(|error| format!("cargo publish --dry-run failed for {crate_name}: {error}"))?;
     }
     Ok(())
+}
+
+fn dry_run_args(
+    crate_name: &str,
+    manifest: &str,
+    workspace_root: &Path,
+) -> Result<Vec<String>, String> {
+    let mut args = vec![
+        "publish".to_string(),
+        "--dry-run".to_string(),
+        "--locked".to_string(),
+        "--registry".to_string(),
+        "crates-io".to_string(),
+        "-p".to_string(),
+        crate_name.to_string(),
+    ];
+    for patch in local_dependency_patches(manifest, workspace_root)? {
+        args.push("--config".to_string());
+        args.push(patch);
+    }
+    Ok(args)
+}
+
+fn local_dependency_patches(manifest: &str, workspace_root: &Path) -> Result<Vec<String>, String> {
+    let mut patches = Vec::new();
+    for (dependency, manifest_path) in RELEASE_CRATES {
+        if !manifest_declares_dependency(manifest, dependency) {
+            continue;
+        }
+        let relative_dir = Path::new(manifest_path)
+            .parent()
+            .ok_or_else(|| format!("release manifest {manifest_path} has no parent directory"))?;
+        let dependency_dir = workspace_root.join(relative_dir);
+        let path = dependency_dir.to_string_lossy();
+        #[cfg(windows)]
+        let path = path.replace('\\', "/");
+        let path = path
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n")
+            .replace('\r', "\\r")
+            .replace('\t', "\\t");
+        patches.push(format!("patch.crates-io.{dependency}.path=\"{path}\""));
+    }
+    Ok(patches)
+}
+
+fn manifest_declares_dependency(manifest: &str, dependency: &str) -> bool {
+    manifest.lines().any(|line| {
+        let line = line.trim();
+        !line.starts_with('#')
+            && line
+                .split_once('=')
+                .is_some_and(|(candidate, _)| candidate.trim() == dependency)
+    })
 }
 
 fn publish(version: &str) -> Result<(), String> {
@@ -522,5 +569,34 @@ mod tests {
         let dependencies = toml_section(toml, "workspace.dependencies").unwrap();
         let line = toml_assignment(dependencies, "rpi-ai").unwrap();
         assert_eq!(inline_table_string(line, "version"), Some("0.1.12"));
+    }
+
+    #[test]
+    fn dry_run_uses_full_verification_with_only_declared_local_dependencies() {
+        let manifest = r#"
+[dependencies]
+rpi-telemetry = { workspace = true }
+rpi-plugin-sdk = { version = "0.1.12" }
+serde = { version = "1" }
+"#;
+        let args = dry_run_args("rpi-ai", manifest, Path::new("workspace")).unwrap();
+        assert!(!args.iter().any(|arg| arg == "--no-verify"));
+        assert_eq!(args.iter().filter(|arg| *arg == "--config").count(), 2);
+        assert_eq!(
+            args,
+            [
+                "publish",
+                "--dry-run",
+                "--locked",
+                "--registry",
+                "crates-io",
+                "-p",
+                "rpi-ai",
+                "--config",
+                "patch.crates-io.rpi-telemetry.path=\"workspace/crates/pi-telemetry\"",
+                "--config",
+                "patch.crates-io.rpi-plugin-sdk.path=\"workspace/crates/rpi-plugin-sdk\"",
+            ]
+        );
     }
 }
