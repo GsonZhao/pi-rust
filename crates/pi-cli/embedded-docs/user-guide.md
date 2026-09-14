@@ -152,12 +152,12 @@ rpi self-update            # 更新 rpi CLI 自身
 
 ## 4. 内置工具
 
-默认工具与 Pi 保持一致，仅包含 `read`、`bash`、`edit`、`write`。此前 rpi 增加的 `docs`、`grep`、`find`、`ls`、`powershell` 工具暂不由 CLI 注册；对应 `rpi-tools` 库实现仍保留，避免破坏已有嵌入式调用者。
+默认工具包含 Pi 的 `read`、`bash`、`edit`、`write`，以及 rpi 自带的只读 `docs` 文档查询工具。`docs` 可以查询使用手册、扩展开发、Pi package、架构和兼容性说明；`grep`、`find`、`ls`、`powershell` 仍保留为库实现，但不由 CLI 默认注册。
 
 需要限制工具范围时，显式列出 Pi 的四个工具：
 
 ```bash
-rpi --tools read,bash,edit,write -p "检查并修改项目文件"
+rpi --tools read,bash,edit,write,docs -p "检查并修改项目文件"
 ```
 
 ## 5. 项目目录和资源优先级

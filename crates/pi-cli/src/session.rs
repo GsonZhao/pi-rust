@@ -20,10 +20,10 @@
 //! - **No `ModelRuntime`/multi-provider registry.** The resolver supports the
 //!   built-in Anthropic/OpenAI-compatible providers and `models.json`, but
 //!   runtime catalog mutation remains outside this layer.
-//! - **Built-in tools**: `read`, `bash`, `edit`, and `write`, matching Pi's
-//!   default `createCodingTools` set. The former rpi-only `docs`, `grep`,
-//!   `find`, `ls`, and `powershell` tools remain library modules but are no
-//!   longer registered by the CLI.
+//! - **Built-in tools**: `read`, `bash`, `edit`, `write`, and the read-only
+//!   `docs` lookup tool. The former rpi-only `grep`, `find`, `ls`, and
+//!   `powershell` tools remain library modules but are not registered by the
+//!   CLI.
 //! - **Session restore (`-c`/`-r`/`--session`)** is *partially* supported: a
 //!   fresh session is always created. The harness's `create` rejects sessions
 //!   that already have records unless `allow_existing_session` is enabled.
@@ -53,6 +53,7 @@ use rpi_tools::{
 };
 
 use crate::args::Args;
+use crate::docs_tool::create_docs_tool;
 use crate::extension_api::ExtensionBackend;
 use crate::provider::ResolvedModel;
 use crate::resource_dirs::{
@@ -67,7 +68,7 @@ use rpi_extensions::{
 };
 
 /// The Pi-compatible coding tools registered by the CLI by default.
-pub const BUILTIN_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write"];
+pub const BUILTIN_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write", "docs"];
 
 /// Package-backed JS/TS loading is opt-in. `--no-extensions` remains a final
 /// kill switch even when package loading was explicitly enabled.
@@ -130,6 +131,7 @@ Available tools:
 - bash  — Execute shell commands
 - edit  — Find/replace edits to existing files
 - write — Create or overwrite files
+- docs  — Look up rpi usage, extension, package, and compatibility documentation
 
 Guidelines:
 - Be concise in your responses
@@ -1697,7 +1699,8 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
     if args.no_tools {
         return Vec::new();
     }
-    // Keep the default set aligned with Pi's createCodingTools.
+    // Keep the coding tools aligned with Pi and expose rpi's read-only docs
+    // lookup as a default assistant capability.
     let mut all: Vec<(&'static str, HarnessTool)> = vec![
         ("read", HarnessTool::new(create_read_tool(ctx, None))),
         (
@@ -1706,6 +1709,7 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
         ),
         ("edit", HarnessTool::new(create_edit_tool(ctx))),
         ("write", HarnessTool::new(create_write_tool(ctx))),
+        ("docs", HarnessTool::new(create_docs_tool())),
     ];
 
     // `--no-builtin-tools` disables the built-in set but would keep
@@ -2115,10 +2119,25 @@ mod tests {
         assert!(p.contains("bash"));
         assert!(p.contains("edit"));
         assert!(p.contains("write"));
+        assert!(p.contains("docs"));
         assert!(!p.contains("- grep"));
         assert!(!p.contains("- find"));
         assert!(!p.contains("- ls"));
         assert!(!p.contains("powershell"));
+    }
+
+    #[test]
+    fn default_tools_include_docs_lookup() {
+        let env = Arc::new(OsExecutionEnv::with_cwd(PathBuf::from(".")));
+        let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env.clone();
+        let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
+        let context = ExecutionToolContext::new(env_dyn, Some(mut_env));
+        let names: Vec<String> = build_tools(&context, &Args::default())
+            .iter()
+            .map(|tool| tool.tool.schema().name.clone())
+            .collect();
+
+        assert_eq!(names, vec!["read", "bash", "edit", "write", "docs"]);
     }
 
     #[test]
