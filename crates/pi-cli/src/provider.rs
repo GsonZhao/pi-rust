@@ -139,20 +139,6 @@ const DEFAULT_MODELS_PER_PROVIDER: &[(&str, &str)] = &[
 /// model capabilities by the harness's provider build_params).
 pub const DEFAULT_THINKING_LEVEL: ThinkingLevel = ThinkingLevel::Medium;
 
-/// Return the complete local model catalog without resolving credentials.
-///
-/// This is intentionally separate from [`resolve`]: `--list-models` is a
-/// discovery command and must work before an API key is configured. The
-/// catalog combines built-ins with the optional `models.json` entries using
-/// the same merge rules as normal model resolution.
-pub fn catalog_snapshot() -> Vec<Model> {
-    let models_cfg = config::load_models_config().unwrap_or_default();
-    let mut catalog = anthropic_models();
-    catalog.extend(openai_responses_models());
-    merge_user_catalog(&mut catalog, &models_cfg);
-    catalog
-}
-
 /// The resolved run configuration: the provider handle, the chosen model, and
 /// the effective thinking level (after `--thinking` / `:level` / model-clamp).
 #[derive(Clone)]
