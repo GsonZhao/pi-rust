@@ -638,17 +638,16 @@ pub fn print_help() {
   --version, -v                  Show version
 
 {u}Subcommands:{r}
-  update                       Update installed Rust-native extensions
-  pi-update                    Update configured Pi npm/Git packages
-  self-update                  Update the rpi CLI from crates.io
+  update                       Update the rpi CLI from crates.io
   auth login|check|logout        Manage persisted credentials in ~/.rpi/auth.json
                                 (see `rpi auth --help`)
-  package list|add|remove|update Manage TS packages and Rust extensions
+  package list|add|remove|update Update Rust-native packages and manage Pi package settings
                                 (see `rpi package --help`)
   install <crate>                Build and install a Rust cdylib extension
                                 (see `rpi install --help`)
   install-pi <spec>              Install an npm/git/local Pi package
                                 (see `rpi install-pi --help`)
+  pi-package update             Update configured Pi npm/Git packages
   uninstall <crate>              Remove an installed Rust cdylib extension
                                 (use `rpi uninstall pi <spec>` for Pi packages)
   uninstall-pi <spec>            Remove an installed npm/git/local Pi package

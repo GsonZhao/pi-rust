@@ -8321,18 +8321,18 @@ mod tests {
                     name: "rpi".into(),
                     current: "0.1.10".into(),
                     latest: "0.1.11".into(),
-                    command: "rpi self-update".into(),
+                    command: "rpi update".into(),
                 },
                 crate::updates::UpdateNotice {
                     name: "rpi-search".into(),
                     current: "0.1.0".into(),
                     latest: "0.1.1".into(),
-                    command: "rpi pi-update".into(),
+                    command: "rpi pi-package update".into(),
                 },
             ],
             warnings: vec![crate::updates::UpdateWarning {
-                message: "The previously scheduled rpi self-update failed: access denied".into(),
-                command: "rpi self-update".into(),
+                message: "The previously scheduled rpi update failed: access denied".into(),
+                command: "rpi update".into(),
             }],
         };
 
@@ -8342,14 +8342,14 @@ mod tests {
         let plain = strip_ansi(&chat.render(80).join("\n"));
         assert!(plain.contains("Update Failed"), "{plain}");
         assert!(
-            plain.contains("self-update failed: access denied"),
+            plain.contains("rpi update failed: access denied"),
             "{plain}"
         );
         assert!(plain.contains("Update Available"), "{plain}");
         assert!(plain.contains("New version 0.1.11 is available"), "{plain}");
-        assert!(plain.contains("rpi self-update"), "{plain}");
+        assert!(plain.contains("rpi update"), "{plain}");
         assert!(plain.contains("Package Updates Available"), "{plain}");
-        assert!(plain.contains("rpi pi-update"), "{plain}");
+        assert!(plain.contains("rpi pi-package update"), "{plain}");
         assert!(plain.contains("- rpi-search 0.1.0 -> 0.1.1"), "{plain}");
     }
 

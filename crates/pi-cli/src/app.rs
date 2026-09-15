@@ -97,13 +97,26 @@ pub async fn run() -> i32 {
         return crate::packages::run_cli(&argv[1..]);
     }
     if argv.first().map(|s| s.as_str()) == Some("update") {
-        return crate::packages::run_native_update(&argv[1..]);
-    }
-    if argv.first().map(|s| s.as_str()) == Some("pi-update") {
-        return crate::packages::run_pi_update(&argv[1..]);
-    }
-    if argv.first().map(|s| s.as_str()) == Some("self-update") {
         return crate::updates::run_self_update(&argv[1..]);
+    }
+    if argv.first().map(String::as_str) == Some("pi-package") {
+        let subcommand = argv.get(1).map(String::as_str);
+        if matches!(subcommand, Some("--help" | "-h")) {
+            return crate::packages::run_pi_package_update(&argv[1..]);
+        }
+        if subcommand != Some("update") {
+            eprintln!("error: usage is `rpi pi-package update`");
+            return EXIT_USAGE;
+        }
+        return crate::packages::run_pi_package_update(&argv[1..]);
+    }
+    if argv.first().map(String::as_str) == Some("pi-update") {
+        eprintln!("error: unknown command `pi-update`; use `rpi pi-package update`");
+        return EXIT_USAGE;
+    }
+    if argv.first().map(String::as_str) == Some("self-update") {
+        eprintln!("error: unknown command `self-update`; use `rpi update`");
+        return EXIT_USAGE;
     }
     if argv.first().map(|s| s.as_str()) == Some("install") {
         return crate::install::run(&argv[1..]);
