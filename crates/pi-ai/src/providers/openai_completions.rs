@@ -144,7 +144,7 @@ async fn run_stream(
     let url = chat_completions_url(&model.base_url);
     // A silent/stalled gateway must not leave the harness in Working forever.
     // Callers can override this through SimpleStreamOptions when needed.
-    let timeout = opts.timeout.or(Some(std::time::Duration::from_secs(120)));
+    let timeout = opts.request_timeout();
     let signal = opts.signal.clone();
     let response = retry_provider_request(
         move || {
@@ -154,10 +154,7 @@ async fn run_stream(
             let headers = headers.clone();
             let signal = signal.clone();
             async move {
-                let mut request = http.post(&url);
-                if let Some(timeout) = timeout {
-                    request = request.timeout(timeout);
-                }
+                let mut request = http.post(&url).timeout(timeout);
                 for (name, value) in headers {
                     request = request.header(name, value);
                 }

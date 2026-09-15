@@ -24,7 +24,7 @@ pub use event_stream::{AssistantMessageEventStream, AssistantMessageEventStreamP
 pub use model::{Model, StreamingProtocolCompat};
 pub use provider::{
     CacheRetention, NoopProviderHooks, Provider, ProviderHooks, SimpleStreamOptions,
-    SimpleStreamOptionsPatch,
+    SimpleStreamOptionsPatch, DEFAULT_LLM_API_TIMEOUT,
 };
 pub use schema::validate_tool_arguments;
 pub use types::{

@@ -253,7 +253,7 @@ async fn run_anthropic_stream(
     );
 
     let url = format!("{}/v1/messages", model.base_url.trim_end_matches('/'));
-    let timeout = opts.timeout;
+    let timeout = opts.request_timeout();
     let signal = opts.signal.clone();
 
     // ---- POST with retry (retryProviderRequest) ----
@@ -271,10 +271,7 @@ async fn run_anthropic_stream(
             let headers = headers.clone();
             let signal = signal.clone();
             async move {
-                let mut req = http.post(&url);
-                if let Some(t) = timeout {
-                    req = req.timeout(t);
-                }
+                let mut req = http.post(&url).timeout(timeout);
                 for (k, v) in &headers {
                     req = req.header(k.as_str(), v.as_str());
                 }

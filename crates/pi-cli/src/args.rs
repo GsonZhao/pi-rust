@@ -24,6 +24,7 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use rpi_ai::ThinkingLevel;
 
@@ -99,6 +100,8 @@ pub struct Args {
     /// `--base-url` — overrides `ANTHROPIC_BASE_URL` + each model's base URL,
     /// for third-party Anthropic-compatible gateways/proxies.
     pub base_url: Option<String>,
+    /// `--timeout <seconds>` overrides the deadline for each LLM API request.
+    pub timeout: Option<Duration>,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Vec<String>,
     /// `--theme` — built-in theme name or a static package theme name/path.
@@ -376,6 +379,18 @@ pub fn parse_args(args: &[String]) -> Args {
             "--model" => result.model = take_value(&mut result, "--model"),
             "--api-key" => result.api_key = take_value(&mut result, "--api-key"),
             "--base-url" => result.base_url = take_value(&mut result, "--base-url"),
+            "--timeout" => {
+                if let Some(v) = take_value(&mut result, "--timeout") {
+                    match v.parse::<u64>() {
+                        Ok(seconds) if seconds > 0 => {
+                            result.timeout = Some(Duration::from_secs(seconds));
+                        }
+                        _ => result.errors.push(format!(
+                            "Invalid --timeout \"{v}\". Expected a positive integer number of seconds"
+                        )),
+                    }
+                }
+            }
             "--system-prompt" => result.system_prompt = take_value(&mut result, "--system-prompt"),
             "--append-system-prompt" => {
                 if let Some(v) = take_value(&mut result, "--append-system-prompt") {
@@ -574,6 +589,7 @@ pub fn print_help() {
   --model <pattern>              Model pattern or ID (supports \"provider/id\" and optional \":<thinking>\")
   --api-key <key>                API key override for the selected provider
   --base-url <url>               Override the selected model endpoint
+  --timeout <seconds>            LLM API request timeout (default: 600)
   --system-prompt <text>         Replace the default system prompt
   --append-system-prompt <text>  Append text to the system prompt (repeatable)
   --thinking <level>             off, minimal, low, medium, high, xhigh, max
@@ -826,6 +842,26 @@ mod tests {
         let args = parse_args(&s(&["--offline"]));
         assert!(args.offline);
         assert!(args.ignored.is_empty());
+    }
+
+    #[test]
+    fn timeout_parses_seconds_in_separate_and_equals_forms() {
+        let separate = parse_args(&s(&["--timeout", "45"]));
+        assert!(separate.errors.is_empty());
+        assert_eq!(separate.timeout, Some(Duration::from_secs(45)));
+
+        let inline = parse_args(&s(&["--timeout=90"]));
+        assert!(inline.errors.is_empty());
+        assert_eq!(inline.timeout, Some(Duration::from_secs(90)));
+    }
+
+    #[test]
+    fn timeout_rejects_zero_and_invalid_values() {
+        for value in ["0", "1.5", "forever", "18446744073709551616"] {
+            let args = parse_args(&s(&[&format!("--timeout={value}")]));
+            assert_eq!(args.errors.len(), 1, "value: {value}");
+            assert!(args.timeout.is_none(), "value: {value}");
+        }
     }
 
     #[test]

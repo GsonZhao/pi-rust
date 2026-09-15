@@ -44,8 +44,8 @@ use rpi_harness::session::types::{BranchBounds, EntryQuery, SessionMetadata};
 use rpi_harness::session::Session;
 use rpi_harness::system_prompt::compose_system_prompt;
 use rpi_harness::types::{
-    AgentHarnessOptions, AgentHarnessResources, CompactionSettings, DrivingMode, HarnessTool,
-    HarnessToolExecution, RetryPolicy, ToolReplay,
+    AgentHarnessOptions, AgentHarnessResources, AgentHarnessStreamOptions, CompactionSettings,
+    DrivingMode, HarnessTool, HarnessToolExecution, RetryPolicy, ToolReplay,
 };
 use rpi_tools::{
     create_bash_tool, create_edit_tool, create_read_tool, create_write_tool, ExecutionToolContext,
@@ -728,7 +728,10 @@ pub async fn build(
                 | SessionSelection::ByExactId { .. }
                 | SessionSelection::Fork { .. }
         ),
-        stream_options: Default::default(),
+        stream_options: AgentHarnessStreamOptions {
+            timeout: args.timeout,
+            ..Default::default()
+        },
         retry: RetryPolicy::default(),
         compaction: CompactionSettings::default(),
         steering_mode: Default::default(),
