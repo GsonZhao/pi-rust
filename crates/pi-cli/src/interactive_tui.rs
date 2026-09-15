@@ -7873,22 +7873,30 @@ mod tests {
 
     #[test]
     fn trust_command_uses_the_session_cwd_after_process_chdir() {
-        struct RestoreProcessState {
-            config_dir: Option<std::ffi::OsString>,
-            cwd: std::path::PathBuf,
+        const CHILD_ENV: &str = "RPI_TEST_TRUST_COMMAND_CHILD";
+        const SESSION_CWD_ENV: &str = "RPI_TEST_TRUST_COMMAND_SESSION_CWD";
+        const TEST_NAME: &str =
+            "interactive_tui::tests::trust_command_uses_the_session_cwd_after_process_chdir";
+
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let session_cwd = std::path::PathBuf::from(
+                std::env::var_os(SESSION_CWD_ENV).expect("child session cwd should be configured"),
+            );
+            let changed_cwd = std::env::current_dir().unwrap();
+
+            set_project_trust_for_command(&session_cwd, Some(true)).unwrap();
+
+            assert_eq!(
+                crate::config::project_trust_decision(&session_cwd).unwrap(),
+                Some(true)
+            );
+            assert_eq!(
+                crate::config::project_trust_decision(&changed_cwd).unwrap(),
+                None
+            );
+            return;
         }
 
-        impl Drop for RestoreProcessState {
-            fn drop(&mut self) {
-                let _ = std::env::set_current_dir(&self.cwd);
-                match self.config_dir.take() {
-                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
-                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
-                }
-            }
-        }
-
-        let _guard = crate::config::test_support::env_lock().lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let session_cwd = tmp.path().join("session-project");
         let changed_cwd = tmp.path().join("extension-cwd");
@@ -7896,23 +7904,19 @@ mod tests {
         std::fs::create_dir_all(&session_cwd).unwrap();
         std::fs::create_dir_all(&changed_cwd).unwrap();
         std::fs::create_dir_all(&agent_dir).unwrap();
-        let _restore = RestoreProcessState {
-            config_dir: std::env::var_os(crate::config::CONFIG_DIR_ENV),
-            cwd: std::env::current_dir().unwrap(),
-        };
-        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent_dir);
-        std::env::set_current_dir(&changed_cwd).unwrap();
 
-        set_project_trust_for_command(&session_cwd, Some(true)).unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(TEST_NAME)
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .env(SESSION_CWD_ENV, &session_cwd)
+            .env(crate::config::CONFIG_DIR_ENV, &agent_dir)
+            .current_dir(&changed_cwd)
+            .status()
+            .unwrap();
 
-        assert_eq!(
-            crate::config::project_trust_decision(&session_cwd).unwrap(),
-            Some(true)
-        );
-        assert_eq!(
-            crate::config::project_trust_decision(&changed_cwd).unwrap(),
-            None
-        );
+        assert!(status.success(), "child test process failed: {status}");
     }
 
     #[test]
