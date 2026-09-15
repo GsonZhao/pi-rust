@@ -6,6 +6,7 @@ use std::any::Any;
 use std::sync::{Arc, Mutex};
 
 use crossterm::event::{KeyCode, KeyModifiers};
+use unicode_width::UnicodeWidthStr;
 
 use super::component::{Component, Focusable};
 use super::keybindings::Keybindings;
@@ -109,6 +110,62 @@ fn snap_boundary(s: &str, idx: usize) -> usize {
         .unwrap_or(0)
 }
 
+/// Split a logical editor line into terminal-width chunks. The editor keeps
+/// logical lines for editing and cursor movement; wrapping is strictly a
+/// rendering concern so a long draft cannot escape the bordered input box.
+fn wrap_line_ranges(line: &str, max_width: usize) -> Vec<(usize, usize)> {
+    if line.is_empty() {
+        return vec![(0, 0)];
+    }
+    let max_width = max_width.max(1);
+    let mut ranges = Vec::new();
+    let mut start = 0;
+    let mut width = 0;
+    for (idx, ch) in line.char_indices() {
+        let char_width = UnicodeWidthStr::width(ch.to_string().as_str());
+        if idx > start && width + char_width > max_width {
+            ranges.push((start, idx));
+            start = idx;
+            width = 0;
+        }
+        width += char_width;
+    }
+    ranges.push((start, line.len()));
+    ranges
+}
+
+/// Insert the zero-width cursor marker at a visible column without slicing
+/// through ANSI escape sequences added for selection/placeholder styling.
+fn insert_cursor_marker(text: &str, column: usize) -> String {
+    let mut out = String::with_capacity(text.len() + CURSOR_MARKER.len());
+    let mut visible = 0;
+    let mut chars = text.char_indices().peekable();
+    let mut inserted = false;
+    while let Some((idx, ch)) = chars.next() {
+        if ch == '\x1b' {
+            out.push(ch);
+            while let Some((_, esc)) = chars.next() {
+                out.push(esc);
+                if esc == '\x07' || ('@'..='~').contains(&esc) {
+                    break;
+                }
+            }
+            continue;
+        }
+        if !inserted && visible >= column {
+            out.push_str(CURSOR_MARKER);
+            inserted = true;
+        }
+        out.push(ch);
+        visible += UnicodeWidthStr::width(ch.to_string().as_str());
+        let _ = idx;
+    }
+    if !inserted {
+        out.push_str(CURSOR_MARKER);
+    }
+    out
+}
+
 /// Editor - A multi-line text editor component.
 pub struct Editor {
     state: Mutex<EditorState>,
@@ -148,7 +205,7 @@ impl Editor {
     pub fn new(options: EditorOptions, style: EditorStyle, keybindings: Arc<Keybindings>) -> Self {
         let mut state = EditorState::default();
         if let Some(text) = &options.initial_text {
-            state.lines = text.lines().map(|s| s.to_string()).collect();
+            state.lines = text.split('\n').map(|s| s.to_string()).collect();
             if state.lines.is_empty() {
                 state.lines.push(String::new());
             }
@@ -184,7 +241,7 @@ impl Editor {
             state.lines = if text.is_empty() {
                 vec![String::new()]
             } else {
-                text.lines().map(|s| s.to_string()).collect()
+                text.split('\n').map(|s| s.to_string()).collect()
             };
             if state.lines.is_empty() {
                 state.lines.push(String::new());
@@ -993,50 +1050,59 @@ impl Component for Editor {
         // bordered box with padding-only lines and no `> ` prefix — see
         // `editor.ts:539-578`). The `EditorStyle.prompt` field is retained for
         // API compatibility but unread here.
+        let content_width = width.saturating_sub(self.options.padding_x).max(1);
+        // Leave one cell for the cursor marker on the active logical line so
+        // the terminal never performs an implicit wrap at the right border.
+        let active_width = content_width.saturating_sub(1).max(1);
         for (row_idx, line) in state.lines.iter().enumerate() {
-            // Placeholder (dim) only on the single empty line at the cursor —
-            // honors callers that set `placeholder`; production drops it.
-            let content =
-                if line.is_empty() && row_idx == state.cursor_row && state.lines.len() == 1 {
-                    if let Some(placeholder) = &self.options.placeholder {
-                        format!("\x1b[2m{}\x1b[22m", placeholder)
-                    } else {
-                        String::new()
-                    }
+            let ranges = wrap_line_ranges(
+                line,
+                if row_idx == state.cursor_row {
+                    active_width
                 } else {
-                    line.clone()
-                };
-
-            // Selection highlight: inverse-video the span on this row (byte
-            // offsets are char boundaries — both anchor and caret always sit
-            // on one).
-            let mut content = content;
-            if let Some((sc, ec)) = self.selection_span_on_row(&state, row_idx) {
-                if ec <= content.len()
-                    && sc <= ec
-                    && content.is_char_boundary(sc)
-                    && content.is_char_boundary(ec)
-                {
-                    let before = &content[..sc];
-                    let sel = &content[sc..ec];
-                    let after = &content[ec..];
-                    content = format!("{before}\x1b[7m{sel}\x1b[27m{after}");
-                }
-            }
-
-            let visible_w = crate::ansi::visible_width(&content);
-            // Pad the line out to the full width (left padding + content +
-            // right padding) so the border box has a uniform interior width
-            // (mirrors editor.ts:522-578).
-            let right_pad = " ".repeat(
-                width
-                    .saturating_sub(self.options.padding_x)
-                    .saturating_sub(visible_w),
+                    content_width
+                },
             );
-            let right_pad_cursor =
-                if state.focused && row_idx == state.cursor_row && content.is_empty() {
-                    // Reserve room for the empty-cursor (`\x1b[7m \x1b[0m`) so
-                    // the trailing cursor doesn't wrap past the right border.
+            for (chunk_start, chunk_end) in ranges {
+                let chunk = &line[chunk_start..chunk_end];
+                // Placeholder (dim) only on the single empty line at the cursor —
+                // honors callers that set `placeholder`; production drops it.
+                let content =
+                    if chunk.is_empty() && row_idx == state.cursor_row && state.lines.len() == 1 {
+                        if let Some(placeholder) = &self.options.placeholder {
+                            format!("\x1b[2m{}\x1b[22m", placeholder)
+                        } else {
+                            String::new()
+                        }
+                    } else {
+                        chunk.to_string()
+                    };
+
+                // Selection highlight: inverse-video the span on this row (byte
+                // offsets are char boundaries — both anchor and caret always sit
+                // on one).
+                let mut content = content;
+                if let Some((sc, ec)) = self.selection_span_on_row(&state, row_idx) {
+                    let local_start = sc.max(chunk_start).min(chunk_end);
+                    let local_end = ec.max(chunk_start).min(chunk_end);
+                    if local_start < local_end {
+                        let before = &line[chunk_start..local_start];
+                        let sel = &line[local_start..local_end];
+                        let after = &line[local_end..chunk_end];
+                        content = format!("{before}\x1b[7m{sel}\x1b[27m{after}");
+                    }
+                }
+
+                let visible_w = crate::ansi::visible_width(&content);
+                // Pad the line out to the full width (left padding + content +
+                // right padding) so the border box has a uniform interior width
+                // (mirrors editor.ts:522-578).
+                let right_pad = " ".repeat(
+                    width
+                        .saturating_sub(self.options.padding_x)
+                        .saturating_sub(visible_w),
+                );
+                let right_pad_cursor = if state.focused && row_idx == state.cursor_row {
                     right_pad
                         .get(..right_pad.len().saturating_sub(1))
                         .unwrap_or("")
@@ -1045,22 +1111,30 @@ impl Component for Editor {
                     right_pad
                 };
 
-            let mut rendered = format!("{pad}{content}{right_pad_cursor}");
+                let mut rendered = format!("{pad}{content}{right_pad_cursor}");
 
-            // Cursor marker if this focused row holds the cursor. `cursor_col`
-            // is a byte offset into `line`; the rendered prefix up to the caret
-            // is `pad` (ASCII, `padding_x` bytes) + `line[..cursor_col]`.
-            // Because `content` may carry ANSI escapes (placeholder branch),
-            // and the prefix length is computed in *bytes* of the source line,
-            // snap the insertion point to the nearest preceding char boundary
-            // in `rendered` before byte-slicing — never slice mid-character.
-            if state.focused && row_idx == state.cursor_row {
-                let prefix_bytes = self.options.padding_x + state.cursor_col;
-                let pos = snap_boundary(&rendered, prefix_bytes);
-                rendered = format!("{}{}{}", &rendered[..pos], CURSOR_MARKER, &rendered[pos..]);
+                // Cursor marker if this focused row holds the cursor. `cursor_col`
+                // is a byte offset into `line`; the rendered prefix up to the caret
+                // is `pad` (ASCII, `padding_x` bytes) + `line[..cursor_col]`.
+                // Because `content` may carry ANSI escapes (placeholder branch),
+                // and the prefix length is computed in *bytes* of the source line,
+                // snap the insertion point to the nearest preceding char boundary
+                // in `rendered` before byte-slicing — never slice mid-character.
+                if state.focused
+                    && row_idx == state.cursor_row
+                    && state.cursor_col >= chunk_start
+                    && state.cursor_col <= chunk_end
+                {
+                    let cursor_col = UnicodeWidthStr::width(
+                        line[chunk_start..state.cursor_col.min(chunk_end)]
+                            .to_string()
+                            .as_str(),
+                    );
+                    rendered = insert_cursor_marker(&rendered, self.options.padding_x + cursor_col);
+                }
+
+                content_lines.push(rendered);
             }
-
-            content_lines.push(rendered);
         }
 
         // Guard against an empty `lines` vector (the invariant is `[""]`, but
@@ -1495,20 +1569,50 @@ l12",
     }
 
     #[test]
+    fn test_editor_wraps_long_draft_inside_width() {
+        let editor = Editor::new(
+            EditorOptions {
+                padding_x: 1,
+                ..Default::default()
+            },
+            EditorStyle::default(),
+            Arc::new(Keybindings::new()),
+        );
+        editor.set_focused(true);
+        editor.set_text("12345678901234567890");
+        let lines = editor.render(10);
+        assert_eq!(lines.len(), 5, "two wrapped content rows plus borders");
+        for line in &lines {
+            assert!(
+                crate::ansi::visible_width(line) <= 10,
+                "line escaped editor width: {line:?}"
+            );
+        }
+        let rendered = crate::ansi::strip_ansi(&lines.join("\n"));
+        assert!(rendered.contains("1234567"));
+        assert!(rendered.contains("90123456"));
+    }
+
+    #[test]
+    fn test_editor_preserves_trailing_newline() {
+        let editor = Editor::simple();
+        editor.set_text("first\n");
+        assert_eq!(editor.get_text(), "first\n");
+        assert_eq!(editor.cursor_position(), (0, 0));
+    }
+
+    #[test]
     fn test_autocomplete_cursor_origin() {
         // Origin of the autocomplete panic (autocomplete.rs:279, before the
         // fix): the editor handed back a byte `cursor_col` for multibyte
         // text, and the slash-command provider sliced `&input[..cursor]`
-        // mid-character. `refresh_autocomplete` in the CLI now passes the
-        // byte col directly (providers snap to a boundary), so a multibyte
-        // editor line must round-trip through `get_suggestions` without
-        // panicking.
+        // mid-character. A multibyte editor line must still round-trip
+        // through `get_suggestions` without panicking.
         use crate::autocomplete::AutocompleteManager;
 
         let editor = Editor::simple();
         editor.set_text("读");
         editor.set_cursor(0, 3); // byte end of line
-                                 // Emulate refresh_autocomplete: col (byte) min text len.
         let text = editor.get_text();
         let (_r, col) = editor.cursor_position();
         let cursor = col.min(text.len());

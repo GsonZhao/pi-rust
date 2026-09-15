@@ -1359,6 +1359,7 @@ fn close_extension_editor(
 ) {
     editor_container.clear();
     editor_container.add_child(editor.clone());
+    state.autocomplete_container.clear();
     *state.active_extension_editor.lock().unwrap() = None;
     *state.active_extension_input.lock().unwrap() = None;
     *state.active_extension_cancel.lock().unwrap() = None;
@@ -5964,7 +5965,11 @@ async fn run_prompt_streaming(
                 // Only add an error line if the stream did NOT already render
                 // an assistant message for it (drain task leaves
                 // current_assistant Some only on an abrupt end).
-                let already_rendered = final_message.is_some();
+                // A final assistant error is emitted by the event drain only
+                // in streaming mode. In regular mode there is no drain task,
+                // so suppressing this branch merely hides 405/auth/network
+                // diagnostics from the user.
+                let already_rendered = streaming && final_message.is_some();
                 if !already_rendered {
                     let msg = final_message
                         .as_ref()
@@ -6777,6 +6782,9 @@ fn open_selector_with_view<C: Component + 'static>(
 ) {
     // Unfocus the editor so its cursor marker doesn't render behind the list.
     editor.set_focused(false);
+    // A selector replaces the editor slot. Drop stale slash/@file
+    // suggestions so they cannot reappear after the selector closes.
+    state.autocomplete_container.clear();
     // Swap: clear the container and add the selector view.
     editor_container.clear();
     editor_container.add_child(view.clone());
@@ -6796,6 +6804,7 @@ fn close_selector(
 ) {
     editor_container.clear();
     editor_container.add_child(editor.clone());
+    state.autocomplete_container.clear();
     editor.set_focused(true);
     *state.active_selector.lock().unwrap() = None;
     *state.active_extension_cancel.lock().unwrap() = None;
@@ -7453,17 +7462,43 @@ fn open_images_selector(
 /// editor) or clears it when there are none.
 fn refresh_autocomplete(state: &Arc<TuiState>, editor: &Arc<Editor>) {
     let text = editor.get_text();
-    let (_row, col) = editor.cursor_position();
-    // The editor's `cursor_col` is a byte offset into the current line; for
-    // single-line input (the common case) that equals the byte offset into
-    // `get_text()`, which is exactly what the autocomplete providers expect to
-    // slice on. Clamp to the text length so a stale/multi-line col can't
-    // overshoot. Providers snap to a char boundary internally as a safety net
-    // (`autocomplete::snap_cursor`), so a byte col landing mid-character never
-    // panics.
-    let cursor = col.min(text.len());
+    let cursor = editor_cursor_offset(editor, &text);
     let suggestions = state.autocomplete.get_suggestions(&text, cursor);
     render_autocomplete(state, suggestions);
+}
+
+/// Convert the editor's logical `(row, byte-column)` caret into the absolute
+/// byte offset expected by autocomplete providers.
+fn editor_cursor_offset(editor: &Editor, text: &str) -> usize {
+    let (row, col) = editor.cursor_position();
+    let mut offset = 0;
+    for (index, line) in text.split('\n').enumerate() {
+        if index == row {
+            return (offset + col.min(line.len())).min(text.len());
+        }
+        offset = offset.saturating_add(line.len() + 1);
+    }
+    text.len()
+}
+
+/// Restore an editor caret from an absolute byte offset after autocomplete
+/// replaces a span in a multi-line draft.
+fn set_editor_cursor_offset(editor: &Editor, text: &str, offset: usize) {
+    let offset = offset.min(text.len());
+    let mut consumed = 0;
+    for (row, line) in text.split('\n').enumerate() {
+        let end = consumed + line.len();
+        if offset <= end {
+            editor.set_cursor(row, offset - consumed);
+            return;
+        }
+        consumed = end + 1;
+    }
+    let last_row = text.bytes().filter(|byte| *byte == b'\n').count();
+    editor.set_cursor(
+        last_row,
+        text.rsplit('\n').next().map(str::len).unwrap_or(0),
+    );
 }
 
 /// Render (or clear) the autocomplete suggestion list into the container.
@@ -7511,8 +7546,7 @@ fn render_autocomplete(state: &Arc<TuiState>, suggestions: Option<AutocompleteSu
 /// Returns `true` if a suggestion was accepted.
 fn accept_top_suggestion(state: &Arc<TuiState>, editor: &Arc<Editor>) -> bool {
     let text = editor.get_text();
-    let (_row, col) = editor.cursor_position();
-    let cursor = col.min(text.len());
+    let cursor = editor_cursor_offset(editor, &text);
     let Some(sugg) = state.autocomplete.get_suggestions(&text, cursor) else {
         return false;
     };
@@ -7545,7 +7579,7 @@ fn accept_top_suggestion(state: &Arc<TuiState>, editor: &Arc<Editor>) -> bool {
             },
     );
     editor.set_text(&replaced);
-    editor.set_cursor(0, new_cursor);
+    set_editor_cursor_offset(editor, &replaced, new_cursor);
     state.autocomplete_container.clear();
     true
 }
@@ -7858,12 +7892,63 @@ fn add_user_message(container: &Arc<Container>, text: &str) {
 /// Add an error message to the chat container.
 fn add_error_message(container: &Arc<Container>, text: &str) {
     let c = current_theme().colors;
+    let text = sanitize_error_message(text);
     container.add_child(Arc::new(Text::new(
-        format!("  {} {}", c.error.fg("✗"), c.error.fg(text)),
+        format!("  {} {}", c.error.fg("✗"), c.error.fg(&text)),
         1,
         0,
     )));
     container.add_child(Arc::new(Spacer::new(1)));
+}
+
+/// Keep provider diagnostics printable in the transcript. HTTP error bodies
+/// may contain carriage returns, terminal escapes, or an unexpectedly large
+/// JSON payload; letting those bytes reach the renderer can corrupt the input
+/// row or make the whole frame exceed terminal limits.
+fn sanitize_error_message(text: &str) -> String {
+    const MAX_ERROR_CHARS: usize = 16 * 1024;
+    let mut result = String::with_capacity(text.len().min(MAX_ERROR_CHARS));
+    let mut count = 0;
+    // 0 = normal, 1 = escape introducer, 2 = CSI, 3 = OSC.
+    let mut escape_mode = 0u8;
+    for ch in text.chars() {
+        if escape_mode != 0 {
+            match escape_mode {
+                1 if ch == '[' => escape_mode = 2,
+                1 if ch == ']' => escape_mode = 3,
+                1 if ch == '\x07' || ('@'..='~').contains(&ch) => escape_mode = 0,
+                2 if ('@'..='~').contains(&ch) => escape_mode = 0,
+                3 if ch == '\x07' => escape_mode = 0,
+                _ => {}
+            }
+            continue;
+        }
+        if ch == '\x1b' {
+            escape_mode = 1;
+            continue;
+        }
+        if count >= MAX_ERROR_CHARS {
+            result.push_str("…");
+            break;
+        }
+        match ch {
+            '\n' | '\t' => {
+                result.push(ch);
+                count += 1;
+            }
+            '\r' => {}
+            c if c.is_control() => {}
+            c => {
+                result.push(c);
+                count += 1;
+            }
+        }
+    }
+    if result.trim().is_empty() {
+        "Provider request failed.".to_string()
+    } else {
+        result
+    }
 }
 
 /// Add a neutral note (e.g. unsupported-command message) to the chat container.
@@ -8487,8 +8572,7 @@ mod tests {
 
         // Tab: accept the top suggestion (the same code path as the key loop).
         let text = editor.get_text();
-        let (_row, col) = editor.cursor_position();
-        let cursor = col.min(text.len());
+        let cursor = editor_cursor_offset(&editor, &text);
         let sugg = manager
             .get_suggestions(&text, cursor)
             .expect("slash suggestions for /mo");
@@ -8502,8 +8586,9 @@ mod tests {
         if top.insert_space && !replaced.ends_with('/') {
             replaced.push(' ');
         }
+        let new_cursor = start + top.text.len();
         editor.set_text(&replaced);
-        editor.set_cursor(0, replaced.len().min(start + top.text.len()));
+        set_editor_cursor_offset(&editor, &replaced, new_cursor);
         autocomplete_container.clear();
         assert_eq!(editor.get_text(), "/model");
 
@@ -8526,6 +8611,21 @@ mod tests {
             editor_line.contains(&format!("/model{}", rpi_tui::CURSOR_MARKER)),
             "caret must follow the full completed text. Got: {editor_line:?}"
         );
+    }
+
+    #[test]
+    fn multiline_autocomplete_preserves_row_and_column() {
+        let editor = Arc::new(Editor::simple());
+        editor.set_text("first\n/mo");
+        editor.set_cursor(1, 3);
+
+        let text = editor.get_text();
+        assert_eq!(editor_cursor_offset(&editor, &text), 9);
+
+        let replaced = "first\n/model";
+        editor.set_text(replaced);
+        set_editor_cursor_offset(&editor, replaced, 12);
+        assert_eq!(editor.cursor_position(), (1, 6));
     }
 
     #[test]
@@ -8950,6 +9050,20 @@ mod tests {
             assistant_error_text(&aborted).as_deref(),
             Some("Request aborted.")
         );
+    }
+
+    #[test]
+    fn sanitize_error_message_keeps_diagnostics_without_terminal_controls() {
+        assert_eq!(
+            sanitize_error_message("405\r\nMethod Not Allowed\x1b[2J"),
+            "405\nMethod Not Allowed"
+        );
+        assert_eq!(sanitize_error_message("\0\tmessage"), "\tmessage");
+        assert_eq!(sanitize_error_message("   "), "Provider request failed.");
+        let long = "x".repeat(20_000);
+        let cleaned = sanitize_error_message(&long);
+        assert!(cleaned.chars().count() <= 16 * 1024 + 1);
+        assert!(cleaned.ends_with('…'));
     }
 
     #[test]
