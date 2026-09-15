@@ -315,8 +315,8 @@ The workspace `Taskfile.yml` is the canonical release entry point. Run
 publish-scoped token; crates.io records are permanent.
 
 ```bash
-task dry-run RELEASE_VERSION=0.1.14
-task publish RELEASE_VERSION=0.1.14
+task dry-run RELEASE_VERSION=0.1.15
+task publish RELEASE_VERSION=0.1.15
 ```
 
 Both commands require a clean worktree and one consistent version across all
