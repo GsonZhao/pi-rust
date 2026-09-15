@@ -83,11 +83,24 @@ pub enum Mode {
 
 /// Interactive TUI presentation mode. `fullscreen` uses the alternate screen
 /// buffer; `regular` renders into the terminal's normal scrollback.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TuiMode {
-    #[default]
     Fullscreen,
     Regular,
+}
+
+const fn default_tui_mode_for(is_macos: bool) -> TuiMode {
+    if is_macos {
+        TuiMode::Regular
+    } else {
+        TuiMode::Fullscreen
+    }
+}
+
+impl Default for TuiMode {
+    fn default() -> Self {
+        default_tui_mode_for(cfg!(target_os = "macos"))
+    }
 }
 
 /// The parsed argument set. Mirrors TS `Args`. Unknown long flags are retained
@@ -111,7 +124,8 @@ pub struct Args {
     pub print: bool,
     pub mode: Mode,
     /// `--tui-mode regular|fullscreen` controls the interactive terminal
-    /// buffer. The default remains fullscreen for compatibility with rpi.
+    /// buffer. macOS defaults to regular so native selection and terminal
+    /// scrollback remain available together; other platforms use fullscreen.
     pub tui_mode: TuiMode,
 
     /// `--list-models [search]`: list the merged model catalog and exit.
@@ -594,7 +608,7 @@ pub fn print_help() {
   --append-system-prompt <text>  Append text to the system prompt (repeatable)
   --thinking <level>             off, minimal, low, medium, high, xhigh, max
   --mode <mode>                  Output mode: text (default), json, or rpc
-  --tui-mode <mode>              Interactive TUI buffer: regular or fullscreen
+  --tui-mode <mode>              TUI buffer: regular or fullscreen (macOS default: regular)
   --list-models [search]         List available models (with optional fuzzy search)
   --offline                      Disable startup network operations (same as PI_OFFLINE=1)
   --export <file>                Export a JSONL session to HTML and exit
@@ -1057,6 +1071,12 @@ mod tests {
         );
         let invalid = parse_args(&s(&["--tui-mode", "split"]));
         assert!(!invalid.errors.is_empty());
+    }
+
+    #[test]
+    fn tui_mode_default_preserves_native_macos_scrollback() {
+        assert_eq!(default_tui_mode_for(true), TuiMode::Regular);
+        assert_eq!(default_tui_mode_for(false), TuiMode::Fullscreen);
     }
 
     #[test]
