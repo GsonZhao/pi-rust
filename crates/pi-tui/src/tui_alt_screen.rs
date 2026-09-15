@@ -50,6 +50,7 @@ pub struct TuiAltScreen {
     main_previous_height: Mutex<usize>,
     main_hardware_row: Mutex<usize>,
     main_viewport_top: Mutex<usize>,
+    main_previous_cursor: Mutex<Option<(usize, usize)>>,
     // Input handlers
     #[allow(dead_code)]
     input_handler: Mutex<Option<Arc<dyn Fn(InputEvent) + Send + Sync>>>,
@@ -90,6 +91,7 @@ impl TuiAltScreen {
             main_previous_height: Mutex::new(0),
             main_hardware_row: Mutex::new(0),
             main_viewport_top: Mutex::new(0),
+            main_previous_cursor: Mutex::new(None),
             input_handler: Mutex::new(None),
             resize_handler: Mutex::new(None),
             overlays: Arc::new(OverlayManager::new()),
@@ -314,10 +316,14 @@ impl TuiAltScreen {
             .unwrap_or_default();
         let previous_width = *self.main_previous_width.lock().unwrap();
         let previous_height = *self.main_previous_height.lock().unwrap();
+        let previous_cursor = *self.main_previous_cursor.lock().unwrap();
 
-        // Width changes alter wrapping everywhere; redraw the document. Normal
-        // streaming updates stay incremental and preserve terminal scrollback.
-        if previous_width != 0 && previous_width != width {
+        // Size changes alter wrapping or viewport coordinates everywhere;
+        // mirror native pi and rebuild once. Normal streaming updates stay
+        // incremental and preserve terminal scrollback.
+        if (previous_width != 0 && previous_width != width)
+            || (previous_height != 0 && previous_height != height)
+        {
             terminal.write("\x1b[2J\x1b[H\x1b[3J");
             terminal.write("\x1b[?2026h");
             terminal.write(&lines.join("\r\n"));
@@ -332,18 +338,26 @@ impl TuiAltScreen {
             *self.main_viewport_top.lock().unwrap() = lines.len().saturating_sub(height);
         } else {
             let mut first_changed = None;
+            let mut last_changed = None;
             let max = previous.len().max(lines.len());
             for index in 0..max {
                 if previous.get(index) != lines.get(index) {
-                    first_changed = Some(index);
-                    break;
+                    first_changed.get_or_insert(index);
+                    last_changed = Some(index);
                 }
             }
-            if let Some(first) = first_changed {
+            if first_changed.is_none() && cursor == previous_cursor {
+                return;
+            }
+            if let (Some(first), Some(last)) = (first_changed, last_changed) {
                 let mut hardware_row = *self.main_hardware_row.lock().unwrap();
                 let mut viewport_top = *self.main_viewport_top.lock().unwrap();
                 let viewport_bottom = viewport_top + height.saturating_sub(1);
-                let move_target = if first == previous.len() && first > 0 {
+                let deleted_tail_only = first >= lines.len();
+                let append_start = first == previous.len() && first > 0;
+                let move_target = if deleted_tail_only {
+                    lines.len().saturating_sub(1)
+                } else if append_start {
                     first - 1
                 } else {
                     first
@@ -369,26 +383,40 @@ impl TuiAltScreen {
                 } else if current_screen > target_screen {
                     output.push_str(&format!("\x1b[{}A", current_screen - target_screen));
                 }
-                output.push_str(if first == previous.len() && first > 0 {
-                    "\r\n"
-                } else {
-                    "\r"
-                });
-                for index in first..lines.len() {
-                    if index > first {
-                        output.push_str("\r\n");
+                output.push_str(if append_start { "\r\n" } else { "\r" });
+                let render_end = last.min(lines.len().saturating_sub(1));
+                if !deleted_tail_only {
+                    for index in first..=render_end {
+                        if index > first {
+                            output.push_str("\r\n");
+                        }
+                        output.push_str("\x1b[2K");
+                        output.push_str(&lines[index]);
                     }
-                    output.push_str("\x1b[2K");
-                    output.push_str(&lines[index]);
                 }
+                let mut final_row = render_end;
                 if previous.len() > lines.len() {
-                    for _ in lines.len()..previous.len() {
-                        output.push_str("\r\n\x1b[2K");
+                    let extra_lines = previous.len() - lines.len();
+                    let clear_start_offset = usize::from(!lines.is_empty());
+                    if clear_start_offset > 0 {
+                        output.push_str("\x1b[1B");
+                    }
+                    for index in 0..extra_lines {
+                        output.push_str("\r\x1b[2K");
+                        if index + 1 < extra_lines {
+                            output.push_str("\x1b[1B");
+                        }
+                    }
+                    let move_back = extra_lines.saturating_sub(1) + clear_start_offset;
+                    if move_back > 0 {
+                        output.push_str(&format!("\x1b[{move_back}A"));
+                    }
+                    if extra_lines > 0 {
+                        final_row = lines.len().saturating_sub(1);
                     }
                 }
                 output.push_str("\x1b[?2026l");
                 terminal.write(&output);
-                let final_row = lines.len().saturating_sub(1);
                 let advanced = final_row.saturating_sub(viewport_top + height.saturating_sub(1));
                 viewport_top += advanced;
                 *self.main_hardware_row.lock().unwrap() = final_row;
@@ -412,7 +440,8 @@ impl TuiAltScreen {
         terminal.flush();
         *self.previous_screen.lock().unwrap() = lines;
         *self.main_previous_width.lock().unwrap() = width;
-        *self.main_previous_height.lock().unwrap() = previous_height.max(height);
+        *self.main_previous_height.lock().unwrap() = height;
+        *self.main_previous_cursor.lock().unwrap() = cursor;
     }
 
     /// Perform a differential render with constrained layout.
@@ -1042,5 +1071,48 @@ mod tests {
         tui.set_render_suspended(false);
         tui.set_layout_root(Some(Arc::new(Text::new("new frame", 0, 0))));
         assert!(output.lock().unwrap().len() > before);
+    }
+
+    #[test]
+    fn regular_single_line_update_does_not_rewrite_unchanged_tail() {
+        let output = Arc::new(Mutex::new(String::new()));
+        let terminal = RecordingTerminal {
+            output: output.clone(),
+        };
+        let tui = TuiAltScreen::new(Box::new(terminal), true, None);
+        let content = Arc::new(Text::new("header\nstatus\neditor\nfooter", 0, 0));
+        tui.set_main_screen_mode(true);
+        tui.set_layout_root(Some(content.clone()));
+        tui.start_readerless();
+        output.lock().unwrap().clear();
+
+        content.set_text("header\nstatus2\neditor\nfooter");
+        tui.request_render(false);
+
+        let rendered = output.lock().unwrap().clone();
+        assert!(rendered.contains("status2"));
+        assert!(!rendered.contains("editor"));
+        assert!(!rendered.contains("footer"));
+    }
+
+    #[test]
+    fn regular_unchanged_frame_writes_nothing() {
+        let output = Arc::new(Mutex::new(String::new()));
+        let terminal = RecordingTerminal {
+            output: output.clone(),
+        };
+        let tui = TuiAltScreen::new(Box::new(terminal), true, None);
+        tui.set_main_screen_mode(true);
+        tui.set_layout_root(Some(Arc::new(Text::new(
+            "header\nstatus\neditor\nfooter",
+            0,
+            0,
+        ))));
+        tui.start_readerless();
+        output.lock().unwrap().clear();
+
+        tui.request_render(false);
+
+        assert!(output.lock().unwrap().is_empty());
     }
 }

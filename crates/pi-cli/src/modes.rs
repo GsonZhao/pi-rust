@@ -275,6 +275,15 @@ fn agent_event_json(event: &AgentEvent) -> serde_json::Value {
             "type":"agent_end", "messageCount": messages.len(),
             "messages": serde_json::to_value(messages).unwrap_or(serde_json::Value::Null)
         }),
+        AgentEvent::RetryScheduled {
+            attempt,
+            max_retries,
+            delay_ms,
+            error,
+        } => serde_json::json!({
+            "type":"retry_scheduled", "attempt":attempt,
+            "maxRetries":max_retries, "delayMs":delay_ms, "error":error
+        }),
         AgentEvent::TurnStart => serde_json::json!({"type":"turn_start"}),
         AgentEvent::TurnEnd {
             message,
@@ -643,5 +652,17 @@ mod tests {
         assert_eq!(tool["type"], "tool_execution_end");
         assert_eq!(tool["result"]["content"][0]["text"], "hello");
         assert_eq!(tool["result"]["terminate"], false);
+
+        let retry = agent_event_json(&AgentEvent::RetryScheduled {
+            attempt: 3,
+            max_retries: 10,
+            delay_ms: 8_000,
+            error: "503 service unavailable".into(),
+        });
+        assert_eq!(retry["type"], "retry_scheduled");
+        assert_eq!(retry["attempt"], 3);
+        assert_eq!(retry["maxRetries"], 10);
+        assert_eq!(retry["delayMs"], 8_000);
+        assert_eq!(retry["error"], "503 service unavailable");
     }
 }

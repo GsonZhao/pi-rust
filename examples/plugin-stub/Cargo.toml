@@ -6,7 +6,7 @@ publish = false
 description = "Minimal rpi Rust-cdylib plugin: registers an `echo` tool + one event handler (the Part B2 ABI smoke target)."
 
 [lib]
-# cdylib so the host can load it via libloading as rpi_plugin_register.
+# cdylib so the host can load it via libloading as rpi_plugin_register_v2.
 crate-type = ["cdylib"]
 
 [dependencies]

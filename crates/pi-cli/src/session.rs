@@ -15,15 +15,15 @@
 //!   re-run through `load_skills`/`load_prompt_templates` (individual `.md` files
 //!   load too — `load_skills` accepts both dirs and files). Package themes are
 //!   parsed by the TUI when selected via settings or `--theme`.**
-//!   A project trust gate now fails closed by default; use `--approve` or a
-//!   stored `trust.json` decision to enable project-local resources.
+//!   Project resources load by default without a prompt. `--no-approve` or a
+//!   stored negative `trust.json` decision disables them explicitly.
 //! - **No `ModelRuntime`/multi-provider registry.** The resolver supports the
 //!   built-in Anthropic/OpenAI-compatible providers and `models.json`, but
 //!   runtime catalog mutation remains outside this layer.
-//! - **Built-in tools**: `read`, `bash`, `edit`, and `write`, matching Pi's
-//!   default `createCodingTools` set. The former rpi-only `docs`, `grep`,
-//!   `find`, `ls`, and `powershell` tools remain library modules but are no
-//!   longer registered by the CLI.
+//! - **Built-in tools**: `read`, `bash`, `edit`, `write`, and the read-only
+//!   `docs` lookup tool. The former rpi-only `grep`, `find`, `ls`, and
+//!   `powershell` tools remain library modules but are not registered by the
+//!   CLI.
 //! - **Session restore (`-c`/`-r`/`--session`)** is *partially* supported: a
 //!   fresh session is always created. The harness's `create` rejects sessions
 //!   that already have records unless `allow_existing_session` is enabled.
@@ -44,8 +44,8 @@ use rpi_harness::session::types::{BranchBounds, EntryQuery, SessionMetadata};
 use rpi_harness::session::Session;
 use rpi_harness::system_prompt::compose_system_prompt;
 use rpi_harness::types::{
-    AgentHarnessOptions, AgentHarnessResources, CompactionSettings, DrivingMode, HarnessTool,
-    HarnessToolExecution, RetryPolicy, ToolReplay,
+    AgentHarnessOptions, AgentHarnessResources, AgentHarnessStreamOptions, CompactionSettings,
+    DrivingMode, HarnessTool, HarnessToolExecution, RetryPolicy, ToolReplay,
 };
 use rpi_tools::{
     create_bash_tool, create_edit_tool, create_read_tool, create_write_tool, ExecutionToolContext,
@@ -53,13 +53,14 @@ use rpi_tools::{
 };
 
 use crate::args::Args;
+use crate::docs_tool::create_docs_tool;
 use crate::extension_api::ExtensionBackend;
 use crate::provider::ResolvedModel;
 use crate::resource_dirs::{
     discover_append_system_prompt_file_with_packages, discover_system_prompt_file_with_packages,
     extension_dirs, global_extension_dirs, global_prompt_template_dirs, global_skill_dirs,
-    load_prompt_templates_with_precedence, load_skills_with_precedence, prompt_template_dirs,
-    skill_dirs,
+    load_prompt_templates_with_precedence, load_skills_with_precedence,
+    project_prompt_template_dirs, project_skill_dirs, prompt_template_dirs, skill_dirs,
 };
 use rpi_extensions::{
     emit_resources_discover, ExtensionEmitter, ExtensionSession, NullDiagnostics,
@@ -67,7 +68,7 @@ use rpi_extensions::{
 };
 
 /// The Pi-compatible coding tools registered by the CLI by default.
-pub const BUILTIN_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write"];
+pub const BUILTIN_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write", "docs"];
 
 /// Package-backed JS/TS loading is opt-in. `--no-extensions` remains a final
 /// kill switch even when package loading was explicitly enabled.
@@ -105,11 +106,13 @@ pub(crate) fn package_resources_for(
 /// and versions neither starts Node nor executes package code. Project-local
 /// settings remain behind the same trust decision as the runtime loader.
 pub(crate) fn package_resources_for_update_check(
-    _args: &Args,
+    args: &Args,
     cwd: &Path,
     project_trusted: bool,
 ) -> crate::packages::PackageResources {
-    if project_trusted {
+    if args.dev_local_only {
+        crate::packages::PackageResources::default()
+    } else if project_trusted {
         crate::packages::discover_from_settings(cwd)
     } else {
         crate::packages::discover_from_global_settings(cwd)
@@ -128,6 +131,7 @@ Available tools:
 - bash  — Execute shell commands
 - edit  — Find/replace edits to existing files
 - write — Create or overwrite files
+- docs  — Look up rpi usage, extension, package, and compatibility documentation
 
 Guidelines:
 - Be concise in your responses
@@ -237,13 +241,17 @@ pub async fn build(
     let cwd_str = cwd.to_string_lossy().to_string();
     if !project_trusted && args.verbose {
         eprintln!(
-            "warning: project is not trusted; local settings, resources, and discovered extensions are disabled (use --approve or /trust)"
+            "warning: current-project settings, resources, and discovered extensions are explicitly disabled (use --approve or /trust yes to re-enable)"
         );
     }
     // Pi packages are explicitly opt-in because discovery can start Node and
-    // execute package code. Trust additionally limits discovery to global
-    // settings when the current project has not been approved.
-    let package_resources = package_resources_for(args, cwd, project_trusted);
+    // execute package code. An explicit project opt-out limits discovery to
+    // global settings.
+    let package_resources = if args.dev_local_only {
+        crate::packages::PackageResources::default()
+    } else {
+        package_resources_for(args, cwd, project_trusted)
+    };
 
     // ---- B5a: build the action bridge BEFORE extension load ----
     // Extensions load before `AgentHarness::create` (extensions provide tools the
@@ -267,6 +275,7 @@ pub async fn build(
         catalog.clone(),
         cwd.to_path_buf(),
         runtime.clone(),
+        args.unknown_flags.clone(),
     );
     let host_arc: Arc<dyn rpi_extensions::RuntimeActionHost> = Arc::new(action_host);
     // `runtime` is reused below (B5c: `PluggableProvider` needs a captured
@@ -500,7 +509,9 @@ pub async fn build(
     let mut skills: Vec<rpi_harness::types::Skill> = Vec::new();
     let mut skill_diags: Vec<rpi_harness::skills::SkillDiagnostic> = Vec::new();
     if !args.no_skills {
-        let mut dirs = if project_trusted {
+        let mut dirs = if args.dev_local_only {
+            project_skill_dirs(cwd)
+        } else if project_trusted {
             skill_dirs(cwd)
         } else {
             global_skill_dirs()
@@ -519,7 +530,9 @@ pub async fn build(
     let mut prompt_templates: Vec<rpi_harness::types::PromptTemplate> = Vec::new();
     let mut prompt_diags: Vec<rpi_harness::prompt_templates::PromptTemplateDiagnostic> = Vec::new();
     if !args.no_prompt_templates {
-        let mut dirs = if project_trusted {
+        let mut dirs = if args.dev_local_only {
+            project_prompt_template_dirs(cwd)
+        } else if project_trusted {
             prompt_template_dirs(cwd)
         } else {
             global_prompt_template_dirs()
@@ -715,7 +728,10 @@ pub async fn build(
                 | SessionSelection::ByExactId { .. }
                 | SessionSelection::Fork { .. }
         ),
-        stream_options: Default::default(),
+        stream_options: AgentHarnessStreamOptions {
+            timeout: args.timeout,
+            ..Default::default()
+        },
         retry: RetryPolicy::default(),
         compaction: CompactionSettings::default(),
         steering_mode: Default::default(),
@@ -1026,6 +1042,7 @@ where
                 ctx.catalog.clone(),
                 ctx.cwd.clone(),
                 ctx.runtime.clone(),
+                ctx.args.unknown_flags.clone(),
             );
             crate::extensions_actions::HarnessActionHost::set_harness(
                 &_cell,
@@ -1335,10 +1352,11 @@ struct ReloadSettingsSnapshot {
 }
 
 fn reload_reads_settings(args: &Args) -> bool {
-    should_load_js_packages(args)
-        || !args.no_extensions
-        || !args.no_skills
-        || !args.no_prompt_templates
+    !args.dev_local_only
+        && (should_load_js_packages(args)
+            || !args.no_extensions
+            || !args.no_skills
+            || !args.no_prompt_templates)
 }
 
 /// Strictly read the settings fields consumed while preparing a reload. The
@@ -1394,9 +1412,13 @@ where
 {
     let settings_before = load_reload_settings_snapshot(args, cwd, project_trusted)?;
 
-    let package_resources = package_resources_for(args, cwd, project_trusted);
+    let package_resources = if args.dev_local_only {
+        crate::packages::PackageResources::default()
+    } else {
+        package_resources_for(args, cwd, project_trusted)
+    };
 
-    let mut extension_dirs = if args.no_extensions {
+    let mut extension_dirs = if args.no_extensions || args.dev_local_only {
         Vec::new()
     } else if project_trusted {
         extension_dirs(cwd)
@@ -1409,6 +1431,8 @@ where
 
     let skill_base_dirs = if args.no_skills {
         Vec::new()
+    } else if args.dev_local_only {
+        project_skill_dirs(cwd)
     } else if project_trusted {
         skill_dirs(cwd)
     } else {
@@ -1417,6 +1441,8 @@ where
 
     let prompt_base_dirs = if args.no_prompt_templates {
         Vec::new()
+    } else if args.dev_local_only {
+        project_prompt_template_dirs(cwd)
     } else if project_trusted {
         prompt_template_dirs(cwd)
     } else {
@@ -1514,28 +1540,8 @@ fn build_models_with_extensions(
     models
 }
 
-/// Whether the cwd contains project-owned resources that warrant a trust
-/// decision prompt. Session storage alone is intentionally excluded so a
-/// normal launch does not repeatedly ask after creating `.rpi/sessions`.
-pub fn project_has_local_resources(cwd: &Path) -> bool {
-    const FILES: &[&str] = &[
-        "settings.json",
-        "SYSTEM.md",
-        "APPEND_SYSTEM.md",
-        "packages.json",
-    ];
-    const DIRS: &[&str] = &["skills", "prompts", "themes", "extensions", "packages"];
-    [".rpi", ".pi"].iter().any(|layout| {
-        let root = cwd.join(layout);
-        FILES.iter().any(|name| root.join(name).is_file())
-            || DIRS.iter().any(|name| root.join(name).is_dir())
-    })
-}
-
-/// Resolve the project trust gate without prompting. Explicit CLI overrides
-/// win; otherwise a stored `trust.json` decision is honored. An absent or
-/// malformed decision fails closed so untrusted project files cannot execute
-/// during startup.
+/// Resolve project resource loading without prompting. Explicit CLI overrides
+/// win, then a stored decision; projects with no decision load by default.
 pub(crate) fn resolve_project_trust(args: &Args, cwd: &Path) -> bool {
     if let Some(override_value) = args.trust_override {
         return override_value;
@@ -1543,7 +1549,7 @@ pub(crate) fn resolve_project_trust(args: &Args, cwd: &Path) -> bool {
     crate::config::project_trust_decision(cwd)
         .ok()
         .flatten()
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
 /// Resolve the extension dirs to scan and load the cdylib plugins, returning
@@ -1559,7 +1565,9 @@ fn load_extensions(
     project_trusted: bool,
     action_bridge: Option<Arc<rpi_extensions::ActionBridge>>,
 ) -> ExtensionSession {
-    let mut dirs = if project_trusted {
+    let mut dirs = if args.dev_local_only {
+        Vec::new()
+    } else if project_trusted {
         extension_dirs(cwd)
     } else {
         global_extension_dirs()
@@ -1589,6 +1597,9 @@ fn js_extension_paths(
     project_trusted: bool,
     packages: &crate::packages::PackageResources,
 ) -> Vec<PathBuf> {
+    if args.dev_local_only {
+        return Vec::new();
+    }
     let mut paths = packages.extension_paths();
     let discovered_dirs = if project_trusted {
         extension_dirs(cwd)
@@ -1691,7 +1702,8 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
     if args.no_tools {
         return Vec::new();
     }
-    // Keep the default set aligned with Pi's createCodingTools.
+    // Keep the coding tools aligned with Pi and expose rpi's read-only docs
+    // lookup as a default assistant capability.
     let mut all: Vec<(&'static str, HarnessTool)> = vec![
         ("read", HarnessTool::new(create_read_tool(ctx, None))),
         (
@@ -1700,6 +1712,7 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
         ),
         ("edit", HarnessTool::new(create_edit_tool(ctx))),
         ("write", HarnessTool::new(create_write_tool(ctx))),
+        ("docs", HarnessTool::new(create_docs_tool())),
     ];
 
     // `--no-builtin-tools` disables the built-in set but would keep
@@ -2109,10 +2122,25 @@ mod tests {
         assert!(p.contains("bash"));
         assert!(p.contains("edit"));
         assert!(p.contains("write"));
+        assert!(p.contains("docs"));
         assert!(!p.contains("- grep"));
         assert!(!p.contains("- find"));
         assert!(!p.contains("- ls"));
         assert!(!p.contains("powershell"));
+    }
+
+    #[test]
+    fn default_tools_include_docs_lookup() {
+        let env = Arc::new(OsExecutionEnv::with_cwd(PathBuf::from(".")));
+        let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env.clone();
+        let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
+        let context = ExecutionToolContext::new(env_dyn, Some(mut_env));
+        let names: Vec<String> = build_tools(&context, &Args::default())
+            .iter()
+            .map(|tool| tool.tool.schema().name.clone())
+            .collect();
+
+        assert_eq!(names, vec!["read", "bash", "edit", "write", "docs"]);
     }
 
     #[test]
@@ -2296,6 +2324,12 @@ mod tests {
                 .unwrap_err()
                 .contains("could not load global settings"));
         }
+
+        let local_only = Args {
+            dev_local_only: true,
+            ..Args::default()
+        };
+        assert!(validate_settings_for_reload(&local_only, &cwd, true).is_ok());
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2603,19 +2637,19 @@ mod tests {
     }
 
     #[test]
-    fn project_trust_override_fails_closed_by_default() {
-        let denied = Args::default();
-        assert!(!resolve_project_trust(
-            &denied,
+    fn project_resources_load_by_default_and_allow_explicit_opt_out() {
+        let defaults = Args::default();
+        assert!(resolve_project_trust(
+            &defaults,
             Path::new("C:/definitely-not-a-project")
         ));
 
-        let approved = Args {
-            trust_override: Some(true),
+        let denied = Args {
+            trust_override: Some(false),
             ..Args::default()
         };
-        assert!(resolve_project_trust(
-            &approved,
+        assert!(!resolve_project_trust(
+            &denied,
             Path::new("C:/definitely-not-a-project")
         ));
     }
@@ -2666,16 +2700,6 @@ mod tests {
 
         assert_eq!(context.cwd, cwd);
         assert!(context.project_trusted);
-    }
-
-    #[test]
-    fn project_resource_probe_ignores_session_directory_but_detects_config() {
-        let root = tempfile::tempdir().unwrap();
-        let cwd = root.path();
-        std::fs::create_dir_all(cwd.join(".rpi/sessions")).unwrap();
-        assert!(!project_has_local_resources(cwd));
-        std::fs::write(cwd.join(".rpi/settings.json"), "{}").unwrap();
-        assert!(project_has_local_resources(cwd));
     }
 
     #[test]

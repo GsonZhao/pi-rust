@@ -11,9 +11,9 @@
           "id": "complete-guide",
           "kicker": "00 / COMPLETE GUIDE",
           "title": "完整使用手册",
-          "summary": "从安装、模型配置、.rpi 资源和 Pi package，到 JS/TS 扩展、Rust 插件、SDK、排错和发布的完整路径。",
+          "summary": "从安装、模型配置、.rpi 资源和 Pi package，到 Beta JS/TS 扩展、Rust 插件、SDK、排错和发布的完整路径。",
           "body": [
-            "官网文档与仓库内 /user-guide.md 保持同步。安装后的 rpi 默认只提供 Pi 的四个核心工具；需要了解扩展和配置时请查阅在线文档或仓库文档。",
+            "官网文档与仓库内 /user-guide.md 保持同步。安装后的 rpi 默认只提供 Pi 的四个核心工具；Node/TS 扩展和原生技能渲染属于 Beta，仅建议本地评估。",
             "推荐先阅读安装与第一次运行，再按需求进入 Provider、Pi package、扩展或 SDK 集成章节。"
           ],
           "links": [

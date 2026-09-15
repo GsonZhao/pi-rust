@@ -1287,6 +1287,13 @@ pub fn run_cli(args: &[String]) -> i32 {
             0
         }
         "update" => {
+            if args
+                .iter()
+                .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+            {
+                print_update_help();
+                return 0;
+            }
             let project_trusted = match package_command_project_trusted(&cwd, &args[1..]) {
                 Ok(trusted) => trusted,
                 Err(error) => {
@@ -1294,7 +1301,7 @@ pub fn run_cli(args: &[String]) -> i32 {
                     return 2;
                 }
             };
-            update_packages(&cwd, project_trusted)
+            update_packages_with_scope(&cwd, project_trusted, UpdateScope::Native)
         }
         "help" | "--help" | "-h" => {
             print_help();
@@ -1308,10 +1315,78 @@ pub fn run_cli(args: &[String]) -> i32 {
     }
 }
 
+/// Compatibility helper for callers that need the Rust-native package scope.
+pub fn run_native_update(args: &[String]) -> i32 {
+    run_top_level_update(args, UpdateScope::Native)
+}
+
+/// Top-level `rpi pi-package update`: update only configured Pi npm/Git
+/// packages.
+pub fn run_pi_package_update(args: &[String]) -> i32 {
+    // Consume the explicit `update` subcommand before handling shared flags.
+    if args.first().map(String::as_str) == Some("update") {
+        run_top_level_update(&args[1..], UpdateScope::Pi)
+    } else {
+        run_top_level_update(args, UpdateScope::Pi)
+    }
+}
+
+fn run_top_level_update(args: &[String], scope: UpdateScope) -> i32 {
+    crate::args::normalize_offline_mode(args);
+    let args = crate::args::without_offline_flag(args);
+    let cwd = match std::env::current_dir() {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("error: could not determine current directory: {error}");
+            return 1;
+        }
+    };
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
+        print_scoped_update_help(scope);
+        return 0;
+    }
+    let project_trusted = if scope.includes_pi() {
+        match package_command_project_trusted(&cwd, &args) {
+            Ok(trusted) => trusted,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return 2;
+            }
+        }
+    } else {
+        if let Some(arg) = args.first() {
+            eprintln!("error: unknown native update option `{arg}`");
+            return 2;
+        }
+        false
+    };
+    update_packages_with_scope(&cwd, project_trusted, scope)
+}
+
 fn print_help() {
     println!(
-        "Usage: rpi package <command>\n\nCommands:\n  list [--json] [--approve|--no-approve]\n                     List enabled TS packages and installed Rust extensions\n  add <path-or-name> Enable a local/package.json package\n  remove <path-or-name>\n                     Disable a Pi package\n  update [--approve|--no-approve] [--offline]\n                     Update TS npm/git packages and Rust crates.io extensions\n\nProject packages are read only when the project has a saved trust decision or --approve is supplied. TS package resources are loaded from skills/, prompts/, themes/, SYSTEM.md, APPEND_SYSTEM.md, and extensions. Rust-native extensions are installed with `rpi install`."
+        "Usage: rpi package <command>\n\nCommands:\n  list [--json] [--approve|--no-approve]\n                     List enabled TS packages and installed Rust extensions\n  add <path-or-name> Enable a local/package.json package\n  remove <path-or-name>\n                     Disable a Pi package\n  update [--offline]\n                     Update installed Rust-native extensions\n\nProject packages load by default without confirmation; use --no-approve to disable project package access. TS package resources are loaded from skills/, prompts/, themes/, SYSTEM.md, APPEND_SYSTEM.md, and extensions. Rust-native extensions are installed with `rpi install`. Pi packages are updated with `rpi pi-package update`."
     );
+}
+
+fn print_update_help() {
+    println!(
+        "Usage: rpi package update [--offline]\n\nUpdate installed Rust-native extensions only.\n\nUse `rpi pi-package update` for configured Pi npm/Git packages."
+    );
+}
+
+fn print_scoped_update_help(scope: UpdateScope) {
+    match scope {
+        UpdateScope::Native => println!(
+            "Usage: rpi package update [--offline]\n\nUpdate installed Rust-native extensions only."
+        ),
+        UpdateScope::Pi => println!(
+            "Usage: rpi pi-package update [--approve|--no-approve] [--offline]\n\nUpdate configured Pi npm/Git packages only.\n\nThe rpi CLI itself is updated with `rpi update`."
+        ),
+    }
 }
 
 fn package_command_project_trusted(cwd: &Path, args: &[String]) -> Result<bool, String> {
@@ -1334,39 +1409,60 @@ fn package_command_project_trusted(cwd: &Path, args: &[String]) -> Result<bool, 
     }
     Ok(crate::config::project_trust_decision(cwd)
         .map_err(|error| error.to_string())?
-        .unwrap_or(false))
+        .unwrap_or(true))
 }
 
-fn update_packages(cwd: &Path, project_trusted: bool) -> i32 {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpdateScope {
+    Native,
+    Pi,
+}
+
+impl UpdateScope {
+    fn includes_native(self) -> bool {
+        matches!(self, Self::Native)
+    }
+
+    fn includes_pi(self) -> bool {
+        matches!(self, Self::Pi)
+    }
+}
+
+fn update_packages_with_scope(cwd: &Path, project_trusted: bool, scope: UpdateScope) -> i32 {
     if crate::args::offline_env_enabled() {
         println!("package update skipped: offline mode is enabled");
         return 0;
     }
-    // This command updates Rust and TS packages as one operation. Validate the
-    // native registry before discovery because discovery may recover an
-    // interrupted npm/Git directory swap. A damaged registry must make the
-    // whole command a no-op rather than allowing a partial TS-only update.
-    let native = match crate::install::installed_native_packages_strict() {
-        Ok(packages) => packages,
-        Err(error) => {
-            eprintln!(
-                "error: refusing package update while native package metadata is invalid: {error}"
-            );
-            return 1;
+    // Native updates validate their registry before mutating anything. Pi
+    // package updates independently validate settings before recovering an
+    // interrupted npm/Git directory swap.
+    let native = if scope.includes_native() {
+        match crate::install::installed_native_packages_strict() {
+            Ok(packages) => packages,
+            Err(error) => {
+                eprintln!(
+                    "error: refusing native package update while metadata is invalid: {error}"
+                );
+                return 1;
+            }
         }
+    } else {
+        Vec::new()
     };
-    // Load every settings document before performing recovery, invoking a
-    // package manager, or updating a Rust extension. A malformed active file
-    // must make the entire command a no-op rather than silently narrowing the
-    // requested package set and partially updating it.
-    let (resources, preflight_npm_command) =
+    // Load every settings document before performing Pi package recovery or
+    // invoking a package manager. A malformed active file must make the Pi
+    // update a no-op rather than silently narrowing the requested package set.
+    let (resources, preflight_npm_command) = if scope.includes_pi() {
         match discover_from_settings_for_update(cwd, project_trusted) {
             Ok(result) => result,
             Err(error) => {
-                eprintln!("error: refusing package update with unreadable settings: {error}");
+                eprintln!("error: refusing Pi package update with unreadable settings: {error}");
                 return 1;
             }
-        };
+        }
+    } else {
+        (PackageResources::default(), None)
+    };
     let blocked = resources
         .diagnostics
         .iter()
@@ -1398,7 +1494,7 @@ fn update_packages(cwd: &Path, project_trusted: bool) -> i32 {
     };
     let mut failed = 0;
     if resources.packages.is_empty() && native.is_empty() {
-        println!("no Pi packages enabled");
+        println!("no packages available for update");
         return 0;
     }
     let mut updated = 0;
@@ -1561,7 +1657,11 @@ fn update_packages(cwd: &Path, project_trusted: bool) -> i32 {
             None => unreachable!("package command was preflighted for update candidates"),
         }
     }
-    println!("package update complete: {updated} updated, {skipped} skipped");
+    let label = match scope {
+        UpdateScope::Native => "native package update",
+        UpdateScope::Pi => "Pi package update",
+    };
+    println!("{label} complete: {updated} updated, {skipped} skipped");
     i32::from(failed > 0)
 }
 
@@ -3800,7 +3900,51 @@ mod tests {
         // A non-truthy value must not silently suppress the same invalid
         // registry preflight.
         std::env::set_var(crate::args::PI_OFFLINE_ENV, "0");
-        assert_eq!(update_packages(tmp.path(), false), 1);
+        assert_eq!(
+            update_packages_with_scope(tmp.path(), false, UpdateScope::Native),
+            1
+        );
+    }
+
+    #[test]
+    fn top_level_update_help_is_handled_by_package_updater() {
+        assert_eq!(run_cli(&["update".into(), "--help".into()]), 0);
+    }
+
+    #[test]
+    fn native_and_pi_update_scopes_validate_only_their_own_metadata() {
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let previous = std::env::var_os(config::CONFIG_DIR_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::write(agent.join("native-packages.json"), "[{broken").unwrap();
+        std::env::set_var(config::CONFIG_DIR_ENV, &agent);
+
+        assert_eq!(
+            update_packages_with_scope(tmp.path(), false, UpdateScope::Native),
+            1
+        );
+        assert_eq!(
+            update_packages_with_scope(tmp.path(), false, UpdateScope::Pi),
+            0
+        );
+
+        std::fs::remove_file(agent.join("native-packages.json")).unwrap();
+        std::fs::write(agent.join("settings.json"), "{ malformed").unwrap();
+        assert_eq!(
+            update_packages_with_scope(tmp.path(), false, UpdateScope::Native),
+            0
+        );
+        assert_eq!(
+            update_packages_with_scope(tmp.path(), false, UpdateScope::Pi),
+            1
+        );
+
+        match previous {
+            Some(value) => std::env::set_var(config::CONFIG_DIR_ENV, value),
+            None => std::env::remove_var(config::CONFIG_DIR_ENV),
+        }
     }
 
     #[test]
@@ -5755,7 +5899,7 @@ mod tests {
         std::fs::create_dir_all(&agent).unwrap();
         std::env::set_var(config::CONFIG_DIR_ENV, &agent);
 
-        assert_eq!(update_packages(&cwd, true), 1);
+        assert_eq!(update_packages_with_scope(&cwd, true, UpdateScope::Pi), 1);
         assert!(!target.exists());
 
         match previous {
@@ -5779,7 +5923,7 @@ mod tests {
         std::fs::write(cwd.join(".rpi/settings.json"), "{ malformed").unwrap();
         std::env::set_var(config::CONFIG_DIR_ENV, &agent);
 
-        assert_eq!(update_packages(&cwd, true), 1);
+        assert_eq!(update_packages_with_scope(&cwd, true, UpdateScope::Pi), 1);
 
         match previous {
             Some(value) => std::env::set_var(config::CONFIG_DIR_ENV, value),
@@ -5812,7 +5956,10 @@ mod tests {
         .unwrap();
         std::env::set_var(config::CONFIG_DIR_ENV, &agent);
 
-        assert_eq!(update_packages(&cwd, true), 1);
+        assert_eq!(
+            update_packages_with_scope(&cwd, true, UpdateScope::Native),
+            1
+        );
 
         match previous {
             Some(value) => std::env::set_var(config::CONFIG_DIR_ENV, value),
@@ -5846,7 +5993,7 @@ mod tests {
         .unwrap();
         std::env::set_var(config::CONFIG_DIR_ENV, &agent);
 
-        assert_eq!(update_packages(&cwd, true), 1);
+        assert_eq!(update_packages_with_scope(&cwd, true, UpdateScope::Pi), 1);
 
         match previous {
             Some(value) => std::env::set_var(config::CONFIG_DIR_ENV, value),
@@ -5879,7 +6026,7 @@ mod tests {
         .unwrap();
         std::env::set_var(config::CONFIG_DIR_ENV, &agent);
 
-        assert_eq!(update_packages(&cwd, true), 1);
+        assert_eq!(update_packages_with_scope(&cwd, true, UpdateScope::Pi), 1);
 
         match previous {
             Some(value) => std::env::set_var(config::CONFIG_DIR_ENV, value),

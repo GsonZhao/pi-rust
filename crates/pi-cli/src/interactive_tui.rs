@@ -46,8 +46,9 @@ use rpi_tui::{
     EditorOptions, EditorStyle, FilePathAutocompleteProvider, Focusable, FollowMode,
     FooterComponent, Image, ImageOptions, Input, Loader, ProcessTerminal, ScrollView,
     ScrollViewOptions, SelectItem, SelectList, SlashCommand as SlashCommandEntry,
-    SlashCommandAutocompleteProvider, Spacer, StackChild, StackEntry, Text, ThemeManager,
-    ThemePreset, ToolExecutionComponent, TuiAltScreen, UserMessageComponent, VStack, TUI,
+    SlashCommandAutocompleteProvider, Spacer, StackChild, StackEntry, StatusIndicator, Text,
+    ThemeManager, ThemePreset, ToolExecutionComponent, TuiAltScreen, UserMessageComponent, VStack,
+    TUI,
 };
 use rpi_tui::{bold as tui_bold, theme as current_theme};
 
@@ -4064,7 +4065,10 @@ impl TuiState {
     fn apply_status(&self, status: RunStatus) {
         match status {
             RunStatus::Working => {
-                self.footer.set_status("Working…");
+                // The status dock already shows the active loader. Keep the
+                // footer focused on the model and shortcuts instead of
+                // repeating a second `Working…` at the bottom of the TUI.
+                self.footer.set_status("");
                 // Reflect the in-flight turn in the terminal window/tab title
                 // (OSC 2). No-op when `tui` is absent (unit tests).
                 if let Some(tui) = &self.tui {
@@ -4106,6 +4110,22 @@ impl TuiState {
         if self.show_terminal_progress && self.bash_components.lock().unwrap().is_empty() {
             self.status_container.add_child(self.loader.clone());
         }
+    }
+
+    fn show_retry(&self, attempt: u32, max_retries: u32, delay_ms: u64) {
+        *self.status.lock().unwrap() = RunStatus::Working;
+        self.footer.set_status("");
+        if let Some(tui) = &self.tui {
+            tui.set_title("rpi — retrying");
+        }
+        self.loader.stop();
+        self.status_container.clear();
+        self.status_container
+            .add_child(Arc::new(StatusIndicator::retry(
+                attempt,
+                max_retries,
+                std::time::Duration::from_millis(delay_ms),
+            )));
     }
 
     /// Whether a selector overlay is currently open (routes keys to it first).
@@ -4333,6 +4353,18 @@ pub async fn interactive_tui(
     // return defensive clones, so rendering this summary does not retain a
     // harness lock or trigger a second resource scan.
     let mut active_tool_names = lane.get_active_tools().await.unwrap_or_default();
+    // AgentHarness uses an empty active-name list as the default "all tools"
+    // state. Do not expose that implementation sentinel as `Tools (0) none`
+    // in the welcome banner (it is especially visible on the first prompt).
+    if active_tool_names.is_empty() {
+        active_tool_names = harness
+            .get_tools()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tool| tool.tool.schema().name.clone())
+            .collect();
+    }
     let resources_snapshot = harness.get_resources().await.unwrap_or_default();
     let skill_names: Vec<String> = resources_snapshot
         .skills
@@ -5843,10 +5875,33 @@ fn launch_external_editor(draft: String, tx: mpsc::UnboundedSender<TuiMessage>) 
     });
 }
 
+/// Apply the authoritative run result when it wins the race with the async
+/// event drain, then detach the live component from further partial updates.
+fn reconcile_streamed_assistant_completion(
+    current_assistant: &Mutex<Option<Arc<AssistantMessageComponent>>>,
+    last_assistant_text: &Mutex<String>,
+    final_message: Option<&AssistantMessage>,
+) {
+    let final_blocks = final_message.map(assistant_blocks);
+    let final_text = final_message.map(assistant_text);
+    let component = current_assistant.lock().unwrap().take();
+
+    if let Some(component) = component {
+        if let Some(blocks) = final_blocks.as_deref() {
+            component.update_blocks(blocks);
+        }
+        component.set_streaming(false);
+    }
+
+    if let Some(text) = final_text.filter(|text| !text.is_empty()) {
+        *last_assistant_text.lock().unwrap() = text;
+    }
+}
+
 /// Drive a single prompt through the lane. When `streaming` is true, the
-/// `AgentEvent` drain task renders the response live and this function only
-/// awaits completion (to surface hard errors). When false (no `event_rx`),
-/// it falls back to the blocking await-final-text path.
+/// `AgentEvent` drain task renders the response live and the completed outcome
+/// reconciles its final snapshot. When false (no `event_rx`), this falls back
+/// to the blocking await-final-text path.
 async fn run_prompt_streaming(
     lane: &Arc<dyn AgentLane>,
     prompt: &str,
@@ -5876,14 +5931,25 @@ async fn run_prompt_streaming(
 
     let outcome = lane.prompt_text(prompt, images).await;
 
-    // The drain task finalized the assistant message via MessageEnd/AgentEnd,
-    // but guard against runs that ended without a terminal event (e.g. a hard
-    // provider rejection before any streaming) by clearing streaming state.
-    {
-        let mut cur = state.current_assistant.lock().unwrap();
-        if let Some(comp) = cur.take() {
-            comp.set_streaming(false);
-        }
+    if streaming {
+        // Broadcast delivery is asynchronous: the harness result can resolve
+        // before the drain task processes MessageEnd. Reconcile from the
+        // authoritative outcome before detaching the component so the final
+        // streamed tail cannot be left at an earlier partial snapshot.
+        let final_message = match &outcome {
+            Ok(result) => match &result.outcome {
+                HarnessRunOutcome::Completed { final_message, .. }
+                | HarnessRunOutcome::Aborted { final_message, .. } => Some(final_message),
+                HarnessRunOutcome::Failed { final_message, .. } => final_message.as_ref(),
+                HarnessRunOutcome::Suspended { .. } => None,
+            },
+            Err(_) => None,
+        };
+        reconcile_streamed_assistant_completion(
+            &state.current_assistant,
+            &state.last_assistant_text,
+            final_message,
+        );
     }
 
     state.set_status(RunStatus::Idle);
@@ -6129,6 +6195,16 @@ async fn handle_agent_event(
             tui.request_render(false);
         }
 
+        AgentEvent::RetryScheduled {
+            attempt,
+            max_retries,
+            delay_ms,
+            ..
+        } => {
+            state.show_retry(attempt, max_retries, delay_ms);
+            tui.request_render(false);
+        }
+
         AgentEvent::TurnStart => {
             // A new turn: reset the streaming-assistant guard so the next
             // MessageStart creates a fresh component.
@@ -6228,8 +6304,13 @@ async fn handle_agent_event(
                 // already exists).
                 for c in &a.content {
                     if let Content::ToolCall(tc) = c {
+                        // Streaming providers may expose a placeholder tool
+                        // call before its name has arrived. It is not a real
+                        // tool panel and must not leave an empty first row.
+                        if tc.name.trim().is_empty() {
+                            continue;
+                        }
                         if tc.name == "bash" {
-                            saw_bash_tool_call = true;
                             // Bash has a dedicated component. Create it here as
                             // well as on ToolExecutionStart because the tool
                             // call can become visible in a MessageUpdate first.
@@ -6240,6 +6321,16 @@ async fn handle_agent_event(
                                 .get("command")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("");
+                            // Streaming tool-call arguments may still be `{}`
+                            // here. Do not create a running bash panel until
+                            // the lifecycle start event provides the command;
+                            // otherwise the spinner renders first and the
+                            // actual `$ command` header appears one frame
+                            // later.
+                            if command.trim().is_empty() {
+                                continue;
+                            }
+                            saw_bash_tool_call = true;
                             let mut bash = state.bash_components.lock().unwrap();
                             if !bash.contains_key(&tc.id) {
                                 let comp = Arc::new(BashExecutionComponent::new(command));
@@ -6330,6 +6421,11 @@ async fn handle_agent_event(
             tool_name,
             args,
         } => {
+            // Ignore placeholder lifecycle events emitted before the
+            // provider has supplied a tool name.
+            if tool_name.trim().is_empty() {
+                return;
+            }
             if tool_name == "bash" {
                 // Bash streams into a dedicated BashExecutionComponent (command
                 // header + live preview + exit/truncation status) rather than a
@@ -6340,6 +6436,12 @@ async fn handle_agent_event(
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
+                // Bash arguments can still be `{}` when the lifecycle event
+                // races the streamed tool-call argument finalization. Defer
+                // the panel until a later start event carries the command.
+                if command.trim().is_empty() {
+                    return;
+                }
                 let mut bash_map = state.bash_components.lock().unwrap();
                 if let Some(existing) = bash_map.get(&tool_call_id) {
                     // A ToolExecutionUpdate already created the panel (fast
@@ -6387,25 +6489,27 @@ async fn handle_agent_event(
             args,
             partial_result,
         } => {
+            if tool_name.trim().is_empty() {
+                return;
+            }
+            let partial_text = tool_result_text(&partial_result);
+            let has_partial_payload = tool_update_has_payload(&partial_text, &partial_result);
             if tool_name == "bash" {
                 // Append the streamed chunk to the bash component's preview.
                 // RAW text (no single-line collapsing) — the old
                 // `summarize_tool_result` folded every newline into a `⏎`
                 // glyph, cramming e.g. `ls -la`'s listing onto one line.
-                let chunk = tool_result_text(&partial_result);
+                let chunk = partial_text;
                 if let Some(bash) = state.bash_components.lock().unwrap().get(&tool_call_id) {
-                    bash.append_output(&chunk);
-                } else {
-                    // No component yet — create a running bash one so the
-                    // partial shows (command unknown at Update time; leave blank).
-                    let comp = Arc::new(BashExecutionComponent::new(""));
-                    comp.append_output(&chunk);
-                    chat.add_child(comp.clone());
-                    state
-                        .bash_components
-                        .lock()
-                        .unwrap()
-                        .insert(tool_call_id.clone(), comp);
+                    if has_partial_payload {
+                        bash.append_output(&chunk);
+                    }
+                } else if has_partial_payload {
+                    // ToolExecutionStart is emitted before a tool can run.
+                    // Ignore an out-of-order partial until that event gives us
+                    // the real command, rather than showing a spinner above an
+                    // empty `$ ` header. Normal updates are handled by the
+                    // component created in ToolExecutionStart.
                 }
             } else if let Some(comp) = state.tool_components.lock().unwrap().get(&tool_call_id) {
                 if let Some(skill) = skill_tool_name(&tool_name, &args) {
@@ -6413,17 +6517,22 @@ async fn handle_agent_event(
                 }
                 // Raw multi-line text — read/ls-style tools must show their
                 // full content, not the single-line ⏎-folded summary.
-                comp.set_result(&tool_result_text(&partial_result), false);
-                apply_edit_diff(comp, &tool_name, &partial_result.details, &tui);
-            } else {
+                if has_partial_payload {
+                    comp.set_result(&partial_text, false);
+                    apply_edit_diff(comp, &tool_name, &partial_result.details, &tui);
+                }
+            } else if has_partial_payload {
                 // No component yet — create a running one so the partial shows.
-                let comp = Arc::new(ToolExecutionComponent::new(&tool_name, ""));
+                // Empty callbacks are common before ToolExecutionStart; wait
+                // for Start so the first panel has the real arguments instead
+                // of an empty `TOOLS` box.
+                let comp = Arc::new(ToolExecutionComponent::new(&tool_name, &args.to_string()));
                 comp.set_expanded(*state.tool_outputs_expanded.lock().unwrap());
                 if let Some(skill) = skill_tool_name(&tool_name, &args) {
                     comp.set_skill_name(skill);
                 }
                 comp.set_running();
-                comp.set_result(&tool_result_text(&partial_result), false);
+                comp.set_result(&partial_text, false);
                 apply_edit_diff(&comp, &tool_name, &partial_result.details, &tui);
                 chat.add_child(comp.clone());
                 state
@@ -6442,6 +6551,9 @@ async fn handle_agent_event(
             result,
             is_error,
         } => {
+            if tool_name.trim().is_empty() {
+                return;
+            }
             if tool_name == "bash" {
                 let bash = state.bash_components.lock().unwrap().remove(&tool_call_id);
                 if let Some(bash) = bash {
@@ -6455,6 +6567,11 @@ async fn handle_agent_event(
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
+                    if command.trim().is_empty() && tool_result_text(&result).trim().is_empty() {
+                        state.sync_working_loader_with_bash();
+                        tui.request_render(false);
+                        return;
+                    }
                     let comp = Arc::new(BashExecutionComponent::new(command));
                     comp.set_expanded(*state.tool_outputs_expanded.lock().unwrap());
                     comp.append_output(&tool_result_text(&result));
@@ -6482,19 +6599,21 @@ async fn handle_agent_event(
     }
 }
 
-/// Return the diagnostic carried by a failed assistant message. Providers may
-/// omit `error_message`; keep a stable fallback so an error can never render as
-/// an empty transcript turn.
+/// Return the diagnostic carried by a failed or aborted provider request.
+/// Providers may omit `error_message`; keep a stable fallback so a terminal
+/// request failure can never render as an empty transcript turn.
 fn assistant_error_text(message: &rpi_ai::AssistantMessage) -> Option<String> {
-    if message.stop_reason != rpi_ai::StopReason::Error {
-        return None;
-    }
+    let fallback = match message.stop_reason {
+        rpi_ai::StopReason::Error => "Provider request failed.",
+        rpi_ai::StopReason::Aborted => "Request aborted.",
+        _ => return None,
+    };
     Some(
         message
             .error_message
             .as_deref()
             .filter(|text| !text.trim().is_empty())
-            .unwrap_or("Provider request failed.")
+            .unwrap_or(fallback)
             .to_string(),
     )
 }
@@ -6609,6 +6728,13 @@ fn tool_result_text(result: &rpi_agent::AgentToolResult) -> String {
         }
     }
     parts.join("\n")
+}
+
+/// Empty progress callbacks are valid (notably before a tool's start event),
+/// but they do not contain anything useful to render. Defer those callbacks so
+/// the first tool panel is created from `ToolExecutionStart` with real args.
+fn tool_update_has_payload(text: &str, result: &rpi_agent::AgentToolResult) -> bool {
+    !text.trim().is_empty() || !result.details.is_null()
 }
 
 // ===========================================================================
@@ -7178,12 +7304,22 @@ fn open_tools_selector(
     // runtime (it's called from the main loop's channel dispatch or the submit
     // closure that lives on the blocking thread — but `handle.block_on` is safe
     // because `get_active_tools` is std-Mutex-backed and finishes quickly).
-    let active = match tokio::runtime::Handle::try_current() {
+    let mut active = match tokio::runtime::Handle::try_current() {
         Ok(h) => h
             .block_on(async { lane.get_active_tools().await })
             .unwrap_or_default(),
         Err(_) => Vec::new(),
     };
+    // An empty active set is the harness sentinel for "all registered tools"
+    // (the selector only exposes built-ins). Expand it before rendering and
+    // toggling so the first `/tools` visit does not show every tool as off or
+    // accidentally reduce the active set to the one item selected.
+    if active.is_empty() {
+        active = crate::session::BUILTIN_TOOL_NAMES
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+    }
     let mut items: Vec<SelectItem> = Vec::new();
     for name in crate::session::BUILTIN_TOOL_NAMES {
         let on = active.iter().any(|a| a == name);
@@ -8191,11 +8327,11 @@ mod tests {
                     name: "rpi-search".into(),
                     current: "0.1.0".into(),
                     latest: "0.1.1".into(),
-                    command: "rpi package update".into(),
+                    command: "rpi pi-package update".into(),
                 },
             ],
             warnings: vec![crate::updates::UpdateWarning {
-                message: "The previously scheduled rpi self-update failed: access denied".into(),
+                message: "The previously scheduled rpi update failed: access denied".into(),
                 command: "rpi update".into(),
             }],
         };
@@ -8206,14 +8342,14 @@ mod tests {
         let plain = strip_ansi(&chat.render(80).join("\n"));
         assert!(plain.contains("Update Failed"), "{plain}");
         assert!(
-            plain.contains("self-update failed: access denied"),
+            plain.contains("rpi update failed: access denied"),
             "{plain}"
         );
         assert!(plain.contains("Update Available"), "{plain}");
         assert!(plain.contains("New version 0.1.11 is available"), "{plain}");
         assert!(plain.contains("rpi update"), "{plain}");
         assert!(plain.contains("Package Updates Available"), "{plain}");
-        assert!(plain.contains("rpi package update"), "{plain}");
+        assert!(plain.contains("rpi pi-package update"), "{plain}");
         assert!(plain.contains("- rpi-search 0.1.0 -> 0.1.1"), "{plain}");
     }
 
@@ -8245,6 +8381,51 @@ mod tests {
     fn welcome_capabilities_show_empty_state() {
         let plain = strip_ansi(&welcome_capability_line("Skills", &[]));
         assert_eq!(plain, "Skills (0) none");
+    }
+
+    #[test]
+    fn empty_tool_progress_is_deferred_until_start() {
+        let empty = rpi_agent::AgentToolResult::default();
+        assert!(!tool_update_has_payload("", &empty));
+
+        let text = rpi_agent::AgentToolResult::text("partial output");
+        assert!(tool_update_has_payload("partial output", &text));
+
+        let details = rpi_agent::AgentToolResult {
+            details: serde_json::json!({"path": "src/lib.rs"}),
+            ..Default::default()
+        };
+        assert!(tool_update_has_payload("", &details));
+    }
+
+    #[test]
+    fn completed_stream_reconciles_the_final_tail_before_detaching() {
+        let component = Arc::new(AssistantMessageComponent::new(
+            AssistantMessageOptions::default(),
+        ));
+        component.set_streaming(true);
+        component.update_blocks(&[AssistantBlock::Text("partial response".into())]);
+
+        let current = Mutex::new(Some(component.clone()));
+        let cached = Mutex::new("partial response".to_string());
+        let mut final_message = AssistantMessage::empty(rpi_ai::Api::Faux, "faux", "faux-model", 0);
+        final_message.content = vec![Content::text(
+            "partial response with the previously missing final tail",
+        )];
+        final_message.stop_reason = rpi_ai::types::StopReason::Stop;
+
+        reconcile_streamed_assistant_completion(&current, &cached, Some(&final_message));
+
+        assert!(current.lock().unwrap().is_none());
+        assert_eq!(
+            cached.lock().unwrap().as_str(),
+            "partial response with the previously missing final tail"
+        );
+        let rendered = strip_ansi(&component.render(100).join("\n"));
+        assert!(
+            rendered.contains("previously missing final tail"),
+            "{rendered}"
+        );
     }
 
     /// Reproduction for "Tab 补全了但显示没刷新": after `accept_top_suggestion`
@@ -8592,6 +8773,11 @@ mod tests {
         state.set_status(RunStatus::Idle);
         state.set_status(RunStatus::Working);
         assert_eq!(state.status_container.child_count(), 1);
+        assert!(state.footer.get_status().is_empty());
+        state.show_retry(3, 10, 8_000);
+        let retry_status = strip_ansi(&state.status_container.render(80).join("\n"));
+        assert!(retry_status.contains("Retrying (3/10)"));
+        state.set_status(RunStatus::Working);
         {
             let mut bash = state.bash_components.lock().unwrap();
             bash.insert(
@@ -8720,7 +8906,7 @@ mod tests {
     }
 
     #[test]
-    fn assistant_error_text_keeps_provider_diagnostic_visible() {
+    fn assistant_error_text_keeps_terminal_provider_diagnostic_visible() {
         use rpi_ai::types::{AssistantMessage, AssistantRole, StopReason, Usage};
 
         let failed = AssistantMessage {
@@ -8749,6 +8935,20 @@ mod tests {
         assert_eq!(
             assistant_error_text(&no_detail).as_deref(),
             Some("Provider request failed.")
+        );
+
+        let mut aborted = no_detail;
+        aborted.stop_reason = StopReason::Aborted;
+        aborted.error_message = Some("abort error: Request aborted".into());
+        assert_eq!(
+            assistant_error_text(&aborted).as_deref(),
+            Some("abort error: Request aborted")
+        );
+
+        aborted.error_message = None;
+        assert_eq!(
+            assistant_error_text(&aborted).as_deref(),
+            Some("Request aborted.")
         );
     }
 

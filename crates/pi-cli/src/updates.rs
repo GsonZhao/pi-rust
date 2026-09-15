@@ -723,7 +723,7 @@ fn report_from_cache_scope(
                         name: package.name.clone(),
                         current: current.into(),
                         latest: latest.into(),
-                        command: "rpi package update".into(),
+                        command: "rpi pi-package update".into(),
                     });
                 }
             }
@@ -750,7 +750,7 @@ fn report_from_cache_scope(
                     name: format!("{}/{}", git.host, git.path),
                     current: short_git_oid(&current),
                     latest: short_git_oid(&latest),
-                    command: "rpi package update".into(),
+                    command: "rpi pi-package update".into(),
                 });
             }
         }
@@ -2446,7 +2446,7 @@ fn consume_self_update_statuses(agent_dir: &Path) -> Vec<UpdateWarning> {
         if status.state == "failed" {
             warnings.push(UpdateWarning {
                 message: format!(
-                    "The previously scheduled rpi self-update failed: {}",
+                    "The previously scheduled rpi update failed: {}",
                     sanitized_self_update_status_message(&status.message)
                 ),
                 command: "rpi update".to_string(),
@@ -2812,7 +2812,7 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0]
             .message
-            .contains("self-update failed: permission [31m denied"));
+            .contains("rpi update failed: permission [31m denied"));
         assert!(!warnings[0].message.chars().any(char::is_control));
         assert_eq!(warnings[0].command, "rpi update");
         assert!(!failed.exists());

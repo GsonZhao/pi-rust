@@ -1,12 +1,21 @@
-# rpi — Rust port of the Pi agent SDK
+# rpi (pi-rust) — Rust-native coding-agent runtime
 
 [![rpi-cli on crates.io](https://img.shields.io/crates/v/rpi-cli.svg)](https://crates.io/crates/rpi-cli)
 [![rpi-plugin-sdk docs](https://docs.rs/rpi-plugin-sdk/badge.svg)](https://docs.rs/rpi-plugin-sdk)
 [![CI](https://github.com/bigfish1913/pi-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/bigfish1913/pi-rust/actions)
+[![GitHub stars](https://img.shields.io/github/stars/bigfish1913/pi-rust?style=flat)](https://github.com/bigfish1913/pi-rust/stargazers)
+[![Latest release](https://img.shields.io/github/v/release/bigfish1913/pi-rust)](https://github.com/bigfish1913/pi-rust/releases/latest)
 
-A Rust port of [earendil-works/pi](https://github.com/earendil-works/pi)'s SDK
-layer — a library-first, multi-crate workspace for building personal LLM coding
-agents in Rust, plus an `rpi` CLI built on top.
+`rpi` is a Rust-native, library-first coding-agent runtime and terminal CLI.
+It is a multi-crate Rust implementation of the
+[earendil-works/pi](https://github.com/earendil-works/pi) SDK layer for building
+composable LLM agents with providers, tools, sessions, and plugins.
+
+Repository: `bigfish1913/pi-rust` · Website: <https://rpi.laofu.online/>
+
+The project is useful both as a Rust Agent SDK and as a ready-to-run terminal
+coding agent. Core crates can be embedded independently; the `rpi` CLI provides
+the fastest way to try the complete loop.
 
 > **Naming.** The published crates use the `rpi-` prefix (the upstream `pi-*`
 > names are owned on crates.io by a parallel port). The on-disk directories stay
@@ -41,6 +50,14 @@ Dependency direction: `rpi-telemetry → rpi-ai → rpi-agent → rpi-tools → 
 The registry pages are the canonical entry points for installing the CLI or
 embedding the SDK. The repository may contain unreleased changes; check the
 published version shown on crates.io before depending on a new API.
+
+### Extension package repository
+
+Ready-to-install Rust-native extensions are maintained in the companion
+[`pi-rust/rpi-package`](https://github.com/pi-rust/rpi-package) repository.
+Browse its [`packages/`](https://github.com/pi-rust/rpi-package/tree/master/packages)
+directory for package source, usage documentation, and release metadata, or use
+the [online package catalog](https://rpi.laofu.online/packages.html).
 
 ## Relationship to the TypeScript source
 
@@ -145,6 +162,11 @@ release checklists.
 
 ### Load static Pi packages
 
+> **Beta notice:** JavaScript/TypeScript package loading through the Node host
+> and skill-invocation rendering in the TUI are experimental compatibility
+> features. They are suitable for local evaluation and feedback, but are not
+> recommended for production workloads and may change before stabilization.
+
 rpi can load Pi packages, including their static resources and executable
 JavaScript/TypeScript extensions. Install a package with:
 
@@ -168,7 +190,7 @@ under `.pi/npm` and `.pi/git`, while `--global` uses the configured rpi agent
 directory's `npm` and `git` stores. Local directories are enabled in place and
 are never copied or deleted. Existing legacy `.rpi/packages`, `.pi/packages`,
 and native `~/.pi/agent` installs remain discoverable. Package-manager argv is
-selected from trusted `.rpi/settings.json`, trusted `.pi/settings.json`, then
+selected from project `.rpi/settings.json`, project `.pi/settings.json`, then
 global `settings.json`; the default is npm. rpi treats the setting as structured
 argv rather than a shell command string, applies hardened encoding to Windows
 `.cmd` shims, and uses the native Pi flags for npm, pnpm, or bun.
@@ -302,14 +324,18 @@ The workspace `Taskfile.yml` is the canonical release entry point. Run
 publish-scoped token; crates.io records are permanent.
 
 ```bash
-task dry-run RELEASE_VERSION=0.1.12
-task publish RELEASE_VERSION=0.1.12
+task dry-run RELEASE_VERSION=0.1.18
+task publish RELEASE_VERSION=0.1.18
 ```
 
 Both commands require a clean worktree and one consistent version across all
 nine release crates. `task publish` runs the locked workspace test and check
 suites, publishes in dependency order, waits for each crate to reach the
 crates.io index, and safely resumes by skipping exact versions already present.
+
+## Star history
+
+[![Star History Chart](https://api.star-history.com/svg?repos=bigfish1913/pi-rust,pi-rust/rpi-package&type=Date)](https://www.star-history.com/#bigfish1913/pi-rust&pi-rust/rpi-package&Date)
 
 ## License
 

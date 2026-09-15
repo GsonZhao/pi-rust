@@ -6,8 +6,8 @@
 //! dep) that collects `messages`, `@file` attachments, known flags, and a map
 //! of *unknown* `--flags` (for extensions to claim later). This port keeps the
 //! same shape so the help text and flag semantics line up 1:1 with the
-//! reference. Unknown flags are *not* stored (there is no extension system in
-//! v1); they produce a warning diagnostic instead.
+//! reference. Unknown long flags are retained in [`Args::unknown_flags`] so a
+//! native extension can claim and consume its own CLI options after loading.
 //!
 //! Divergences from the TS parser (all deliberate v1 scope cuts, documented in
 //! `docs/m6-cli-open-questions.md`):
@@ -22,7 +22,9 @@
 //! - `--print`/`-p` may consume a following positional as its prompt (the TS
 //!   parser's `next !== undefined && !startsWith('@')` heuristic) — preserved.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use rpi_ai::ThinkingLevel;
 
@@ -81,16 +83,28 @@ pub enum Mode {
 
 /// Interactive TUI presentation mode. `fullscreen` uses the alternate screen
 /// buffer; `regular` renders into the terminal's normal scrollback.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TuiMode {
-    #[default]
     Fullscreen,
     Regular,
 }
 
-/// The parsed argument set. Mirrors TS `Args`. Fields absent in v1
-/// (`unknownFlags`, extension/resource discovery) are omitted; everything here
-/// is either honored or explicitly ignored-with-warning.
+const fn default_tui_mode_for(is_macos: bool) -> TuiMode {
+    if is_macos {
+        TuiMode::Regular
+    } else {
+        TuiMode::Fullscreen
+    }
+}
+
+impl Default for TuiMode {
+    fn default() -> Self {
+        default_tui_mode_for(cfg!(target_os = "macos"))
+    }
+}
+
+/// The parsed argument set. Mirrors TS `Args`. Unknown long flags are retained
+/// for extension consumption; unknown short flags remain hard errors.
 #[derive(Debug, Clone, Default)]
 pub struct Args {
     pub provider: Option<String>,
@@ -99,6 +113,8 @@ pub struct Args {
     /// `--base-url` — overrides `ANTHROPIC_BASE_URL` + each model's base URL,
     /// for third-party Anthropic-compatible gateways/proxies.
     pub base_url: Option<String>,
+    /// `--timeout <seconds>` overrides the deadline for each LLM API request.
+    pub timeout: Option<Duration>,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Vec<String>,
     /// `--theme` — built-in theme name or a static package theme name/path.
@@ -108,7 +124,8 @@ pub struct Args {
     pub print: bool,
     pub mode: Mode,
     /// `--tui-mode regular|fullscreen` controls the interactive terminal
-    /// buffer. The default remains fullscreen for compatibility with rpi.
+    /// buffer. macOS defaults to regular so native selection and terminal
+    /// scrollback remain available together; other platforms use fullscreen.
     pub tui_mode: TuiMode,
 
     /// `--list-models [search]`: list the merged model catalog and exit.
@@ -184,6 +201,12 @@ pub struct Args {
     /// directory (repeated).
     pub prompt_template: Vec<PathBuf>,
 
+    /// Internal scope set by `rpi dev-local` / `rpi dev --local-only`.
+    /// Only the freshly staged development extension and resources it
+    /// discovers are loaded; normal project/global/package discovery is
+    /// skipped. This is intentionally not parsed by the regular CLI parser.
+    pub dev_local_only: bool,
+
     pub verbose: bool,
     pub help: bool,
     pub version: bool,
@@ -202,6 +225,10 @@ pub struct Args {
     /// expand. Mirrors TS `fileArgs`.
     pub file_args: Vec<PathBuf>,
 
+    /// Extension-declared or otherwise unknown long flags. Values are either
+    /// JSON booleans (a bare flag) or strings (a flag with a value), matching
+    /// Pi's `unknownFlags` contract so an extension can claim its own options.
+    pub unknown_flags: BTreeMap<String, serde_json::Value>,
     /// Warnings about recognized-but-ignored flags (v1 scope cuts). Surfaced
     /// to the user on startup when `--verbose`.
     pub ignored: Vec<String>,
@@ -366,6 +393,18 @@ pub fn parse_args(args: &[String]) -> Args {
             "--model" => result.model = take_value(&mut result, "--model"),
             "--api-key" => result.api_key = take_value(&mut result, "--api-key"),
             "--base-url" => result.base_url = take_value(&mut result, "--base-url"),
+            "--timeout" => {
+                if let Some(v) = take_value(&mut result, "--timeout") {
+                    match v.parse::<u64>() {
+                        Ok(seconds) if seconds > 0 => {
+                            result.timeout = Some(Duration::from_secs(seconds));
+                        }
+                        _ => result.errors.push(format!(
+                            "Invalid --timeout \"{v}\". Expected a positive integer number of seconds"
+                        )),
+                    }
+                }
+            }
             "--system-prompt" => result.system_prompt = take_value(&mut result, "--system-prompt"),
             "--append-system-prompt" => {
                 if let Some(v) = take_value(&mut result, "--append-system-prompt") {
@@ -472,21 +511,24 @@ pub fn parse_args(args: &[String]) -> Args {
                 result.theme = take_value(&mut result, "--theme");
             }
             "--no-themes" => result.no_themes = true,
-            // Unknown long flag (with or without `=`). `flag_key` already holds
-            // the bare name, so both `--frobnicate` and `--frobnicate=x` land
-            // here; consume a value if the next token isn't a flag/file.
+            // Unknown long flag (with or without `=`). Preserve it for an
+            // extension to claim after extension registration, matching Pi's
+            // `unknownFlags` behavior. A bare flag is boolean true; a following
+            // non-flag token is its string value.
             other if other.starts_with("--") => {
                 let name = &flag_key;
-                if inline.is_none()
-                    && i + 1 < args.len()
+                let value = if let Some(value) = inline {
+                    serde_json::Value::String(value)
+                } else if i + 1 < args.len()
                     && !args[i + 1].starts_with('-')
                     && !args[i + 1].starts_with('@')
                 {
                     i += 1;
-                }
-                result
-                    .ignored
-                    .push(format!("{name} is not a recognized flag (ignored)"));
+                    serde_json::Value::String(args[i].clone())
+                } else {
+                    serde_json::Value::Bool(true)
+                };
+                result.unknown_flags.insert(name[2..].to_string(), value);
             }
             // Unknown short flag → hard error (mirrors TS).
             other if other.starts_with('-') && other.len() > 1 => {
@@ -549,9 +591,9 @@ pub enum RunMode {
 
 /// Print the help text to stdout. Mirrors TS `printHelp`, scoped to v1 flags.
 pub fn print_help() {
-    let builtin = "read, bash, edit, write";
+    let builtin = "read, bash, edit, write, docs";
     println!(
-        "{name} - AI coding assistant with read, bash, edit, write tools
+        "{name} - AI coding assistant with read, bash, edit, write, docs tools
 
 {u}Usage:{r}
   {name} [options] [@files...] [messages...]
@@ -561,16 +603,17 @@ pub fn print_help() {
   --model <pattern>              Model pattern or ID (supports \"provider/id\" and optional \":<thinking>\")
   --api-key <key>                API key override for the selected provider
   --base-url <url>               Override the selected model endpoint
+  --timeout <seconds>            LLM API request timeout (default: 600)
   --system-prompt <text>         Replace the default system prompt
   --append-system-prompt <text>  Append text to the system prompt (repeatable)
   --thinking <level>             off, minimal, low, medium, high, xhigh, max
   --mode <mode>                  Output mode: text (default), json, or rpc
-  --tui-mode <mode>              Interactive TUI buffer: regular or fullscreen
+  --tui-mode <mode>              TUI buffer: regular or fullscreen (macOS default: regular)
   --list-models [search]         List available models (with optional fuzzy search)
   --offline                      Disable startup network operations (same as PI_OFFLINE=1)
   --export <file>                Export a JSONL session to HTML and exit
-  --approve, -a                  Trust the current project for local resources
-  --no-approve, -na              Do not trust the current project
+  --approve, -a                  Force-enable current-project resources
+  --no-approve, -na              Disable current-project resources
   --print, -p                    Non-interactive: process prompt(s) and exit
   --continue, -c                 Continue the most recent session
   --resume, -r                   Browse and select a session to resume
@@ -581,7 +624,7 @@ pub fn print_help() {
   --tools, -t <list>             Comma-separated allowlist of tool names to enable
   --exclude-tools, -xt <list>    Comma-separated denylist of tool names to disable
   --no-tools, -nt                Disable all tools
-  --no-builtin-tools, -nbt       Disable the built-in tools (read, bash, edit, write)
+  --no-builtin-tools, -nbt       Disable the built-in tools (read, bash, edit, write, docs)
   --no-skills, -ns               Skip skill discovery (no <available_skills> block)
   --no-prompt-templates, -np     Skip prompt-template discovery (/expand templates)
   --no-context-files, -nc        Skip AGENTS.md/CLAUDE.md discovery (no <project_context>)
@@ -598,21 +641,24 @@ pub fn print_help() {
   update                       Update the rpi CLI from crates.io
   auth login|check|logout        Manage persisted credentials in ~/.rpi/auth.json
                                 (see `rpi auth --help`)
-  package list|add|remove|update Manage TS packages and Rust extensions
+  package list|add|remove|update Update Rust-native packages and manage Pi package settings
                                 (see `rpi package --help`)
   install <crate>                Build and install a Rust cdylib extension
                                 (see `rpi install --help`)
   install-pi <spec>              Install an npm/git/local Pi package
                                 (see `rpi install-pi --help`)
+  pi-package update             Update configured Pi npm/Git packages
   uninstall <crate>              Remove an installed Rust cdylib extension
                                 (use `rpi uninstall pi <spec>` for Pi packages)
   uninstall-pi <spec>            Remove an installed npm/git/local Pi package
                                 (see `rpi uninstall-pi --help`)
   dev [options]                  Build, watch, and hot-reload a Rust extension
                                 (see `rpi dev --help`)
+  dev-local [options]            Debug only the current Rust extension
+                                (shortcut for `rpi dev --local-only`)
 
 {u}Built-in Tools:{r}
-  {builtin}  (enabled by default; Pi-compatible default set)
+  {builtin}  (enabled by default)
 
 {u}Examples:{r}
   # Interactive with an initial prompt
@@ -744,10 +790,36 @@ mod tests {
     }
 
     #[test]
-    fn unknown_long_flag_warns_not_errors() {
+    fn unknown_long_flag_is_retained_for_extensions() {
         let a = parse_args(&s(&["--frobnicate", "value"]));
         assert!(a.errors.is_empty());
-        assert!(!a.ignored.is_empty());
+        assert_eq!(
+            a.unknown_flags.get("frobnicate"),
+            Some(&serde_json::Value::String("value".into()))
+        );
+        assert!(a.ignored.is_empty());
+    }
+
+    #[test]
+    fn unknown_long_boolean_flag_is_retained() {
+        let a = parse_args(&s(&["--server"]));
+        assert_eq!(
+            a.unknown_flags.get("server"),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn unknown_long_flags_keep_string_and_equals_values() {
+        let a = parse_args(&s(&["--port", "8080", "--bind=127.0.0.1"]));
+        assert_eq!(
+            a.unknown_flags.get("port"),
+            Some(&serde_json::Value::String("8080".into()))
+        );
+        assert_eq!(
+            a.unknown_flags.get("bind"),
+            Some(&serde_json::Value::String("127.0.0.1".into()))
+        );
     }
 
     #[test]
@@ -783,6 +855,26 @@ mod tests {
         let args = parse_args(&s(&["--offline"]));
         assert!(args.offline);
         assert!(args.ignored.is_empty());
+    }
+
+    #[test]
+    fn timeout_parses_seconds_in_separate_and_equals_forms() {
+        let separate = parse_args(&s(&["--timeout", "45"]));
+        assert!(separate.errors.is_empty());
+        assert_eq!(separate.timeout, Some(Duration::from_secs(45)));
+
+        let inline = parse_args(&s(&["--timeout=90"]));
+        assert!(inline.errors.is_empty());
+        assert_eq!(inline.timeout, Some(Duration::from_secs(90)));
+    }
+
+    #[test]
+    fn timeout_rejects_zero_and_invalid_values() {
+        for value in ["0", "1.5", "forever", "18446744073709551616"] {
+            let args = parse_args(&s(&[&format!("--timeout={value}")]));
+            assert_eq!(args.errors.len(), 1, "value: {value}");
+            assert!(args.timeout.is_none(), "value: {value}");
+        }
     }
 
     #[test]
@@ -978,6 +1070,12 @@ mod tests {
         );
         let invalid = parse_args(&s(&["--tui-mode", "split"]));
         assert!(!invalid.errors.is_empty());
+    }
+
+    #[test]
+    fn tui_mode_default_preserves_native_macos_scrollback() {
+        assert_eq!(default_tui_mode_for(true), TuiMode::Regular);
+        assert_eq!(default_tui_mode_for(false), TuiMode::Fullscreen);
     }
 
     #[test]

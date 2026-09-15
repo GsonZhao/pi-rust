@@ -13,15 +13,13 @@
 //! system prompt, while the invocation deliberately embeds raw `content` (the
 //! skill author controls it and the model must read full instructions verbatim).
 //!
-//! The TS `yaml` parse is replaced by a minimal YAML-subset parser
-//! ([`crate::frontmatter::parse_frontmatter`]); the loader honors `.gitignore`
-//! / `.ignore` / `.fdignore` via an `ignore`-pattern matcher (hand-ported; no
+//! Frontmatter is parsed as standard YAML by
+//! [`crate::frontmatter::parse_frontmatter`]; the loader honors `.gitignore` /
+//! `.ignore` / `.fdignore` via an `ignore`-pattern matcher (hand-ported; no
 //! `ignore` crate dep).
 //!
 //! v1 divergences from TS (see `docs/m5e-open-questions.md`):
-//! - YAML support is a subset (no anchors/block-sequences/multi-doc); malformed
-//!   frontmatter yields a `parse_failed` diagnostic, matching TS behavior for
-//!   the common cases.
+//! - Malformed frontmatter yields a `parse_failed` diagnostic, matching TS.
 //! - `loadSourcedSkills` is ported as a generic helper where the caller owns
 //!   the source type (Rust has no TS variadic generics); the `mapSkill` hook is
 //!   replaced by the caller post-mapping.

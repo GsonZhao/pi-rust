@@ -145,17 +145,19 @@ rpi install <crate>
 rpi install-pi <spec>
 rpi uninstall <crate>
 rpi uninstall-pi <spec>
-rpi update
+rpi update                 # 更新 rpi CLI 自身
+rpi package update         # 只更新 Rust 原生扩展
+rpi pi-package update      # 只更新 Pi npm/Git package
 ```
 
 ## 4. 内置工具
 
-默认工具与 Pi 保持一致，仅包含 `read`、`bash`、`edit`、`write`。此前 rpi 增加的 `docs`、`grep`、`find`、`ls`、`powershell` 工具暂不由 CLI 注册；对应 `rpi-tools` 库实现仍保留，避免破坏已有嵌入式调用者。
+默认工具包含 Pi 的 `read`、`bash`、`edit`、`write`，以及 rpi 自带的只读 `docs` 文档查询工具。`docs` 可以查询使用手册、扩展开发、Pi package、架构和兼容性说明；`grep`、`find`、`ls`、`powershell` 仍保留为库实现，但不由 CLI 默认注册。
 
 需要限制工具范围时，显式列出 Pi 的四个工具：
 
 ```bash
-rpi --tools read,bash,edit,write -p "检查并修改项目文件"
+rpi --tools read,bash,edit,write,docs -p "检查并修改项目文件"
 ```
 
 ## 5. 项目目录和资源优先级
@@ -201,6 +203,10 @@ RPI_CODING_AGENT_DIR=/work/rpi-agent rpi
 
 ## 6. Pi package
 
+> **Beta 功能提示：** Pi package 的 Node/JavaScript/TypeScript 扩展加载，以及
+> TUI 中的原生技能调用渲染，目前属于实验性兼容功能。建议仅用于本地评估和
+> 反馈收集，暂不建议用于生产环境；接口和行为可能在稳定前调整。
+
 ### 安装和管理
 
 支持 npm、Git 和本地 package：
@@ -244,12 +250,13 @@ rpi uninstall pi npm:@scope/package
 rpi package add ../my-pi-package
 rpi package list
 rpi package remove ../my-pi-package
-rpi package update
+rpi package update         # 只更新 Rust 原生扩展
+rpi pi-package update      # 只更新 Pi npm/Git package
 ```
 
 npm 和 Git 安装使用与原生 Pi 一致的托管布局：项目范围分别写入 `.pi/npm`、`.pi/git`，`--global` 则写入当前 rpi agent 配置目录下的 `npm`、`git`。本地目录只记录到 settings，不会复制，也不会在卸载时删除。旧版 `.rpi/packages`、`.pi/packages` 以及 `~/.pi/agent` 下的原生 Pi 安装仍可发现和迁移。
 
-`npmCommand` 是 argv 数组，不是 shell 字符串；依次选择已信任项目的 `.rpi/settings.json`、`.pi/settings.json`、全局 `settings.json`，都未配置时使用 npm。rpi 会按识别到的 npm、pnpm 或 bun 生成与原生 Pi 一致的 install/uninstall 参数。未信任项目的 settings 和 package 路径不会参与解析；无法安全验证的路径、来源或 manifest 会直接拒绝。Node.js 是运行 JS/TS extension 的必要条件。普通 rpi 命令不会加载这些 package，需显式传 `--enable-pi-packages`。
+`npmCommand` 是 argv 数组，不是 shell 字符串；依次选择项目 `.rpi/settings.json`、`.pi/settings.json`、全局 `settings.json`，都未配置时使用 npm。项目资源默认直接加载，不会弹出确认；需要临时禁用时使用 `--no-approve`，或在 TUI 中执行 `/trust no`。rpi 会按识别到的 npm、pnpm 或 bun 生成与原生 Pi 一致的 install/uninstall 参数。无法安全验证的路径、来源或 manifest 会直接拒绝。Node.js 是运行 JS/TS extension 的必要条件。普通 rpi 命令不会加载这些 package，需显式传 `--enable-pi-packages`。
 
 ### 静态资源
 

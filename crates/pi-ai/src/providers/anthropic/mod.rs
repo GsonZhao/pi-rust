@@ -253,7 +253,7 @@ async fn run_anthropic_stream(
     );
 
     let url = format!("{}/v1/messages", model.base_url.trim_end_matches('/'));
-    let timeout = opts.timeout;
+    let timeout = opts.request_timeout();
     let signal = opts.signal.clone();
 
     // ---- POST with retry (retryProviderRequest) ----
@@ -271,10 +271,7 @@ async fn run_anthropic_stream(
             let headers = headers.clone();
             let signal = signal.clone();
             async move {
-                let mut req = http.post(&url);
-                if let Some(t) = timeout {
-                    req = req.timeout(t);
-                }
+                let mut req = http.post(&url).timeout(timeout);
                 for (k, v) in &headers {
                     req = req.header(k.as_str(), v.as_str());
                 }
@@ -544,6 +541,10 @@ fn assemble_headers(
 ) -> Vec<(String, String)> {
     let mut headers: Vec<(String, String)> = Vec::new();
     headers.push(("accept".into(), "application/json".into()));
+    // Keep the request identity aligned with the working third-party
+    // Anthropic clients (including matrixcode). Some gateways use this
+    // identity when classifying requests from coding-agent clients.
+    headers.push(("user-agent".into(), "curl/8.0".into()));
     if std::env::var("RPI_ANTHROPIC_NON_STREAM").ok().as_deref() != Some("1") {
         headers.push((
             "anthropic-dangerous-direct-browser-access".into(),
@@ -660,6 +661,7 @@ mod tests {
         let headers = assemble_headers(&model, &opts, None, Some("sk-test"));
         let names: Vec<&str> = headers.iter().map(|(k, _)| k.as_str()).collect();
         assert!(names.contains(&"accept"));
+        assert!(names.contains(&"user-agent"));
         assert!(names.contains(&"anthropic-version"));
         assert!(names.contains(&"anthropic-dangerous-direct-browser-access"));
         assert!(names.contains(&"x-api-key"));
@@ -671,6 +673,12 @@ mod tests {
             .map(|(_, v)| v.as_str())
             .unwrap();
         assert_eq!(version, ANTHROPIC_VERSION);
+        let user_agent = headers
+            .iter()
+            .find(|(k, _)| k == "user-agent")
+            .map(|(_, v)| v.as_str())
+            .unwrap();
+        assert_eq!(user_agent, "curl/8.0");
     }
 
     #[test]

@@ -24,6 +24,17 @@ pub enum AgentEvent {
     AgentStart,
     /// Emitted once at the end of a run; carries the new messages produced.
     AgentEnd { messages: Vec<AgentMessage> },
+    /// Emitted after a retryable provider failure, before the backoff wait.
+    RetryScheduled {
+        /// One-based retry number (the initial request is not counted).
+        attempt: u32,
+        /// Maximum number of retries allowed for this request.
+        max_retries: u32,
+        /// Backoff duration before the next provider request.
+        delay_ms: u64,
+        /// Diagnostic from the failed provider request.
+        error: String,
+    },
     /// Emitted at the start of each turn (a turn = one assistant response + its
     /// tool calls/results).
     TurnStart,
@@ -74,6 +85,7 @@ impl AgentEvent {
         match self {
             AgentEvent::AgentStart => "agent_start",
             AgentEvent::AgentEnd { .. } => "agent_end",
+            AgentEvent::RetryScheduled { .. } => "retry_scheduled",
             AgentEvent::TurnStart => "turn_start",
             AgentEvent::TurnEnd { .. } => "turn_end",
             AgentEvent::MessageStart { .. } => "message_start",

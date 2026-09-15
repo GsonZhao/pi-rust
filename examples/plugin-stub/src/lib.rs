@@ -2,7 +2,7 @@
 //!
 //! This is the Part B2 ABI smoke target. The host loads it via `rpi-extensions`
 //! (`--extensions-dir examples/plugin-stub`'), which looks up
-//! `rpi_plugin_register` and calls it with the host vtable. In `register` this
+//! `rpi_plugin_register_v2` and calls it with the host vtable. In `register` this
 //! plugin:
 //!
 //! 1. Registers an **`echo`** tool — params `{ "text": string }`, returns that
@@ -38,8 +38,8 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use rpi_plugin_sdk::{
-    register_entrypoint, EventTag, FreeStringFn, PluginApiVt, StableToolSchema, StbString,
-    StbStringRef, StepHandle, StepResult, StepResultTag, ToolPartialCb, RPI_PLUGIN_ABI_VERSION,
+    EventTag, FreeStringFn, StableToolSchema, StbString, StbStringRef, StepHandle, StepResult,
+    StepResultTag, ToolPartialCb,
 };
 // The provider/render fn signatures are referenced transitively by the
 // `register_provider`/`register_markdown_transformer` vtable slots (the host
@@ -339,124 +339,117 @@ extern "C" fn on_markdown_transform(
 // The register entrypoint
 // ---------------------------------------------------------------------------
 
-/// The cdylib entrypoint the host looks up. `register_entrypoint` does the ABI
-/// version check (refuses on mismatch) + null-checks `api`, then runs our body.
-///
-/// Return 0 on success; nonzero ⇒ the host logs + skips this plugin.
-#[no_mangle]
-pub extern "C" fn rpi_plugin_register(api: *const PluginApiVt, abi_version: u32) -> i32 {
-    register_entrypoint(api, abi_version, |api| {
-        // Register the echo tool. Build an owning StableToolSchema (name +
-        // description + parameters-as-JSON); the host frees the schema's strings
-        // via our `plugin_free_string` after copying them out.
-        let schema = Box::new(StableToolSchema {
-            name: StbString::from_string("echo".to_string()),
-            description: StbString::from_string(
-                "Echoes back the provided text (a B2 ABI smoke-test tool).".to_string(),
-            ),
-            parameters: StbString::from_string(
-                r#"{"type":"object","properties":{"text":{"type":"string","description":"The text to echo back."}},"required":["text"]}"#
+// The SDK macro exports the ABI v2 `rpi_plugin_register_v2` symbol and applies
+// the version/null checks before running our registration body. Return 0 on
+// success; nonzero means the host logs and skips this plugin.
+rpi_plugin_sdk::export_plugin_v2!(|api| {
+    // Register the echo tool. Build an owning StableToolSchema (name +
+    // description + parameters-as-JSON); the host frees the schema's strings
+    // via our `plugin_free_string` after copying them out.
+    let schema = Box::new(StableToolSchema {
+        name: StbString::from_string("echo".to_string()),
+        description: StbString::from_string(
+            "Echoes back the provided text (a B2 ABI smoke-test tool).".to_string(),
+        ),
+        parameters: StbString::from_string(
+            r#"{"type":"object","properties":{"text":{"type":"string","description":"The text to echo back."}},"required":["text"]}"#
                     .to_string(),
-            ),
-        });
-        let schema_ptr = &*schema as *const StableToolSchema;
+        ),
+    });
+    let schema_ptr = &*schema as *const StableToolSchema;
 
-        let Some(register_tool) = api.register_tool else {
-            // Host not yet wiring tool registration — refuse so the host logs a
-            // diagnostic (should not happen against a B2+ host).
-            return 1;
-        };
-        let rc = register_tool(
-            schema_ptr,
-            echo_execute,
-            echo_poll,
-            echo_cancel,
-            echo_destroy,
-            plugin_free_string,
-        );
-        // The host copied the schema strings out + freed them via
-        // plugin_free_string inside the trampoline; we can drop our Box now
-        // (the StbStrings inside were already freed — dropping the Box just
-        // releases the container, the freed fields are Copy ptr+len, no double-free).
-        drop(schema);
-        if rc != 0 {
-            return rc;
-        }
+    let Some(register_tool) = api.register_tool else {
+        // Host not yet wiring tool registration — refuse so the host logs a
+        // diagnostic (should not happen against a B2+ host).
+        return 1;
+    };
+    let rc = register_tool(
+        schema_ptr,
+        echo_execute,
+        echo_poll,
+        echo_cancel,
+        echo_destroy,
+        plugin_free_string,
+    );
+    // The host copied the schema strings out + freed them via
+    // plugin_free_string inside the trampoline; we can drop our Box now
+    // (the StbStrings inside were already freed — dropping the Box just
+    // releases the container, the freed fields are Copy ptr+len, no double-free).
+    drop(schema);
+    if rc != 0 {
+        return rc;
+    }
 
-        // Register the MessageEnd event handler (the on() surface).
-        let Some(register_event_handler) = api.register_event_handler else {
-            return 2;
-        };
-        let rc = register_event_handler(EventTag::MessageEnd, on_message_end, std::ptr::null_mut());
-        if rc != 0 {
-            return rc;
-        }
+    // Register the MessageEnd event handler (the on() surface).
+    let Some(register_event_handler) = api.register_event_handler else {
+        return 2;
+    };
+    let rc = register_event_handler(EventTag::MessageEnd, on_message_end, std::ptr::null_mut());
+    if rc != 0 {
+        return rc;
+    }
 
-        // Register the resources_discover handler (B5b). The host stores our
-        // handler + our `plugin_free_string` (the `out` StbString we produce is
-        // plugin-owned; the host reclaims it via that fn) + our `user_data`. On
-        // discovery the host fans the event out to every registered handler and
-        // merges their returned `{skillPaths, promptPaths, themePaths}`.
-        let Some(register_resources_discover) = api.register_resources_discover else {
-            // Host without the discover path — degrade (the smoke test host
-            // always wires it; a non-wiring host logs + we continue).
-            return 3;
-        };
-        let rc = register_resources_discover(
-            on_resources_discover,
-            plugin_free_string,
-            std::ptr::null_mut(),
-        );
-        if rc != 0 {
-            return rc;
-        }
+    // Register the resources_discover handler (B5b). The host stores our
+    // handler + our `plugin_free_string` (the `out` StbString we produce is
+    // plugin-owned; the host reclaims it via that fn) + our `user_data`. On
+    // discovery the host fans the event out to every registered handler and
+    // merges their returned `{skillPaths, promptPaths, themePaths}`.
+    let Some(register_resources_discover) = api.register_resources_discover else {
+        // Host without the discover path — degrade (the smoke test host
+        // always wires it; a non-wiring host logs + we continue).
+        return 3;
+    };
+    let rc = register_resources_discover(
+        on_resources_discover,
+        plugin_free_string,
+        std::ptr::null_mut(),
+    );
+    if rc != 0 {
+        return rc;
+    }
 
-        // Register a custom provider (B5c). The host wraps `on_provider_request`
-        // in a `PluggableProvider` impl of `rpi_ai::Provider` and injects it into
-        // `AgentHarnessOptions.models`; a catalog model whose `provider` field is
-        // `"stub-provider"` routes to it. The host calls `request_fn` on
-        // `spawn_blocking` (it's sync), reclaims the plugin-owned `out` via our
-        // `plugin_free_string`, parses it as an assistant message, emits it as one
-        // terminal chunk.
-        let Some(register_provider) = api.register_provider else {
-            // Host without the provider path — degrade.
-            return 4;
-        };
-        let rc = register_provider(
-            StbStringRef::from_str("stub-provider"),
-            StbStringRef::from_str("https://stub.example"),
-            StbStringRef::from_str("faux"),
-            on_provider_request,
-            plugin_free_string,
-            std::ptr::null_mut(),
-        );
-        if rc != 0 {
-            return rc;
-        }
+    // Register a custom provider (B5c). The host wraps `on_provider_request`
+    // in a `PluggableProvider` impl of `rpi_ai::Provider` and injects it into
+    // `AgentHarnessOptions.models`; a catalog model whose `provider` field is
+    // `"stub-provider"` routes to it. The host calls `request_fn` on
+    // `spawn_blocking` (it's sync), reclaims the plugin-owned `out` via our
+    // `plugin_free_string`, parses it as an assistant message, emits it as one
+    // terminal chunk.
+    let Some(register_provider) = api.register_provider else {
+        // Host without the provider path — degrade.
+        return 4;
+    };
+    let rc = register_provider(
+        StbStringRef::from_str("stub-provider"),
+        StbStringRef::from_str("https://stub.example"),
+        StbStringRef::from_str("faux"),
+        on_provider_request,
+        plugin_free_string,
+        std::ptr::null_mut(),
+    );
+    if rc != 0 {
+        return rc;
+    }
 
-        // Register a markdown transformer (B5c). The host records it now; TUI
-        // consumption is B5e (the render path calls `RenderFn` at display time).
-        // We register one to prove the registrar + registry storage + snapshot
-        // exposure round-trips.
-        let Some(register_markdown_transformer) = api.register_markdown_transformer else {
-            return 5;
-        };
-        let rc = register_markdown_transformer(
-            StbStringRef::from_str("stub-uppercase"),
-            on_markdown_transform,
-            plugin_free_string,
-            std::ptr::null_mut(),
-        );
-        if rc != 0 {
-            return rc;
-        }
+    // Register a markdown transformer (B5c). The host records it now; TUI
+    // consumption is B5e (the render path calls `RenderFn` at display time).
+    // We register one to prove the registrar + registry storage + snapshot
+    // exposure round-trips.
+    let Some(register_markdown_transformer) = api.register_markdown_transformer else {
+        return 5;
+    };
+    let rc = register_markdown_transformer(
+        StbStringRef::from_str("stub-uppercase"),
+        on_markdown_transform,
+        plugin_free_string,
+        std::ptr::null_mut(),
+    );
+    if rc != 0 {
+        return rc;
+    }
 
-        // RPI_PLUGIN_ABI_VERSION referenced here so a future `pub use` doesn't
-        // trip an unused-import when the version check moves fully into the SDK.
-        let _ = RPI_PLUGIN_ABI_VERSION;
-        0
-    })
-}
+    0
+});
 
 // ---------------------------------------------------------------------------
 // Small helpers

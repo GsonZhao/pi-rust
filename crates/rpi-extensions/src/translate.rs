@@ -5,10 +5,9 @@
 //! dispatch wrapped in `catch_unwind` (a panicky plugin handler must not unwind
 //! across FFI).
 //!
-//! The 10 already-emitted `AgentEvent` variants fold into their matching
-//! `StablePluginEvent` tags now. The remaining `on()` tags (33 total) light up
-//! as B3/B4/B5 add the emission points. Tags with no registered handlers are a
-//! cheap no-op (empty slice → no dispatch).
+//! The 10 stable lifecycle `AgentEvent` variants fold into their matching
+//! `StablePluginEvent` tags. Internal host events such as retry scheduling are
+//! intentionally not projected onto the fixed 33-tag plugin ABI.
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
@@ -21,14 +20,15 @@ use crate::host_free_string;
 use crate::registry::RegistrySnapshot;
 
 /// Map a native [`AgentEvent`] to its pi `on()` [`EventTag`], or `None` if the
-/// host event has no stable-event counterpart (e.g. some internal-only variants
-/// — none today, all 10 map). This is the **fold** described in the crate docs:
-/// the ten `AgentEvent` variants map onto the 10 matching tags; the rest of the
-/// 33-category surface is driven by direct host emission in B3+.
+/// host event has no stable-event counterpart. This is the **fold** described
+/// in the crate docs: the ten stable lifecycle variants map onto matching tags;
+/// internal retry scheduling stays host-only, and the rest of the 33-category
+/// surface is driven by direct host emission in B3+.
 pub fn event_tag_for(event: &AgentEvent) -> Option<EventTag> {
     match event {
         AgentEvent::AgentStart => Some(EventTag::AgentStart),
         AgentEvent::AgentEnd { .. } => Some(EventTag::AgentEnd),
+        AgentEvent::RetryScheduled { .. } => None,
         AgentEvent::TurnStart => Some(EventTag::TurnStart),
         AgentEvent::TurnEnd { .. } => Some(EventTag::TurnEnd),
         AgentEvent::MessageStart { .. } => Some(EventTag::MessageStart),
@@ -102,6 +102,8 @@ pub fn translate(event: &AgentEvent) -> Option<StablePluginEvent> {
         | AgentEvent::TurnStart
         | AgentEvent::AgentEnd { .. }
         | AgentEvent::TurnEnd { .. } => Some(StablePluginEvent::empty(tag)),
+
+        AgentEvent::RetryScheduled { .. } => None,
     }
 }
 
@@ -493,6 +495,13 @@ mod tests {
             event_tag_for(&events[7]),
             Some(EventTag::ToolExecutionStart)
         );
+        assert!(event_tag_for(&AgentEvent::RetryScheduled {
+            attempt: 1,
+            max_retries: 10,
+            delay_ms: 2_000,
+            error: "503".into(),
+        })
+        .is_none());
     }
 
     #[test]

@@ -61,15 +61,16 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex};
 
 use rpi_plugin_sdk::{
-    EventHandlerFn, EventTag, FreeStringFn, PluginApiVt, ProviderRequestFn, RenderFn,
-    ResourcesDiscoverFn, RuntimeActionFn, StablePluginEvent, StableToolSchema, StbString,
-    StbStringRef, ToolCancelFn, ToolDestroyFn, ToolExecuteFn, ToolPollFn,
+    EventHandlerFn, EventTag, FreeStringFn, LegacyPluginApiV1, LegacyRuntimeActionFn, PluginApiVt,
+    ProviderRequestFn, RenderFn, ResourcesDiscoverFn, RuntimeActionFn, StablePluginEvent,
+    StableToolSchema, StbString, StbStringRef, ToolCancelFn, ToolDestroyFn, ToolExecuteFn,
+    ToolPollFn,
 };
 use thiserror::Error;
 
 pub use actions::{
-    reload_callback_from_mailbox, trampoline_runtime_action, ActionBridge, ReloadMailbox,
-    RuntimeActionHost,
+    reload_callback_from_mailbox, trampoline_runtime_action, trampoline_runtime_action_v1,
+    ActionBridge, ReloadMailbox, RuntimeActionHost,
 };
 pub use loader::{
     load_dir, load_one, load_session, load_session_mixed, merge_registries, ExtensionSession,
@@ -78,9 +79,9 @@ pub use loader::{
 pub use provider::PluggableProvider;
 pub use provider_hooks::ExtensionProviderHooks;
 pub use registry::{
-    assert_active, ExtensionRegistry, ExtensionTool, RegisteredHandler, RegisteredProvider,
-    RegisteredRenderer, RegisteredRendererKind, RegistryEntry, RegistrySnapshot,
-    ResourcesDiscoverHandler,
+    assert_active, ExtensionRegistry, ExtensionTool, RegisteredFlag, RegisteredHandler,
+    RegisteredProvider, RegisteredRenderer, RegisteredRendererKind, RegistryEntry,
+    RegistrySnapshot, ResourcesDiscoverHandler,
 };
 pub use resources::{emit_resources_discover, DiscoveredResources};
 pub use tool::{PluginToolAdapter, PluginToolHandle};
@@ -166,15 +167,15 @@ pub struct HostApi {
     /// B5a: the plugin→host action bridge, carried in
     /// [`PluginApiVt::user_data`] so [`trampoline_runtime_action`] can recover
     /// the harness state from ANY thread a plugin calls from (post-register, no
-    /// thread-local). `None` keeps the v1 stub `runtime_action` and the register
-    /// `user_data` (the `HostApi` pointer) — so older call sites that don't pass
-    /// a bridge behave exactly as before.
+    /// thread-local). `None` keeps the no-bridge stub `runtime_action` and the
+    /// register `user_data` (the `HostApi` pointer) — so older call sites that
+    /// don't pass a bridge behave exactly as before.
     action_bridge: Option<Arc<ActionBridge>>,
 }
 
 impl HostApi {
-    /// Build a fresh host API bound to the given registry + diagnostics. v1
-    /// (no action bridge): `runtime_action` stays the stub returning `-1`.
+    /// Build a fresh host API bound to the given registry + diagnostics. With
+    /// no action bridge, `runtime_action` stays the stub returning `-1`.
     pub fn new(registry: ExtensionRegistry, diagnostics: Arc<dyn PluginDiagnostics>) -> Arc<Self> {
         Arc::new(Self {
             registry: Mutex::new(Some(registry)),
@@ -213,14 +214,14 @@ impl HostApi {
         self.registry.lock().expect("host api registry lock").take()
     }
 
-    /// Build the C vtable the host passes to a plugin's `rpi_plugin_register`.
+    /// Build the ABI v2 C vtable passed to `rpi_plugin_register_v2`.
     ///
     /// Every optional registrar slot currently resolves to a real `extern "C"`
     /// trampoline that forwards into `self`'s registry (so a plugin that calls
     /// `register_tool` / `register_command` / renderer registration now sees
     /// its registration land). `runtime_action` resolves
     /// to the real [`trampoline_runtime_action`] when a bridge is present (B5a),
-    /// else the stub returning `-1` (v1).
+    /// else the stub returning `-1`.
     ///
     /// **`user_data`**: the register trampolines recover host state via the
     /// thread-local `CURRENT_HOST_API` (set for the duration of register in
@@ -265,10 +266,38 @@ impl HostApi {
             user_data: ud,
         }
     }
+
+    /// Build the frozen ABI v1 view used only for a plugin exporting the legacy
+    /// `rpi_plugin_register` symbol. Its runtime-action slot rejects ids above
+    /// the v1 range before dispatch.
+    pub fn build_legacy_vtable(self: &Arc<Self>) -> LegacyPluginApiV1 {
+        let v2 = self.build_vtable();
+        let legacy_runtime_action = if self.action_bridge.is_some() {
+            trampoline_runtime_action_v1 as LegacyRuntimeActionFn
+        } else {
+            stub_runtime_action as LegacyRuntimeActionFn
+        };
+        LegacyPluginApiV1 {
+            free_string: v2.free_string,
+            register_tool: v2.register_tool,
+            register_command: v2.register_command,
+            register_shortcut: v2.register_shortcut,
+            register_flag: v2.register_flag,
+            register_provider: v2.register_provider,
+            register_message_renderer: v2.register_message_renderer,
+            register_markdown_transformer: v2.register_markdown_transformer,
+            register_entry_renderer: v2.register_entry_renderer,
+            register_event_handler: v2.register_event_handler,
+            register_resources_discover: v2.register_resources_discover,
+            runtime_action: legacy_runtime_action,
+            dispatch_event: v2.dispatch_event,
+            user_data: v2.user_data,
+        }
+    }
 }
 
-// Thread-local "current host api" for the duration of a `rpi_plugin_register`
-// call. Set by [`load_one`] before calling register, cleared after. This is the
+// Thread-local "current host api" for the duration of a plugin register call.
+// Set by [`load_one`] before calling register, cleared after. This is the
 // sound way to let `extern "C" fn` trampolines (which cannot capture) reach the
 // host's registry: the register call is synchronous and single-threaded per
 // plugin, so a thread-local is unambiguous.
@@ -414,9 +443,28 @@ extern "C" fn trampoline_register_shortcut(_key: StbStringRef, _description: Stb
     0
 }
 
-extern "C" fn trampoline_register_flag(_name: StbStringRef, _description: StbStringRef) -> i32 {
-    with_current_api(|api| api.diagnostics.unsupported("register_flag (CLI args — B5)"));
-    0
+extern "C" fn trampoline_register_flag(name: StbStringRef, description: StbStringRef) -> i32 {
+    if !current_api_present() {
+        return -1;
+    }
+    // SAFETY: the plugin guarantees these borrowed refs are valid for the
+    // duration of the registration call; copy them before returning.
+    let (name, description) =
+        unsafe { (name.as_str().to_string(), description.as_str().to_string()) };
+    if name.trim().is_empty() || name.starts_with('-') || name.contains('=') || name.contains(' ') {
+        return 2;
+    }
+    let ok = with_current_api(|api| {
+        match api.with_registry(|reg| reg.register_flag(name, description)) {
+            Some(_) => true,
+            None => false,
+        }
+    });
+    if ok == Some(true) {
+        0
+    } else {
+        -1
+    }
 }
 
 extern "C" fn trampoline_register_event_handler(
@@ -597,12 +645,12 @@ extern "C" fn trampoline_register_resources_discover(
     }
 }
 
-/// v1 fallback: kept for [`HostApi`]s built without an [`ActionBridge`] (the
-/// old `HostApi::new` path). Return -1 (`EPERM`-ish) so a plugin can detect
+/// Fallback for [`HostApi`]s built without an [`ActionBridge`] (the
+/// `HostApi::new` path). Return -1 (`EPERM`-ish) so a plugin can detect
 /// "unsupported" without crashing. When a bridge is present, `build_vtable`
 /// installs [`trampoline_runtime_action`] instead.
 extern "C" fn stub_runtime_action(
-    _action: rpi_plugin_sdk::RuntimeActionId,
+    _action_id: u32,
     _args: StbStringRef,
     _out: *mut StbString,
     _user_data: *mut c_void,

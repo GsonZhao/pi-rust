@@ -1080,9 +1080,10 @@ async fn run_stream(
     }
     let body = build_request(model, ctx, opts);
     let url = responses_url(&model.base_url);
+    let timeout = opts.request_timeout();
     let signal = opts.signal.clone();
     let response = retry_provider_request(move || { let http=http.clone(); let url=url.clone(); let body=body.clone(); let headers=headers.clone(); let signal=signal.clone(); async move {
-        let mut req=http.post(&url).json(&body); if let Some(t)=opts.timeout { req=req.timeout(t); } for (k,v) in headers { req=req.header(k,v); }
+        let mut req=http.post(&url).json(&body).timeout(timeout); for (k,v) in headers { req=req.header(k,v); }
         let response = tokio::select! { r=req.send()=>r.map_err(|e| AiError::Http{status:None,message:e.to_string()})?, _=signal.cancelled()=>return Err(AiError::Abort{message:"Request aborted".into()})};
         if response.status().is_success() { Ok(response) } else { let status=response.status().as_u16(); let msg=response.text().await.unwrap_or_default(); Err(AiError::Http{status:Some(status),message:msg}) }
     }}, opts.max_retries, opts.max_retry_delay, &opts.signal).await;

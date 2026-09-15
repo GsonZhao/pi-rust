@@ -1072,7 +1072,10 @@ try {
   try {
     const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
     const globalRoot = (await import('node:child_process')).execFileSync(npm, ['root', '-g'], { encoding: 'utf8' }).trim();
-    collect(globalRoot, 3);
+    // The global root can be very large (npm itself is commonly installed
+    // there). Direct package roots are sufficient: createRequire from a
+    // package root still resolves that package's nested dependencies.
+    collect(globalRoot, 0);
   } catch {}
   if (moduleRoots.length) {
     process.env.NODE_PATH = [...new Set([process.env.NODE_PATH || '', ...moduleRoots].filter(Boolean))].join(path.delimiter);
