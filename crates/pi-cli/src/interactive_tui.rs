@@ -5875,10 +5875,33 @@ fn launch_external_editor(draft: String, tx: mpsc::UnboundedSender<TuiMessage>) 
     });
 }
 
+/// Apply the authoritative run result when it wins the race with the async
+/// event drain, then detach the live component from further partial updates.
+fn reconcile_streamed_assistant_completion(
+    current_assistant: &Mutex<Option<Arc<AssistantMessageComponent>>>,
+    last_assistant_text: &Mutex<String>,
+    final_message: Option<&AssistantMessage>,
+) {
+    let final_blocks = final_message.map(assistant_blocks);
+    let final_text = final_message.map(assistant_text);
+    let component = current_assistant.lock().unwrap().take();
+
+    if let Some(component) = component {
+        if let Some(blocks) = final_blocks.as_deref() {
+            component.update_blocks(blocks);
+        }
+        component.set_streaming(false);
+    }
+
+    if let Some(text) = final_text.filter(|text| !text.is_empty()) {
+        *last_assistant_text.lock().unwrap() = text;
+    }
+}
+
 /// Drive a single prompt through the lane. When `streaming` is true, the
-/// `AgentEvent` drain task renders the response live and this function only
-/// awaits completion (to surface hard errors). When false (no `event_rx`),
-/// it falls back to the blocking await-final-text path.
+/// `AgentEvent` drain task renders the response live and the completed outcome
+/// reconciles its final snapshot. When false (no `event_rx`), this falls back
+/// to the blocking await-final-text path.
 async fn run_prompt_streaming(
     lane: &Arc<dyn AgentLane>,
     prompt: &str,
@@ -5908,14 +5931,25 @@ async fn run_prompt_streaming(
 
     let outcome = lane.prompt_text(prompt, images).await;
 
-    // The drain task finalized the assistant message via MessageEnd/AgentEnd,
-    // but guard against runs that ended without a terminal event (e.g. a hard
-    // provider rejection before any streaming) by clearing streaming state.
-    {
-        let mut cur = state.current_assistant.lock().unwrap();
-        if let Some(comp) = cur.take() {
-            comp.set_streaming(false);
-        }
+    if streaming {
+        // Broadcast delivery is asynchronous: the harness result can resolve
+        // before the drain task processes MessageEnd. Reconcile from the
+        // authoritative outcome before detaching the component so the final
+        // streamed tail cannot be left at an earlier partial snapshot.
+        let final_message = match &outcome {
+            Ok(result) => match &result.outcome {
+                HarnessRunOutcome::Completed { final_message, .. }
+                | HarnessRunOutcome::Aborted { final_message, .. } => Some(final_message),
+                HarnessRunOutcome::Failed { final_message, .. } => final_message.as_ref(),
+                HarnessRunOutcome::Suspended { .. } => None,
+            },
+            Err(_) => None,
+        };
+        reconcile_streamed_assistant_completion(
+            &state.current_assistant,
+            &state.last_assistant_text,
+            final_message,
+        );
     }
 
     state.set_status(RunStatus::Idle);
@@ -8362,6 +8396,36 @@ mod tests {
             ..Default::default()
         };
         assert!(tool_update_has_payload("", &details));
+    }
+
+    #[test]
+    fn completed_stream_reconciles_the_final_tail_before_detaching() {
+        let component = Arc::new(AssistantMessageComponent::new(
+            AssistantMessageOptions::default(),
+        ));
+        component.set_streaming(true);
+        component.update_blocks(&[AssistantBlock::Text("partial response".into())]);
+
+        let current = Mutex::new(Some(component.clone()));
+        let cached = Mutex::new("partial response".to_string());
+        let mut final_message = AssistantMessage::empty(rpi_ai::Api::Faux, "faux", "faux-model", 0);
+        final_message.content = vec![Content::text(
+            "partial response with the previously missing final tail",
+        )];
+        final_message.stop_reason = rpi_ai::types::StopReason::Stop;
+
+        reconcile_streamed_assistant_completion(&current, &cached, Some(&final_message));
+
+        assert!(current.lock().unwrap().is_none());
+        assert_eq!(
+            cached.lock().unwrap().as_str(),
+            "partial response with the previously missing final tail"
+        );
+        let rendered = strip_ansi(&component.render(100).join("\n"));
+        assert!(
+            rendered.contains("previously missing final tail"),
+            "{rendered}"
+        );
     }
 
     /// Reproduction for "Tab 补全了但显示没刷新": after `accept_top_suggestion`
