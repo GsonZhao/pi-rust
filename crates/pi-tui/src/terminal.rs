@@ -13,6 +13,16 @@ use crossterm::{
 };
 use thiserror::Error;
 
+/// Mouse tracking prevents native text selection in macOS terminal emulators.
+/// RPI only consumes wheel events, so keep the platform default selectable.
+const fn mouse_tracking_enabled_for(is_macos: bool) -> bool {
+    !is_macos
+}
+
+const fn mouse_tracking_enabled_by_default() -> bool {
+    mouse_tracking_enabled_for(cfg!(target_os = "macos"))
+}
+
 /// Errors that can occur during terminal operations.
 #[derive(Debug, Error)]
 pub enum TerminalError {
@@ -151,6 +161,14 @@ impl ProcessTerminal {
             }
         }
     }
+
+    fn configure_mouse_tracking(&self) {
+        if mouse_tracking_enabled_by_default() {
+            self.enable_mouse();
+        } else {
+            self.disable_mouse();
+        }
+    }
 }
 
 impl Default for ProcessTerminal {
@@ -205,7 +223,7 @@ impl Terminal for ProcessTerminal {
         if let Ok(mut running) = self.running.lock() {
             *running = true;
         }
-        self.enable_mouse();
+        self.configure_mouse_tracking();
         self.hide_cursor();
         self.update_size();
         self.flush();
@@ -227,8 +245,7 @@ impl Terminal for ProcessTerminal {
             *running = true;
         }
 
-        // Enable mouse
-        self.enable_mouse();
+        self.configure_mouse_tracking();
         self.hide_cursor();
         self.flush();
 
@@ -310,5 +327,16 @@ impl Terminal for ProcessTerminal {
         if let Ok(mut writer) = self.writer.lock() {
             let _ = writer.flush();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mouse_tracking_enabled_for;
+
+    #[test]
+    fn mouse_tracking_default_preserves_native_selection_on_macos() {
+        assert!(!mouse_tracking_enabled_for(true));
+        assert!(mouse_tracking_enabled_for(false));
     }
 }

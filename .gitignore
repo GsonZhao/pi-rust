@@ -12,3 +12,12 @@ task-*.log
 release-*.log
 .claude/*
 target/*
+
+# Static frontend deployment bundle
+.deploy/
+.codegraph
+.rpi/*
+!.rpi/skills/
+.rpi/skills/*
+!.rpi/skills/rpi-extension-authoring/
+!.rpi/skills/rpi-extension-authoring/SKILL.md

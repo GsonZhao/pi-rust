@@ -1,8 +1,21 @@
-# rpi — Rust port of the Pi agent SDK
+# rpi (pi-rust) — Rust-native coding-agent runtime
 
-A Rust port of [earendil-works/pi](https://github.com/earendil-works/pi)'s SDK
-layer — a library-first, multi-crate workspace for building personal LLM coding
-agents in Rust, plus an `rpi` CLI built on top.
+[![rpi-cli on crates.io](https://img.shields.io/crates/v/rpi-cli.svg)](https://crates.io/crates/rpi-cli)
+[![rpi-plugin-sdk docs](https://docs.rs/rpi-plugin-sdk/badge.svg)](https://docs.rs/rpi-plugin-sdk)
+[![CI](https://github.com/bigfish1913/pi-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/bigfish1913/pi-rust/actions)
+[![GitHub stars](https://img.shields.io/github/stars/bigfish1913/pi-rust?style=flat)](https://github.com/bigfish1913/pi-rust/stargazers)
+[![Latest release](https://img.shields.io/github/v/release/bigfish1913/pi-rust)](https://github.com/bigfish1913/pi-rust/releases/latest)
+
+`rpi` is a Rust-native, library-first coding-agent runtime and terminal CLI.
+It is a multi-crate Rust implementation of the
+[earendil-works/pi](https://github.com/earendil-works/pi) SDK layer for building
+composable LLM agents with providers, tools, sessions, and plugins.
+
+Repository: `bigfish1913/pi-rust` · Website: <https://rpi.laofu.online/>
+
+The project is useful both as a Rust Agent SDK and as a ready-to-run terminal
+coding agent. Core crates can be embedded independently; the `rpi` CLI provides
+the fastest way to try the complete loop.
 
 > **Naming.** The published crates use the `rpi-` prefix (the upstream `pi-*`
 > names are owned on crates.io by a parallel port). The on-disk directories stay
@@ -16,11 +29,35 @@ agents in Rust, plus an `rpi` CLI built on top.
 | `rpi-telemetry`   | `pi-telemetry/`  | Telemetry span/event contracts (noop default).                      |
 | `rpi-ai`          | `pi-ai/`         | Unified multi-provider LLM types + streaming (Anthropic + faux).    |
 | `rpi-agent`       | `pi-agent/`      | Agent runtime + loop, `AgentTool` trait, events, hooks, queues.     |
-| `rpi-tools`       | `pi-tools/`      | Built-in tools (`read`/`write`/`edit`/`bash`/`grep`/`find`/`ls`) + `ExecutionEnv`. |
+| `rpi-tools`       | `pi-tools/`      | Pi-compatible coding tools (`read`/`write`/`edit`/`bash`) + `ExecutionEnv`. |
 | `rpi-harness`     | `pi-harness/`    | `AgentHarness`: session tree, JSONL persistence, compaction, run loop. |
 | `rpi-cli`         | `pi-cli/`        | Terminal coding-agent CLI (`rpi` binary) on top of the library crates. |
+| `rpi-plugin-sdk`   | `rpi-plugin-sdk/` | Stable C ABI for Rust-native plugins and extension discovery.        |
+| `rpi-extensions`   | `rpi-extensions/` | Dynamic plugin loader and `AgentTool` adapter.                       |
+| `rpi-tui`          | `pi-tui/`        | Terminal UI primitives used by the interactive CLI.                 |
 
 Dependency direction: `rpi-telemetry → rpi-ai → rpi-agent → rpi-tools → rpi-harness → rpi-cli`.
+
+### Rust registry links
+
+| Package | crates.io | docs.rs |
+| --- | --- | --- |
+| `rpi-cli` | [crates.io](https://crates.io/crates/rpi-cli) | [docs.rs](https://docs.rs/rpi-cli) |
+| `rpi-agent` | [crates.io](https://crates.io/crates/rpi-agent) | [docs.rs](https://docs.rs/rpi-agent) |
+| `rpi-plugin-sdk` | [crates.io](https://crates.io/crates/rpi-plugin-sdk) | [docs.rs](https://docs.rs/rpi-plugin-sdk) |
+| `rpi-extensions` | [crates.io](https://crates.io/crates/rpi-extensions) | [docs.rs](https://docs.rs/rpi-extensions) |
+
+The registry pages are the canonical entry points for installing the CLI or
+embedding the SDK. The repository may contain unreleased changes; check the
+published version shown on crates.io before depending on a new API.
+
+### Extension package repository
+
+Ready-to-install Rust-native extensions are maintained in the companion
+[`pi-rust/rpi-package`](https://github.com/pi-rust/rpi-package) repository.
+Browse its [`packages/`](https://github.com/pi-rust/rpi-package/tree/master/packages)
+directory for package source, usage documentation, and release metadata, or use
+the [online package catalog](https://rpi.laofu.online/packages.html).
 
 ## Relationship to the TypeScript source
 
@@ -55,6 +92,147 @@ agent.prompt("Hello!").await.unwrap();
 
 See [docs/architecture.md](docs/architecture.md) for the full design.
 
+## Build a plugin
+
+Plugins are Rust `cdylib` libraries loaded through the stable ABI exposed by
+`rpi-plugin-sdk`. The repository includes a complete `echo` tool example that
+also exercises event and resource discovery:
+
+```bash
+cargo build -p plugin-stub
+```
+
+Then point the CLI at the directory containing the generated library (the
+extension is named `plugin_stub.dll`, `libplugin_stub.so`, or
+`libplugin_stub.dylib` depending on the platform):
+
+```bash
+rpi --extensions-dir target/debug -p 'echo "hi"'
+```
+
+The plugin depends on `rpi-plugin-sdk` only; the host-side loader lives in
+`rpi-extensions`. See [`examples/plugin-stub`](examples/plugin-stub) and the
+[`rpi-plugin-sdk` API docs](https://docs.rs/rpi-plugin-sdk) for the ABI
+contract.
+
+### Install a crates.io extension
+
+`rpi install` installs Rust-native extensions directly from Cargo. The package
+must expose an `rpi-plugin-sdk` compatible `cdylib` target:
+
+```bash
+rpi install rpi-extension-example
+rpi install rpi-extension-example --version 0.1.0
+rpi install rpi-extension-example --force
+```
+
+The command resolves and builds the crate with Cargo in release mode, then
+copies its `.dll`, `.so`, or `.dylib` into `~/.rpi/agent/extensions` (or the
+directory selected by `RPI_CODING_AGENT_DIR`). The extension is loaded on the
+next `rpi` start. For local development, use
+`rpi install my-extension --path ../my-rpi-extension --force`.
+
+This is intentionally different from plain `cargo install`: `cargo install`
+only copies executable targets, while rpi loads dynamic-library extensions.
+
+### Develop an extension with watch mode
+
+From a Rust extension crate (`[lib] crate-type` contains `"cdylib"`), start the
+development host with:
+
+```bash
+rpi dev
+```
+
+The command detects the Cargo package, performs an initial build, stages a
+versioned library under `.rpi/extensions/.dev`, and watches the crate sources.
+Successful source changes trigger a rebuild and the same live reload used by
+the TUI's `/reload` command. A failed build keeps the currently loaded plugin.
+For a workspace containing multiple extensions, select one explicitly:
+
+```bash
+rpi dev --package rpi-todo
+rpi dev --release
+rpi dev --no-watch
+```
+
+See [`docs/extension-authoring.md`](docs/extension-authoring.md) for complete
+Rust extension and Pi JS/TS package templates, safety rules, testing, and
+release checklists.
+
+### Load static Pi packages
+
+> **Beta notice:** JavaScript/TypeScript package loading through the Node host
+> and skill-invocation rendering in the TUI are experimental compatibility
+> features. They are suitable for local evaluation and feedback, but are not
+> recommended for production workloads and may change before stabilization.
+
+rpi can load Pi packages, including their static resources and executable
+JavaScript/TypeScript extensions. Install a package with:
+
+```bash
+rpi install-pi npm:@scope/my-package@1.0.0
+rpi install-pi npm:my-alias@npm:@scope/my-package@^1
+rpi install-pi git:github.com/user/my-package@v1
+rpi install-pi ./my-pi-package
+```
+
+卸载已安装的扩展或 Pi package：
+
+```bash
+rpi uninstall rpi-extension-example
+rpi uninstall-pi npm:@scope/my-package
+# 等价写法：rpi uninstall pi npm:@scope/my-package
+```
+
+npm and Git installs use Pi-compatible managed stores: project packages live
+under `.pi/npm` and `.pi/git`, while `--global` uses the configured rpi agent
+directory's `npm` and `git` stores. Local directories are enabled in place and
+are never copied or deleted. Existing legacy `.rpi/packages`, `.pi/packages`,
+and native `~/.pi/agent` installs remain discoverable. Package-manager argv is
+selected from project `.rpi/settings.json`, project `.pi/settings.json`, then
+global `settings.json`; the default is npm. rpi treats the setting as structured
+argv rather than a shell command string, applies hardened encoding to Windows
+`.cmd` shims, and uses the native Pi flags for npm, pnpm, or bun.
+
+Package discovery and loading are disabled by default; start rpi with
+`--enable-pi-packages` to opt in. That startup performs a short one-shot Node.js
+discovery pass. In the interactive TUI, a long-lived Node.js host starts
+immediately before the first submitted prompt (or earlier when a package
+command or tool is used), so an idle TUI does not keep Node resident.
+`registerTool`, `registerCommand`, and `resources_discover` are supported.
+TypeScript uses Node's native type stripping when available, or a package-local
+`jiti` dependency. Pi peer/runtime packages are installed and aliased from
+nested `node_modules` when npm does not hoist them. Node.js is required, and
+extension code has the same filesystem/network permissions as the current user.
+Command handlers receive the core Pi context (`mode`, `hasUI`, `capabilities`,
+`model`, `modelRegistry`, `ui.notify`, editor text access, and session metadata).
+When the active Rust provider is available, `modelRegistry.getProvider(id)`
+supports Pi-compatible `streamSimple()`/`complete()` calls; stream events are
+delivered as an async-iterable snapshot and `result()` resolves to the final
+assistant message. `ctx.ui.custom` fullscreen components are bridged through a
+Node Component proxy with terminal input, resize, overlay, and lifecycle
+events; extensions still need to stay within the Pi component contract.
+The host also exposes the internal `pi.runtimeRequest(action, args)` bridge for
+capabilities that are enabled by rpi; extensions should check
+`ctx.capabilities` before using it.
+
+For a package that is already present locally, enable it without downloading:
+
+```bash
+rpi package add ../my-pi-package
+rpi package list
+rpi package remove ../my-pi-package
+```
+
+The package may provide `skills/`, `prompts/`, `themes/`, `SYSTEM.md`, and
+`APPEND_SYSTEM.md`. An optional `rpi` (or legacy `pi`) object in `package.json`
+can override those resource paths; `rpi` wins when both are present. Package resources are loaded after project and
+global resources, so `.rpi`/`.pi` and `~/.rpi/agent` always win collisions.
+`--theme <name-or-path>` selects a package theme in the interactive TUI when
+startup also includes `--enable-pi-packages`; an explicit JSON path does not
+require package discovery.
+
 ## Status (v1)
 
 - **Providers:** Anthropic Messages and OpenAI-compatible Chat Completions,
@@ -65,9 +243,24 @@ See [docs/architecture.md](docs/architecture.md) for the full design.
   `rpi auth login`) → `~/.rpi/agent/models.json` `apiKey` → provider environment
   variables (`OPENAI_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`). `rpi auth
   login`/`check`/`logout` manage the stored credential.
-- **Tools:** `read`, `write`, `edit`, `bash` (mutating, run through a
-  `MutationQueue`) + `grep`, `find`, `ls` (read-only, in-process via the
-  `FileSystem` trait — no `rg`/`fd` shell-out).
+- **Tools:** the CLI defaults to Pi's `read`, `write`, `edit`, and `bash`
+  tools. The former rpi-only `grep`, `find`, `ls`, `docs`, and `powershell`
+  implementations remain library code but are not loaded by default.
+- **Extensions:** Rust `cdylib` plugins can be installed with `rpi install` and
+  are discovered from project `.rpi/extensions`, legacy `.pi/extensions`,
+  global `~/.rpi/agent/extensions`, and `--extensions-dir`.
+
+- **Project resources:** rpi-owned skills, prompts, system instructions, and
+  extensions use `.rpi/` first; the original Pi `.pi/` layout remains a
+  compatibility fallback. When both contain the same skill or prompt name,
+  `.rpi/` wins. Project `.rpi/settings.json` can add `skillDirs`, `promptDirs`,
+  `extensionDirs`, and `packages` (with `.pi/settings.json` as fallback).
+- **Pi packages:** package specs in `~/.rpi/agent/settings.json` (`packages`
+  array) are loaded only when startup includes `--enable-pi-packages`. Skills,
+  prompt templates, themes, system prompt fragments, and JavaScript/TypeScript
+  extensions are supported through the Node host; without the flag, configured
+  Pi packages are not discovered or executed. Rust `cdylib` extensions remain
+  available for native integrations unless `--no-extensions` is supplied.
 - **Sessions:** JSONL v4 durable backend + in-memory ephemeral; compaction + a
   split-turn two-LLM-call invariant.
 
@@ -116,8 +309,8 @@ native pi does — the first *authenticated* model in the catalog when the
 built-in default isn't authenticated. So a `models.json`-only Anthropic or
 OpenAI gateway setup "just works": the gateway model is the only authenticated
 one, so `rpi -p "hi"` routes through it — no `--model` needed. With a standard
-`ANTHROPIC_API_KEY`/`auth.json`/`--api-key` setup, the built-in
-`claude-sonnet-5` remains the default.
+`ANTHROPIC_API_KEY`/`auth.json`/`--api-key` setup, the native Pi default
+`claude-opus-4-8` is selected when available.
 See
 [docs/m6-cli-open-questions.md §4–5](docs/m6-cli-open-questions.md) for the
 full auth precedence, the default-selection rule, the `~/.rpi`-flat-vs-nested
@@ -126,20 +319,23 @@ multi-provider registry).
 
 ## Releasing
 
-Publish the crate family in dependency order with `cargo publish` (run
-`cargo login` once first so `~/.cargo/credentials.toml` exists with a
-publish-scoped token; crates.io records are permanent):
+The workspace `Taskfile.yml` is the canonical release entry point. Run
+`cargo login` once first so `~/.cargo/credentials.toml` contains a
+publish-scoped token; crates.io records are permanent.
 
-```
-# dep order: telemetry → ai → agent → tools → harness → cli
-for c in rpi-telemetry rpi-ai rpi-agent rpi-tools rpi-harness rpi-cli; do
-  cargo publish -p "$c"
-done
+```bash
+task dry-run RELEASE_VERSION=0.1.18
+task publish RELEASE_VERSION=0.1.18
 ```
 
-The workspace `Taskfile.yml` (`task dry-run` / `task publish`) used to wrap
-`release.ps1`/`release.sh`, but those scripts were removed; publish directly
-as above.
+Both commands require a clean worktree and one consistent version across all
+nine release crates. `task publish` runs the locked workspace test and check
+suites, publishes in dependency order, waits for each crate to reach the
+crates.io index, and safely resumes by skipping exact versions already present.
+
+## Star history
+
+[![Star History Chart](https://api.star-history.com/svg?repos=bigfish1913/pi-rust,pi-rust/rpi-package&type=Date)](https://www.star-history.com/#bigfish1913/pi-rust&pi-rust/rpi-package&Date)
 
 ## License
 

@@ -10,6 +10,9 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
+/// Default deadline for one LLM API request, including its streamed response.
+pub const DEFAULT_LLM_API_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Cache-retention hint passed to a provider. Mirrors TS `CacheRetention`.
 /// `Long` requests 1h ephemeral cache control on Anthropic (subject to compat);
 /// `Short` requests the default ephemeral; `None` disables cache control.
@@ -29,7 +32,8 @@ pub struct SimpleStreamOptions {
     /// API key. A provider may fall back to an env var when `None` (M3 anthropic
     /// reads `ANTHROPIC_API_KEY`); faux ignores it.
     pub api_key: Option<String>,
-    /// Request timeout. `None` = provider default.
+    /// Request timeout. Defaults to 600 seconds; `None` uses the same provider
+    /// fallback and can be used by patches to clear a caller override.
     pub timeout: Option<Duration>,
     /// Max retry attempts on retryable errors (408/409/429/>=500). `None` = 0.
     pub max_retries: Option<u32>,
@@ -69,7 +73,7 @@ impl Default for SimpleStreamOptions {
     fn default() -> Self {
         Self {
             api_key: None,
-            timeout: None,
+            timeout: Some(DEFAULT_LLM_API_TIMEOUT),
             max_retries: None,
             max_retry_delay: None,
             headers: None,
@@ -103,6 +107,34 @@ impl SimpleStreamOptions {
     /// Resolve the effective reasoning level, defaulting to `Off` when unset.
     pub fn reasoning_level(&self) -> ThinkingLevel {
         self.reasoning.unwrap_or(ThinkingLevel::Off)
+    }
+
+    /// Resolve the effective request timeout, including the provider fallback.
+    pub fn request_timeout(&self) -> Duration {
+        self.timeout.unwrap_or(DEFAULT_LLM_API_TIMEOUT)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{SimpleStreamOptions, DEFAULT_LLM_API_TIMEOUT};
+    use std::time::Duration;
+
+    #[test]
+    fn llm_api_timeout_defaults_to_ten_minutes() {
+        let options = SimpleStreamOptions::default();
+        assert_eq!(options.timeout, Some(Duration::from_secs(600)));
+        assert_eq!(options.request_timeout(), DEFAULT_LLM_API_TIMEOUT);
+    }
+
+    #[test]
+    fn llm_api_timeout_allows_override_and_none_uses_provider_fallback() {
+        let mut options = SimpleStreamOptions::default();
+        options.timeout = Some(Duration::from_secs(15));
+        assert_eq!(options.request_timeout(), Duration::from_secs(15));
+
+        options.timeout = None;
+        assert_eq!(options.request_timeout(), Duration::from_secs(600));
     }
 }
 

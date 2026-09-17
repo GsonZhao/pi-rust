@@ -244,15 +244,23 @@ impl AgentHarnessStreamOptionsPatch {
 pub struct RetryPolicy {
     pub enabled: bool,
     pub max_retries: u32,
+    /// Exponential delay base for assistant-level retries.
     pub base_delay_ms: u64,
+    /// Hard cap for the accumulated agent retry delay. Mirrors pi's
+    /// `maxAgentDelayMs` (60 seconds by default).
+    pub max_agent_delay_ms: u64,
 }
 
 impl Default for RetryPolicy {
     fn default() -> Self {
         Self {
-            enabled: false,
-            max_retries: 0,
-            base_delay_ms: 1000,
+            // Pi retries transient assistant failures by default. Provider
+            // SDK retries remain disabled separately in the agent stream
+            // options so one failure is not retried twice.
+            enabled: true,
+            max_retries: 10,
+            base_delay_ms: 2000,
+            max_agent_delay_ms: 60_000,
         }
     }
 }
@@ -464,5 +472,17 @@ impl Default for AgentHarnessOptions {
             entry_transforms: Vec::new(),
             provider_hooks: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RetryPolicy;
+
+    #[test]
+    fn retry_policy_allows_ten_retries_by_default() {
+        let retry = RetryPolicy::default();
+        assert!(retry.enabled);
+        assert_eq!(retry.max_retries, 10);
     }
 }

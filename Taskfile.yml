@@ -12,15 +12,26 @@
 #
 # Usage:
 #   task              # list targets
-#   task dry-run      # cargo publish --dry-run per crate, dep-ordered (no upload)
-#   task publish      # real publish to crates.io, dep-ordered, with pre-flight test
-#   task publish:fast # real publish, skip pre-flight tests (only after a green `task test`)
-#   task test         # cargo test --workspace
+#   task dry-run RELEASE_VERSION=0.1.12
+#                     # package all crates without uploading
+#   task publish RELEASE_VERSION=0.1.12
+#                     # idempotent crates.io publish with full pre-flight checks
+#   task publish:fast RELEASE_VERSION=0.1.12
+#                     # idempotent publish, skip test/check (still validates release state)
+#   task test         # cargo test --workspace --locked
 #
-# Prerequisite for `task publish*`: run `cargo login` once so ~/.cargo/credentials.toml
-# exists with a valid publish-scoped token. crates.io records are permanent.
+# Prerequisites for `task publish*`: `rustc` and `curl` on PATH, plus a one-time
+# `cargo login` so ~/.cargo/credentials.toml has a publish-scoped token.
+# crates.io records are permanent.
 
 version: '3'
+
+vars:
+  RPI_SERVICE_NAME: rpi
+  RPI_DOMAIN: rpi.laofu.online
+  RPI_DEPLOY_DIR: .deploy/rpi
+  RPI_RELEASE_HELPER:
+    sh: git rev-parse --git-path rpi-release-helper.exe
 
 tasks:
   default:
@@ -29,46 +40,147 @@ tasks:
       - task --list
 
   dry-run:
-    desc: cargo publish --dry-run per crate, dep-ordered (no upload)
+    desc: Package all rpi-* crates in release order without uploading
     cmds:
-      - cargo publish --dry-run -p rpi-telemetry
-      - cargo publish --dry-run -p rpi-ai
-      - cargo publish --dry-run -p rpi-agent
-      - cargo publish --dry-run -p rpi-plugin-sdk
-      - cargo publish --dry-run -p rpi-extensions
-      - cargo publish --dry-run -p rpi-tools
-      - cargo publish --dry-run -p rpi-harness
-      - cargo publish --dry-run -p rpi-tui
-      - cargo publish --dry-run -p rpi-cli
+      - task: release:validate
+      - task: release:dry-run-crates
 
   publish:
-    desc: Real publish rpi-* crates to crates.io in dependency order (runs pre-flight `cargo test`)
+    desc: Idempotently publish rpi-* crates to crates.io after full pre-flight checks
     cmds:
-      - cargo test --workspace
-      - cargo publish -p rpi-telemetry
-      - cargo publish -p rpi-ai
-      - cargo publish -p rpi-agent
-      - cargo publish -p rpi-plugin-sdk
-      - cargo publish -p rpi-extensions
-      - cargo publish -p rpi-tools
-      - cargo publish -p rpi-harness
-      - cargo publish -p rpi-tui
-      - cargo publish -p rpi-cli
+      - task: release:validate
+      - task: test
+      - task: check
+      - task: release:publish-crates
 
   publish:fast:
-    desc: Real publish, dep-ordered, skip pre-flight tests (use only after a fresh green `task test`)
+    desc: Idempotently publish in dependency order, skipping test/check only
     cmds:
-      - cargo publish -p rpi-telemetry
-      - cargo publish -p rpi-ai
-      - cargo publish -p rpi-agent
-      - cargo publish -p rpi-plugin-sdk
-      - cargo publish -p rpi-extensions
-      - cargo publish -p rpi-tools
-      - cargo publish -p rpi-harness
-      - cargo publish -p rpi-tui
-      - cargo publish -p rpi-cli
+      - task: release:validate
+      - task: release:publish-crates
+
+  release:validate:
+    desc: Require a clean tree and one consistent version across the nine release crates
+    requires:
+      vars: [RELEASE_VERSION]
+    deps:
+      - release:build-helper
+    cmds:
+      - '"{{.RPI_RELEASE_HELPER}}" validate "{{.RELEASE_VERSION}}"'
+
+  release:build-helper:
+    internal: true
+    cmds:
+      - rustc --edition=2021 release-helper.rs -o "{{.RPI_RELEASE_HELPER}}"
+
+  release:dry-run-crates:
+    internal: true
+    deps:
+      - release:build-helper
+    cmds:
+      - '"{{.RPI_RELEASE_HELPER}}" dry-run'
+
+  release:publish-crates:
+    internal: true
+    requires:
+      vars: [RELEASE_VERSION]
+    deps:
+      - release:build-helper
+    cmds:
+      - '"{{.RPI_RELEASE_HELPER}}" publish "{{.RELEASE_VERSION}}"'
 
   test:
-    desc: cargo test --workspace (the release pre-flight, run standalone)
+    desc: Run the locked workspace test suite
     cmds:
-      - cargo test --workspace
+      - cargo test --workspace --locked
+
+  check:
+    desc: Check all locked workspace targets
+    cmds:
+      - cargo check --workspace --all-targets --locked
+
+  rpi-pack-frontend:
+    desc: 打包 rpi 静态官网
+    cmds:
+      - >-
+        powershell -NoProfile -Command "New-Item -ItemType Directory -Force -Path '{{.RPI_DEPLOY_DIR}}' | Out-Null; Compress-Archive -Path 'website\\*' -DestinationPath '{{.RPI_DEPLOY_DIR}}\\frontend.zip' -Force"
+      - >-
+        echo "前端包已生成: {{.RPI_DEPLOY_DIR}}/frontend.zip"
+
+  rpi-upload-frontend:
+    desc: 上传 rpi 静态官网到公网服务器
+    deps:
+      - rpi-pack-frontend
+    cmds:
+      - ssh root@139.196.85.175 "mkdir -p /var/www/{{.RPI_SERVICE_NAME}} /tmp/deploy"
+      - scp "{{.RPI_DEPLOY_DIR}}/frontend.zip" root@139.196.85.175:/tmp/deploy/{{.RPI_SERVICE_NAME}}-frontend.zip
+      - ssh root@139.196.85.175 "unzip -o /tmp/deploy/{{.RPI_SERVICE_NAME}}-frontend.zip -d /var/www/{{.RPI_SERVICE_NAME}} >/dev/null && rm /tmp/deploy/{{.RPI_SERVICE_NAME}}-frontend.zip"
+      - >-
+        echo "前端文件已上传到 /var/www/{{.RPI_SERVICE_NAME}}/"
+
+  rpi-upload-guide:
+    desc: 上传 rpi 完整使用手册和扩展作者指南
+    cmds:
+      - ssh root@139.196.85.175 "mkdir -p /var/www/{{.RPI_SERVICE_NAME}}"
+      - scp docs/user-guide.md root@139.196.85.175:/var/www/{{.RPI_SERVICE_NAME}}/user-guide.md
+      - scp docs/extension-authoring.md root@139.196.85.175:/var/www/{{.RPI_SERVICE_NAME}}/extension-authoring.md
+      - >-
+        echo "使用手册和扩展作者指南已上传"
+
+  rpi-caddy-upload:
+    desc: 上传 rpi Caddy 配置并重载
+    cmds:
+      - scp deploy/rpi.caddy root@139.196.85.175:/root/work/ai-infr/config/caddy/sites/{{.RPI_SERVICE_NAME}}.caddy
+      - ssh root@139.196.85.175 "docker exec app-caddy sh -c 'mkdir -p /data/caddy && chmod 755 /data/caddy'"
+      - ssh root@139.196.85.175 "docker exec app-caddy caddy validate --config /etc/caddy/Caddyfile && docker exec app-caddy caddy reload --config /etc/caddy/Caddyfile"
+      - >-
+        echo "Caddy 配置已生效: {{.RPI_DOMAIN}}"
+
+  rpi-caddy-mount:
+    desc: 将 rpi 静态目录挂载到现有 Caddy 容器
+    cmds:
+      - scp deploy/caddy-rpi.override.yml root@139.196.85.175:/root/work/ai-infr/docker-compose.rpi.override.yml
+      - ssh root@139.196.85.175 "cd /root/work/ai-infr && docker compose -f docker-compose.yml -f docker-compose.rpi.override.yml config >/dev/null"
+      - ssh root@139.196.85.175 "docker rm -f app-caddy 2>/dev/null || true"
+      - ssh root@139.196.85.175 "cd /root/work/ai-infr && docker compose -f docker-compose.yml -f docker-compose.rpi.override.yml up -d caddy"
+      - powershell -NoProfile -Command "Start-Sleep -Seconds 5"
+
+  rpi-caddy-storage-repair:
+    desc: 恢复 Caddy 缺失的绑定存储目录并重启容器
+    cmds:
+      - ssh root@139.196.85.175 "mkdir -p /var/lib/docker/volumes/app-caddy-data/_data /var/lib/docker/volumes/app-caddy-config/_data"
+      - ssh root@139.196.85.175 "docker restart app-caddy"
+      - powershell -NoProfile -Command "Start-Sleep -Seconds 5"
+
+  rpi-deploy:
+    desc: 打包、上传并发布 rpi 静态官网
+    cmds:
+      - task: rpi-upload-frontend
+      - task: rpi-upload-guide
+      - task: rpi-caddy-mount
+      - task: rpi-caddy-upload
+      - task: rpi-verify
+
+  rpi-verify:
+    desc: 验证 rpi 公网首页和静态 JSON
+    cmds:
+      - ssh root@139.196.85.175 "curl --fail --silent --show-error --head https://{{.RPI_DOMAIN}}/"
+      - ssh root@139.196.85.175 "curl --fail --silent --show-error https://{{.RPI_DOMAIN}}/data/packages.json"
+      - ssh root@139.196.85.175 "curl --fail --silent --show-error https://{{.RPI_DOMAIN}}/index.html | grep -F 'bigfish1913/pi-rust'"
+
+  rpi-diagnose:
+    desc: 诊断 rpi 公网 HTTP 与 Caddy 状态
+    cmds:
+      - ssh root@139.196.85.175 "curl --max-time 15 --silent --show-error --head http://{{.RPI_DOMAIN}}/"
+      - ssh root@139.196.85.175 "docker logs app-caddy --tail 80 2>&1 | grep -i '{{.RPI_DOMAIN}}' || true"
+      - ssh root@139.196.85.175 "docker inspect app-caddy | head -c 5000"
+      - ssh root@139.196.85.175 "docker exec app-caddy sh -c 'ls -ld /data /config /etc/caddy 2>&1 || true'"
+      - ssh root@139.196.85.175 "docker exec app-caddy sh -c 'id; stat /data /config; test -w /config && echo config-writable || echo config-not-writable'"
+      - ssh root@139.196.85.175 "docker volume inspect app-caddy-data app-caddy-config || true"
+      - ssh root@139.196.85.175 "ls -ld /var/lib/docker/volumes/app-caddy-data/_data /var/lib/docker/volumes/app-caddy-config/_data 2>&1 || true; ls -la /var/lib/docker/volumes/app-caddy-data/_data /var/lib/docker/volumes/app-caddy-config/_data 2>&1 || true"
+      - ssh root@139.196.85.175 "docker info | grep -E 'Docker Root Dir|Storage Driver'; ls -ld /var/lib/docker /var/lib/docker/volumes"
+      - ssh root@139.196.85.175 "find /var/www/rpi -maxdepth 2 -type f -printf '%P\\n' | sort | head -80"
+      - ssh root@139.196.85.175 "curl --insecure --silent --show-error --head https://{{.RPI_DOMAIN}}/index.html; curl --insecure --silent --show-error https://{{.RPI_DOMAIN}}/data/packages.json"
+      - ssh root@139.196.85.175 "find /root/work/ai-infr -maxdepth 4 -type f \( -name 'docker-compose*.yml' -o -name 'compose*.yml' \) -print"
+      - ssh root@139.196.85.175 "grep -R -n 'app-caddy' /root/work/ai-infr --include='*.yml' --include='*.yaml' 2>/dev/null | head -40"
+      - ssh root@139.196.85.175 "sed -n '170,230p' /root/work/ai-infr/docker-compose.yml"

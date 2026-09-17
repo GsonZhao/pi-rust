@@ -16,21 +16,22 @@
 //!
 //! # v1 scope cuts vs TS `main.ts` (in `docs/m6-cli-open-questions.md`)
 //!
-//! The TS `main` is enormous: auth-command routing, package-manager commands,
-//! HTTP proxy config, project-trust prompts, first-time setup, migrations,
-//! settings managers, theme init, extension/resource discovery. **None of that
-//! is ported** — v1 is a straight parse → resolve → build → run pipeline. The
-//! `@file` expansion ports *only* the text-file branch (images are detected
+//! The TS `main` is enormous: HTTP proxy config, project-trust handling,
+//! first-time setup, migrations, and full npm package management remain
+//! outside this port. rpi does support local static package management via
+//! `rpi package` and Rust cdylib extension installation. The regular agent path
+//! remains a straight parse → resolve → build → run pipeline. The `@file`
+//! expansion ports *only* the text-file branch (images are detected
 //! but not attached to the prompt — the harness `prompt_text` accepts images,
 //! but v1 does not yet wire an image processor; binary/non-UTF-8 files error).
 
 use std::io::{IsTerminal, Read};
 use std::path::Path;
 
-use rpi_ai::types::ImageContent;
+use rpi_ai::types::{ImageContent, ImageContentType};
 
 use crate::args::{parse_args, print_help, print_version, resolve_mode, Args, RunMode};
-use crate::provider::{resolve, ResolveError};
+use crate::provider::{resolve_for_cwd, ResolveError};
 use crate::session::{build, BuildError};
 
 /// The exit code for a usage/parse error. (TS `main.ts` uses `process.exit(1)`
@@ -49,13 +50,88 @@ pub const EXIT_RUNTIME: i32 = 1;
 pub async fn run() -> i32 {
     // argv[0] is the program name; skip it (TS `main(args)` receives the same,
     // already sliced by the Node CLI entry).
-    let argv: Vec<String> = std::env::args().skip(1).collect();
+    let mut argv: Vec<String> = std::env::args().skip(1).collect();
+
+    if argv.first().map(String::as_str) == Some("__rpi_dev_cleanup") {
+        return crate::dev_extension::run_cleanup_helper(&argv[1..]);
+    }
+
+    // Native Pi resolves offline mode before dispatching top-level commands.
+    // Normalize the CLI flag into PI_OFFLINE so early package/update commands
+    // and the regular parsed path all observe the same process-wide gate.
+    crate::args::normalize_offline_mode(&argv);
+
+    // `rpi dev` wraps the normal CLI: consume only development-specific
+    // options, then pass every remaining argument through the regular parser.
+    let dev_command = argv.first().map(String::as_str);
+    let dev_options = if matches!(dev_command, Some("dev" | "dev-local")) {
+        match crate::dev_extension::parse_args(&argv[1..]) {
+            Ok(options) if options.help => {
+                crate::dev_extension::print_help();
+                return 0;
+            }
+            Ok(mut options) => {
+                if dev_command == Some("dev-local") {
+                    options.local_only = true;
+                }
+                argv = options.passthrough.clone();
+                Some(options)
+            }
+            Err(error) => {
+                eprintln!("error: {error}");
+                crate::dev_extension::print_help();
+                return EXIT_USAGE;
+            }
+        }
+    } else {
+        None
+    };
 
     // ---- `rpi auth …` subcommand dispatch (before flag parsing) ----
     // `auth` is a top-level subcommand (mirrors TS `runAuthCommand` routing in
     // `main.ts`); dispatching it here avoids it being misparsed as a prompt.
     if argv.first().map(|s| s.as_str()) == Some("auth") {
         return crate::auth::run(&argv[1..]).await;
+    }
+    if argv.first().map(|s| s.as_str()) == Some("package") {
+        return crate::packages::run_cli(&argv[1..]);
+    }
+    if argv.first().map(|s| s.as_str()) == Some("update") {
+        return crate::updates::run_self_update(&argv[1..]);
+    }
+    if argv.first().map(String::as_str) == Some("pi-package") {
+        let subcommand = argv.get(1).map(String::as_str);
+        if matches!(subcommand, Some("--help" | "-h")) {
+            return crate::packages::run_pi_package_update(&argv[1..]);
+        }
+        if subcommand != Some("update") {
+            eprintln!("error: usage is `rpi pi-package update`");
+            return EXIT_USAGE;
+        }
+        return crate::packages::run_pi_package_update(&argv[1..]);
+    }
+    if argv.first().map(String::as_str) == Some("pi-update") {
+        eprintln!("error: unknown command `pi-update`; use `rpi pi-package update`");
+        return EXIT_USAGE;
+    }
+    if argv.first().map(String::as_str) == Some("self-update") {
+        eprintln!("error: unknown command `self-update`; use `rpi update`");
+        return EXIT_USAGE;
+    }
+    if argv.first().map(|s| s.as_str()) == Some("install") {
+        return crate::install::run(&argv[1..]);
+    }
+    if argv.first().map(|s| s.as_str()) == Some("install-pi") {
+        return crate::install_pi::run(&argv[1..]);
+    }
+    if argv.first().map(|s| s.as_str()) == Some("uninstall") {
+        if argv.get(1).map(String::as_str) == Some("pi") {
+            return crate::install_pi::uninstall(&argv[2..]);
+        }
+        return crate::install::uninstall(&argv[1..]);
+    }
+    if argv.first().map(|s| s.as_str()) == Some("uninstall-pi") {
+        return crate::install_pi::uninstall(&argv[1..]);
     }
 
     let mut parsed = parse_args(&argv);
@@ -94,6 +170,62 @@ pub async fn run() -> i32 {
     // set (an explicit override is its own layout).
     let _ = crate::config::migrate_legacy_layout();
 
+    if let Some(input) = parsed.export.as_deref() {
+        let output = parsed
+            .messages
+            .first()
+            .map(Path::new)
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| {
+                let stem = input
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or("session");
+                Path::new(&format!("rpi-session-{stem}.html")).to_path_buf()
+            });
+        match crate::export::export_file(input, &output) {
+            Ok(()) => {
+                println!("Exported to: {}", output.display());
+                return 0;
+            }
+            Err(error) => {
+                eprintln!("error: {error}");
+                return EXIT_RUNTIME;
+            }
+        }
+    }
+
+    // `--list-models` is intentionally handled before credentials, session
+    // restoration, and harness construction. Native Pi exposes this as a
+    // catalog inspection command, so it must work for a newly installed user
+    // who has not authenticated yet.
+    if let Some(search) = parsed.list_models.as_deref() {
+        return list_models(search).await;
+    }
+
+    // Build before provider resolution so compiler errors do not require
+    // valid model credentials. The staged directory joins normal discovery.
+    let dev_extension = if let Some(options) = &dev_options {
+        let extension = match crate::dev_extension::DevExtension::detect(&cwd, options) {
+            Ok(extension) => extension,
+            Err(error) => {
+                eprintln!("error: {error}");
+                return EXIT_USAGE;
+            }
+        };
+        if let Err(error) = extension.rebuild() {
+            eprintln!("error: initial extension build failed: {error}");
+            return EXIT_RUNTIME;
+        }
+        if let Err(error) = extension.apply_to_args(&mut parsed) {
+            eprintln!("error: {error}");
+            return EXIT_RUNTIME;
+        }
+        Some(extension)
+    } else {
+        None
+    };
+
     // `-r/--resume` is an interactive picker, unlike `-c/--continue` which
     // immediately opens the latest session. Resolve the picker result before
     // building the harness so cancelling does not create or modify a session.
@@ -121,12 +253,15 @@ pub async fn run() -> i32 {
             eprintln!("warning: {warn}");
         }
     }
+    if parsed.no_themes && parsed.theme.is_some() {
+        eprintln!("warning: --no-themes overrides --theme; using the built-in default theme");
+    }
 
     // ---- stdin (TS readPipedStdin: non-TTY stdin becomes initial prompt text) ----
     let stdin_text = read_piped_stdin();
 
     // ---- @file attachments → text (TS processFileArguments, text branch only) ----
-    let (file_text, _file_images) = match process_file_args(&parsed.file_args, &cwd) {
+    let (file_text, file_images) = match process_file_args(&parsed.file_args, &cwd) {
         Ok(t) => t,
         Err(msg) => {
             eprintln!("error: {msg}");
@@ -143,12 +278,15 @@ pub async fn run() -> i32 {
     let (initial, extra) = build_initial_message(&parsed, stdin_text.as_deref(), file_text_opt);
 
     // ---- provider + model resolution ----
-    let resolved = match resolve(
+    let project_trusted = crate::session::resolve_project_trust(&parsed, &cwd);
+    let resolved = match resolve_for_cwd(
         parsed.provider.as_deref(),
         parsed.model.as_deref(),
         parsed.thinking,
         parsed.api_key.as_deref(),
         parsed.base_url.as_deref(),
+        &cwd,
+        project_trusted,
     ) {
         Ok(r) => r,
         Err(e) => {
@@ -193,13 +331,15 @@ pub async fn run() -> i32 {
     }
 
     // ---- harness build ----
-    let (harness, event_rx, reload_context) = match build(&resolved, &parsed, &cwd).await {
-        Ok(triple) => triple,
-        Err(e) => {
-            print_build_error(&e);
-            return EXIT_RUNTIME;
-        }
-    };
+    let (harness, event_rx, mut reload_context) =
+        match build(&resolved, &parsed, &cwd, project_trusted).await {
+            Ok(triple) => triple,
+            Err(e) => {
+                print_build_error(&e);
+                return EXIT_RUNTIME;
+            }
+        };
+    reload_context.dev_extension = dev_extension;
 
     // ---- mode dispatch (TS resolveAppMode → runPrintMode / InteractiveMode / runRpcMode) ----
     let stdin_is_tty = std::io::stdin().is_terminal();
@@ -224,9 +364,38 @@ pub async fn run() -> i32 {
         mode
     };
 
-    match mode {
-        RunMode::Print => crate::modes::print(&harness, &parsed, initial.clone(), &extra).await,
-        RunMode::Json => crate::modes::json(&harness, &parsed, initial.clone(), &extra).await,
+    let dev_cleanup = reload_context.dev_extension.clone();
+    let dev_watcher = if matches!(mode, RunMode::Interactive) {
+        reload_context
+            .dev_extension
+            .as_ref()
+            .and_then(|extension| extension.start_watcher(reload_context.mailbox.clone()))
+    } else {
+        None
+    };
+
+    let exit_code = match mode {
+        RunMode::Print => {
+            crate::modes::print(
+                &harness,
+                &parsed,
+                initial.clone(),
+                &extra,
+                file_images.clone(),
+            )
+            .await
+        }
+        RunMode::Json => {
+            crate::modes::json(
+                &harness,
+                &parsed,
+                initial.clone(),
+                &extra,
+                file_images.clone(),
+                Some(event_rx),
+            )
+            .await
+        }
         RunMode::Interactive => {
             crate::modes::interactive(
                 &harness,
@@ -235,7 +404,13 @@ pub async fn run() -> i32 {
                 model_catalog,
                 initial.clone(),
                 &extra,
-                resolved.theme.as_deref(),
+                file_images.clone(),
+                if parsed.no_themes {
+                    None
+                } else {
+                    parsed.theme.as_deref().or(resolved.theme.as_deref())
+                },
+                parsed.no_themes,
                 &reload_context,
             )
             .await
@@ -247,7 +422,129 @@ pub async fn run() -> i32 {
             eprintln!("error: rpc mode is not implemented in v1 (use --mode text or --mode json)");
             EXIT_USAGE
         }
+    };
+
+    if let Some(dev) = &dev_cleanup {
+        dev.stop_watcher();
     }
+    if let Some(watcher) = dev_watcher {
+        let _ = watcher.join();
+    }
+    drop(reload_context);
+    drop(harness);
+    if let Some(dev) = dev_cleanup {
+        dev.cleanup();
+    }
+    exit_code
+}
+
+/// Print the merged model catalog, optionally filtered by a case-insensitive
+/// fuzzy-ish substring over provider, id, and display name.
+async fn list_models(search: &str) -> i32 {
+    let catalog = match crate::provider::catalog_all() {
+        Ok(models) => models,
+        Err(error) => {
+            eprintln!("warning: could not load models.json: {error}");
+            Vec::new()
+        }
+    };
+    let needle = search.trim().to_ascii_lowercase();
+    let mut models: Vec<_> = catalog
+        .into_iter()
+        .filter(|model| {
+            needle.is_empty()
+                || format!("{} {} {}", model.provider, model.id, model.name)
+                    .to_ascii_lowercase()
+                    .contains(&needle)
+        })
+        .collect();
+    if models.is_empty() {
+        if needle.is_empty() {
+            println!("No models available");
+        } else {
+            println!("No models matching \"{search}\"");
+        }
+        return 0;
+    }
+
+    fn format_tokens(value: u64) -> String {
+        if value >= 1_000_000 {
+            let whole = value % 1_000_000 == 0;
+            if whole {
+                format!("{}M", value / 1_000_000)
+            } else {
+                format!("{:.1}M", value as f64 / 1_000_000.0)
+            }
+        } else if value >= 1_000 {
+            let whole = value % 1_000 == 0;
+            if whole {
+                format!("{}K", value / 1_000)
+            } else {
+                format!("{:.1}K", value as f64 / 1_000.0)
+            }
+        } else {
+            value.to_string()
+        }
+    }
+
+    let rows: Vec<_> = models
+        .drain(..)
+        .map(|model| {
+            let images = model
+                .input
+                .iter()
+                .any(|input| matches!(input, rpi_ai::InputModality::Image));
+            (
+                model.provider,
+                model.id,
+                format_tokens(model.context_window),
+                format_tokens(model.max_tokens),
+                if model.reasoning { "yes" } else { "no" }.to_string(),
+                if images { "yes" } else { "no" }.to_string(),
+            )
+        })
+        .collect();
+    let widths = (
+        rows.iter().map(|r| r.0.len()).max().unwrap_or(8).max(8),
+        rows.iter().map(|r| r.1.len()).max().unwrap_or(5).max(5),
+        rows.iter().map(|r| r.2.len()).max().unwrap_or(7).max(7),
+        rows.iter().map(|r| r.3.len()).max().unwrap_or(7).max(7),
+        rows.iter().map(|r| r.4.len()).max().unwrap_or(8).max(8),
+        rows.iter().map(|r| r.5.len()).max().unwrap_or(6).max(6),
+    );
+    println!(
+        "{:provider$}  {:model$}  {:context$}  {:max_out$}  {:thinking$}  {:images$}",
+        "provider",
+        "model",
+        "context",
+        "max-out",
+        "thinking",
+        "images",
+        provider = widths.0,
+        model = widths.1,
+        context = widths.2,
+        max_out = widths.3,
+        thinking = widths.4,
+        images = widths.5,
+    );
+    for row in rows {
+        println!(
+            "{:provider$}  {:model$}  {:context$}  {:max_out$}  {:thinking$}  {:images$}",
+            row.0,
+            row.1,
+            row.2,
+            row.3,
+            row.4,
+            row.5,
+            provider = widths.0,
+            model = widths.1,
+            context = widths.2,
+            max_out = widths.3,
+            thinking = widths.4,
+            images = widths.5,
+        );
+    }
+    0
 }
 
 /// Read piped stdin into a string. Mirrors TS `readPipedStdin`: returns `None`
@@ -286,18 +583,13 @@ fn read_piped_stdin() -> Option<String> {
 /// TS `processFileArguments`: each readable text file is wrapped in
 /// `<file name="...">\n<contents>\n</file>\n` and concatenated.
 ///
-/// v1 divergence: the TS image branch (detect mime → base64 → `ImageContent`)
-/// is **not ported** — `pi-tools` ships an image *detector* but no CLI-facing
-/// image processor, and the v1 `modes` do not forward images into
-/// `prompt_text`. Recognized image extensions are reported as an error rather
-/// than silently mis-parsed as text. See `docs/m6-cli-open-questions.md`.
-///
 /// Paths are resolved relative to `cwd` (the TS uses `resolve(readPath, cwd)`).
 fn process_file_args(
     file_args: &[std::path::PathBuf],
     cwd: &Path,
 ) -> Result<(String, Vec<ImageContent>), String> {
     let mut text = String::new();
+    let mut images = Vec::new();
     for rel in file_args {
         let abs = if rel.is_absolute() {
             rel.clone()
@@ -307,39 +599,40 @@ fn process_file_args(
         if !abs.exists() {
             return Err(format!("file not found: {}", abs.display()));
         }
-        // v1: refuse image files outright (no image-attachment path yet).
-        if is_likely_image(&abs) {
-            return Err(format!(
-                "image attachments are not supported in v1: {}",
-                abs.display()
+        let bytes = std::fs::read(&abs)
+            .map_err(|e| format!("could not read file {}: {e}", abs.display()))?;
+        if let Some(image) = image_content_from_bytes(&bytes) {
+            images.push(image);
+        } else {
+            let content = String::from_utf8(bytes).map_err(|_| {
+                format!(
+                    "file is not valid UTF-8 text or a supported image: {}",
+                    abs.display()
+                )
+            })?;
+            text.push_str(&format!(
+                "<file name=\"{}\">\n{}\n</file>\n",
+                abs.display(),
+                content
             ));
         }
-        match std::fs::read_to_string(&abs) {
-            Ok(content) => {
-                text.push_str(&format!(
-                    "<file name=\"{}\">\n{}\n</file>\n",
-                    abs.display(),
-                    content
-                ));
-            }
-            Err(e) => {
-                return Err(format!("could not read file {}: {e}", abs.display()));
-            }
-        }
     }
-    Ok((text, Vec::new()))
+    Ok((text, images))
 }
 
-/// True if the path's extension looks like a raster image the TS path would
-/// have base64-attached. Used to route `@file` away from the text branch.
-fn is_likely_image(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
-            .as_deref(),
-        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp")
-    )
+pub(crate) fn image_content_from_path(path: &Path) -> Result<Option<ImageContent>, String> {
+    let bytes =
+        std::fs::read(path).map_err(|e| format!("could not read file {}: {e}", path.display()))?;
+    Ok(image_content_from_bytes(&bytes))
+}
+
+fn image_content_from_bytes(bytes: &[u8]) -> Option<ImageContent> {
+    let mime_type = rpi_tools::detect_supported_image_mime_type(bytes)?;
+    Some(ImageContent {
+        kind: ImageContentType,
+        data: rpi_tools::encode_base64(bytes),
+        mime_type: mime_type.to_string(),
+    })
 }
 
 /// Build the initial prompt + the remaining extra messages. Mirrors TS
@@ -444,10 +737,29 @@ mod tests {
     }
 
     #[test]
-    fn is_likely_image_detects_extensions() {
-        assert!(is_likely_image(Path::new("foo.png")));
-        assert!(is_likely_image(Path::new("foo.JPG")));
-        assert!(!is_likely_image(Path::new("foo.rs")));
-        assert!(!is_likely_image(Path::new("foo")));
+    fn process_file_args_attaches_supported_images() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("image.bin");
+        let mut png = vec![137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13];
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&[0; 13]);
+        std::fs::write(&path, png).unwrap();
+        let (text, images) = process_file_args(&[path], dir.path()).unwrap();
+        assert!(text.is_empty());
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].mime_type, "image/png");
+        assert!(!images[0].data.is_empty());
+    }
+
+    #[test]
+    fn image_content_from_path_reports_supported_mime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("drop.png");
+        let mut png = vec![137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13];
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&[0; 13]);
+        std::fs::write(&path, png).unwrap();
+        let image = image_content_from_path(&path).unwrap().unwrap();
+        assert_eq!(image.mime_type, "image/png");
     }
 }

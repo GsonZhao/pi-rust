@@ -6,25 +6,69 @@
 //! dep) that collects `messages`, `@file` attachments, known flags, and a map
 //! of *unknown* `--flags` (for extensions to claim later). This port keeps the
 //! same shape so the help text and flag semantics line up 1:1 with the
-//! reference. Unknown flags are *not* stored (there is no extension system in
-//! v1); they produce a warning diagnostic instead.
+//! reference. Unknown long flags are retained in [`Args::unknown_flags`] so a
+//! native extension can claim and consume its own CLI options after loading.
 //!
 //! Divergences from the TS parser (all deliberate v1 scope cuts, documented in
 //! `docs/m6-cli-open-questions.md`):
-//! - `--mode rpc`, `--tui-mode`, `--export`, `--list-models`, `--models`,
-//!   `--fork`, `--offline`, `--approve`/`-na`, the package-manager subcommands,
-//!   `--extension`/`-e`, `--skill`, `--prompt-template`, `--theme`, and their
-//!   `--no-*` discovery toggles are **recognized but ignored** (parsed so users
-//!   don't get a hard error for muscle-memory flags, with a warning). They are
-//!   not in v1's surface.
+//! - `--mode rpc`,
+//!   `--fork`, `--approve`/`-na`,
+//!   `--extension`/`-e`, `--skill`, and `--prompt-template` are recognized but
+//!   not all wired into the full TS package manager. The supported resource
+//!   flags are handled by the Rust loader; remaining compatibility flags are
+//!   accepted with a warning.
 //! - `--thinking` is typed via [`ThinkingLevel`] from `rpi_ai` (the TS parser
 //!   validates against the same string set).
 //! - `--print`/`-p` may consume a following positional as its prompt (the TS
 //!   parser's `next !== undefined && !startsWith('@')` heuristic) — preserved.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::time::Duration;
 
 use rpi_ai::ThinkingLevel;
+
+/// Native Pi's process-wide offline flag. The CLI normalizes a truthy value
+/// to `1` before dispatch so early subcommands and the regular app path share
+/// the same network gate.
+pub(crate) const PI_OFFLINE_ENV: &str = "PI_OFFLINE";
+
+/// Match native Pi's environment-flag contract exactly: empty values and
+/// values other than `1`, `true`, or `yes` are false; words are ASCII
+/// case-insensitive.
+pub(crate) fn is_truthy_env_flag(value: Option<&str>) -> bool {
+    value.is_some_and(|value| {
+        value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("yes")
+    })
+}
+
+pub(crate) fn offline_env_enabled() -> bool {
+    is_truthy_env_flag(std::env::var(PI_OFFLINE_ENV).ok().as_deref())
+}
+
+pub(crate) fn offline_mode_enabled(cli_offline: bool) -> bool {
+    cli_offline || offline_env_enabled()
+}
+
+/// Resolve and normalize offline mode before top-level subcommand dispatch.
+/// This mirrors native Pi setting `PI_OFFLINE=1` after either input enables it,
+/// allowing downstream code to use the same process-wide gate.
+pub(crate) fn normalize_offline_mode(args: &[String]) -> bool {
+    let enabled = offline_mode_enabled(args.iter().any(|arg| arg == "--offline"));
+    if enabled {
+        std::env::set_var(PI_OFFLINE_ENV, "1");
+    }
+    enabled
+}
+
+/// Remove the global offline flag before an early-dispatched subcommand parses
+/// its own options. The process-wide gate has already retained its meaning.
+pub(crate) fn without_offline_flag(args: &[String]) -> Vec<String> {
+    args.iter()
+        .filter(|arg| arg.as_str() != "--offline")
+        .cloned()
+        .collect()
+}
 
 /// Output mode. Mirrors TS `Mode = "text" | "json" | "rpc"`. `rpc` is parsed
 /// (so `--mode rpc` doesn't error) but v1 does not implement it; `main`
@@ -37,9 +81,30 @@ pub enum Mode {
     Rpc,
 }
 
-/// The parsed argument set. Mirrors TS `Args`. Fields absent in v1
-/// (`unknownFlags`, extension/resource discovery) are omitted; everything here
-/// is either honored or explicitly ignored-with-warning.
+/// Interactive TUI presentation mode. `fullscreen` uses the alternate screen
+/// buffer; `regular` renders into the terminal's normal scrollback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiMode {
+    Fullscreen,
+    Regular,
+}
+
+const fn default_tui_mode_for(is_macos: bool) -> TuiMode {
+    if is_macos {
+        TuiMode::Regular
+    } else {
+        TuiMode::Fullscreen
+    }
+}
+
+impl Default for TuiMode {
+    fn default() -> Self {
+        default_tui_mode_for(cfg!(target_os = "macos"))
+    }
+}
+
+/// The parsed argument set. Mirrors TS `Args`. Unknown long flags are retained
+/// for extension consumption; unknown short flags remain hard errors.
 #[derive(Debug, Clone, Default)]
 pub struct Args {
     pub provider: Option<String>,
@@ -48,12 +113,32 @@ pub struct Args {
     /// `--base-url` — overrides `ANTHROPIC_BASE_URL` + each model's base URL,
     /// for third-party Anthropic-compatible gateways/proxies.
     pub base_url: Option<String>,
+    /// `--timeout <seconds>` overrides the deadline for each LLM API request.
+    pub timeout: Option<Duration>,
     pub system_prompt: Option<String>,
     pub append_system_prompt: Vec<String>,
+    /// `--theme` — built-in theme name or a static package theme name/path.
+    pub theme: Option<String>,
     pub thinking: Option<ThinkingLevel>,
 
     pub print: bool,
     pub mode: Mode,
+    /// `--tui-mode regular|fullscreen` controls the interactive terminal
+    /// buffer. macOS defaults to regular so native selection and terminal
+    /// scrollback remain available together; other platforms use fullscreen.
+    pub tui_mode: TuiMode,
+
+    /// `--list-models [search]`: list the merged model catalog and exit.
+    /// `Some("")` represents the bare flag; `None` means absent.
+    pub list_models: Option<String>,
+    /// `--offline`: disable best-effort startup network checks.
+    pub offline: bool,
+    /// `--export <session-file>`: export a JSONL session to HTML (or copy it
+    /// when the destination ends in `.jsonl`).
+    pub export: Option<PathBuf>,
+    /// Explicit project trust override. `--approve` trusts the current
+    /// project; `--no-approve` keeps project-local resources disabled.
+    pub trust_override: Option<bool>,
 
     pub continue_session: bool,
     pub resume: bool,
@@ -87,13 +172,22 @@ pub struct Args {
     /// `--no-context-files`/`-nc`: skip context-file (`AGENTS.md`/`CLAUDE.md`)
     /// discovery + the `<project_context>` system-prompt block.
     pub no_context_files: bool,
-    /// `--no-extensions`/`-ne`: skip cdylib plugin discovery + loading entirely.
+    /// `--no-extensions`/`-ne`: skip Rust cdylib extension loading and act
+    /// as a final kill switch for Pi JS/TS packages when enabled.
     /// Honored by `session.rs` (Part B2): when set, no extension directory is
     /// scanned and no plugin tools/handlers are registered.
     pub no_extensions: bool,
+    /// `--enable-pi-packages`: opt into discovery and loading of configured
+    /// Pi JavaScript/TypeScript packages. This is intentionally opt-in because
+    /// loading a package may start a Node runtime and execute package code.
+    pub enable_pi_packages: bool,
+    /// `--no-themes`: disable package/custom theme discovery and loading.
+    /// Built-in presets remain available unless a custom `--theme` is given.
+    pub no_themes: bool,
     /// `--extensions-dir`/`-ed`: an extra directory to scan for cdylib plugins
-    /// (`.dll`/`.so`/`.dylib`), in addition to the project `.pi/extensions` and
-    /// global `agent_dir()/extensions` defaults. May be repeated; scanned after
+    /// (`.dll`/`.so`/`.dylib`), in addition to project `.rpi/extensions`
+    /// (with legacy `.pi/extensions` compatibility) and global
+    /// `agent_dir()/extensions` defaults. May be repeated; scanned after
     /// the defaults (so a same-named tool in a default dir wins first, mirroring
     /// pi's registration order). `RPI_EXTENSIONS_DIR` (colon-separated on Unix,
     /// semicolon on Windows) provides the same list via env.
@@ -106,6 +200,12 @@ pub struct Args {
     /// `--prompt-template <path>`: load an explicit prompt-template file or
     /// directory (repeated).
     pub prompt_template: Vec<PathBuf>,
+
+    /// Internal scope set by `rpi dev-local` / `rpi dev --local-only`.
+    /// Only the freshly staged development extension and resources it
+    /// discovers are loaded; normal project/global/package discovery is
+    /// skipped. This is intentionally not parsed by the regular CLI parser.
+    pub dev_local_only: bool,
 
     pub verbose: bool,
     pub help: bool,
@@ -125,6 +225,10 @@ pub struct Args {
     /// expand. Mirrors TS `fileArgs`.
     pub file_args: Vec<PathBuf>,
 
+    /// Extension-declared or otherwise unknown long flags. Values are either
+    /// JSON booleans (a bare flag) or strings (a flag with a value), matching
+    /// Pi's `unknownFlags` contract so an extension can claim its own options.
+    pub unknown_flags: BTreeMap<String, serde_json::Value>,
     /// Warnings about recognized-but-ignored flags (v1 scope cuts). Surfaced
     /// to the user on startup when `--verbose`.
     pub ignored: Vec<String>,
@@ -174,6 +278,7 @@ fn file_arg(arg: &str) -> Option<PathBuf> {
 /// ergonomics). Short flags use a single leading `-`.
 pub fn parse_args(args: &[String]) -> Args {
     let mut result = Args::default();
+    result.offline = offline_env_enabled();
     // `RPI_EXTENSIONS_DIR` env: an extra list of plugin dirs prepended to any
     // `--extensions-dir` flags. Semicolon-separated on Windows, colon-separated
     // on Unix (PATH-style). Empty entries skipped. `--no-extensions` still wins.
@@ -253,6 +358,20 @@ pub fn parse_args(args: &[String]) -> Args {
                     };
                 }
             }
+            "--tui-mode" => {
+                if let Some(v) = take_value(&mut result, "--tui-mode") {
+                    result.tui_mode = match v.to_ascii_lowercase().as_str() {
+                        "regular" => TuiMode::Regular,
+                        "fullscreen" => TuiMode::Fullscreen,
+                        other => {
+                            result.errors.push(format!(
+                                "Invalid --tui-mode \"{other}\". Valid: regular, fullscreen"
+                            ));
+                            TuiMode::Fullscreen
+                        }
+                    };
+                }
+            }
             "--continue" | "-c" => result.continue_session = true,
             "--resume" | "-r" => result.resume = true,
             "--no-session" => result.no_session = true,
@@ -262,6 +381,7 @@ pub fn parse_args(args: &[String]) -> Args {
             "--no-prompt-templates" | "-np" => result.no_prompt_templates = true,
             "--no-context-files" | "-nc" => result.no_context_files = true,
             "--no-extensions" | "-ne" => result.no_extensions = true,
+            "--enable-pi-packages" => result.enable_pi_packages = true,
             "--extensions-dir" | "-ed" => {
                 if let Some(v) = take_value(&mut result, &flag_key) {
                     result.extensions_dir.push(PathBuf::from(v));
@@ -273,6 +393,18 @@ pub fn parse_args(args: &[String]) -> Args {
             "--model" => result.model = take_value(&mut result, "--model"),
             "--api-key" => result.api_key = take_value(&mut result, "--api-key"),
             "--base-url" => result.base_url = take_value(&mut result, "--base-url"),
+            "--timeout" => {
+                if let Some(v) = take_value(&mut result, "--timeout") {
+                    match v.parse::<u64>() {
+                        Ok(seconds) if seconds > 0 => {
+                            result.timeout = Some(Duration::from_secs(seconds));
+                        }
+                        _ => result.errors.push(format!(
+                            "Invalid --timeout \"{v}\". Expected a positive integer number of seconds"
+                        )),
+                    }
+                }
+            }
             "--system-prompt" => result.system_prompt = take_value(&mut result, "--system-prompt"),
             "--append-system-prompt" => {
                 if let Some(v) = take_value(&mut result, "--append-system-prompt") {
@@ -329,30 +461,39 @@ pub fn parse_args(args: &[String]) -> Args {
                     result.exclude_tools = Some(split_csv(&v));
                 }
             }
+            "--list-models" => {
+                // Optionally consumes a search term, matching the native
+                // parser's bare-flag versus string distinction.
+                let mut search = inline.clone().unwrap_or_default();
+                if inline.is_none()
+                    && i + 1 < args.len()
+                    && !args[i + 1].starts_with('-')
+                    && !args[i + 1].starts_with('@')
+                {
+                    i += 1;
+                    search = args[i].clone();
+                }
+                result.list_models = Some(search);
+            }
+            "--offline" => result.offline = true,
+            "--export" => {
+                if let Some(value) = take_value(&mut result, &flag_key) {
+                    result.export = Some(PathBuf::from(value));
+                }
+            }
+            "--approve" | "-a" => result.trust_override = Some(true),
+            "--no-approve" | "-na" => result.trust_override = Some(false),
             // ---- Recognized-but-ignored v1 scope cuts (warn, don't error) ----
             // `flag_key` has already had any `=value` peeled, so these match the
             // bare flag name even when the user wrote `--offline=1`.
             //
             // NOTE: `--no-skills`/`-ns`, `--no-prompt-templates`/`-np`,
-            // `--no-context-files`/`-nc`, and `--no-extensions`/`-ne` are now
-            // HONORED (parsed into real fields above), so they no longer reach
-            // this arm. The skill/prompt/context flags gate resource discovery
-            // (`session.rs`); `--no-extensions` is a no-op acceptance until the
-            // Part-B plugin system lands.
-            other
-                if matches!(
-                    other,
-                    "--models"
-                        | "--offline"
-                        | "--export"
-                        | "--tui-mode"
-                        | "--approve"
-                        | "-a"
-                        | "--no-approve"
-                        | "-na"
-                        | "--no-themes"
-                ) =>
-            {
+            // `--no-context-files`/`-nc`, `--no-extensions`/`-ne`, and
+            // `--enable-pi-packages`, and `--no-themes` are honored (parsed
+            // into real fields above), so they no longer reach this arm. The
+            // resource flags gate discovery in `session.rs`; package loading
+            // is separately opt-in.
+            other if matches!(other, "--models") => {
                 // Consume a value if the next token isn't a flag (so
                 // `--models sonnet` doesn't swallow `sonnet` as a message).
                 if inline.is_none()
@@ -367,48 +508,27 @@ pub fn parse_args(args: &[String]) -> Args {
                     .push(format!("{other} is not supported in v1 (ignored)"));
             }
             "--theme" => {
-                // These take a value (or an inline `=`); consume the next token
-                // when there's no inline value so the path isn't read as a
-                // message, then warn.
-                if inline.is_none()
-                    && i + 1 < args.len()
-                    && !args[i + 1].starts_with('-')
-                    && !args[i + 1].starts_with('@')
-                {
-                    i += 1;
-                }
-                result
-                    .ignored
-                    .push("--theme is not supported in v1 (ignored)".to_string());
+                result.theme = take_value(&mut result, "--theme");
             }
-            "--list-models" => {
-                // Optionally consumes a search term.
-                if inline.is_none()
-                    && i + 1 < args.len()
-                    && !args[i + 1].starts_with('-')
-                    && !args[i + 1].starts_with('@')
-                {
-                    i += 1;
-                }
-                result
-                    .ignored
-                    .push("--list-models is not supported in v1 (ignored)".to_string());
-            }
-            // Unknown long flag (with or without `=`). `flag_key` already holds
-            // the bare name, so both `--frobnicate` and `--frobnicate=x` land
-            // here; consume a value if the next token isn't a flag/file.
+            "--no-themes" => result.no_themes = true,
+            // Unknown long flag (with or without `=`). Preserve it for an
+            // extension to claim after extension registration, matching Pi's
+            // `unknownFlags` behavior. A bare flag is boolean true; a following
+            // non-flag token is its string value.
             other if other.starts_with("--") => {
                 let name = &flag_key;
-                if inline.is_none()
-                    && i + 1 < args.len()
+                let value = if let Some(value) = inline {
+                    serde_json::Value::String(value)
+                } else if i + 1 < args.len()
                     && !args[i + 1].starts_with('-')
                     && !args[i + 1].starts_with('@')
                 {
                     i += 1;
-                }
-                result
-                    .ignored
-                    .push(format!("{name} is not a recognized flag (ignored)"));
+                    serde_json::Value::String(args[i].clone())
+                } else {
+                    serde_json::Value::Bool(true)
+                };
+                result.unknown_flags.insert(name[2..].to_string(), value);
             }
             // Unknown short flag → hard error (mirrors TS).
             other if other.starts_with('-') && other.len() > 1 => {
@@ -471,22 +591,29 @@ pub enum RunMode {
 
 /// Print the help text to stdout. Mirrors TS `printHelp`, scoped to v1 flags.
 pub fn print_help() {
-    let builtin = "read, bash, edit, write, grep, find, ls";
+    let builtin = "read, bash, edit, write, docs";
     println!(
-        "{name} - AI coding assistant with read, bash, edit, write, grep, find, ls tools
+        "{name} - AI coding assistant with read, bash, edit, write, docs tools
 
 {u}Usage:{r}
   {name} [options] [@files...] [messages...]
 
 {u}Options:{r}
-  --provider <name>              Provider name (anthropic, openai-completions, or models.json id)
+  --provider <name>              Provider name (anthropic, openai-completions, openai-responses, or models.json id)
   --model <pattern>              Model pattern or ID (supports \"provider/id\" and optional \":<thinking>\")
   --api-key <key>                API key override for the selected provider
   --base-url <url>               Override the selected model endpoint
+  --timeout <seconds>            LLM API request timeout (default: 600)
   --system-prompt <text>         Replace the default system prompt
   --append-system-prompt <text>  Append text to the system prompt (repeatable)
   --thinking <level>             off, minimal, low, medium, high, xhigh, max
   --mode <mode>                  Output mode: text (default), json, or rpc
+  --tui-mode <mode>              TUI buffer: regular or fullscreen (macOS default: regular)
+  --list-models [search]         List available models (with optional fuzzy search)
+  --offline                      Disable startup network operations (same as PI_OFFLINE=1)
+  --export <file>                Export a JSONL session to HTML and exit
+  --approve, -a                  Force-enable current-project resources
+  --no-approve, -na              Disable current-project resources
   --print, -p                    Non-interactive: process prompt(s) and exit
   --continue, -c                 Continue the most recent session
   --resume, -r                   Browse and select a session to resume
@@ -497,11 +624,12 @@ pub fn print_help() {
   --tools, -t <list>             Comma-separated allowlist of tool names to enable
   --exclude-tools, -xt <list>    Comma-separated denylist of tool names to disable
   --no-tools, -nt                Disable all tools
-  --no-builtin-tools, -nbt       Disable the built-in tools (read, bash, edit, write, grep, find, ls)
+  --no-builtin-tools, -nbt       Disable the built-in tools (read, bash, edit, write, docs)
   --no-skills, -ns               Skip skill discovery (no <available_skills> block)
   --no-prompt-templates, -np     Skip prompt-template discovery (/expand templates)
   --no-context-files, -nc        Skip AGENTS.md/CLAUDE.md discovery (no <project_context>)
-  --no-extensions, -ne           Skip cdylib plugin/extension loading entirely
+  --no-extensions, -ne           Skip Rust cdylib and JS/TS extension loading
+  --enable-pi-packages            Enable configured Pi JS/TS packages (starts Node)
   --extensions-dir, -ed <dir>    Extra dir to scan for plugins (.dll/.so/.dylib); repeatable
                                  (also via RPI_EXTENSIONS_DIR env: ';' on Windows, ':' on Unix)
   --debug-system-prompt          Print the resolved system-prompt sections to stderr (verification)
@@ -510,11 +638,27 @@ pub fn print_help() {
   --version, -v                  Show version
 
 {u}Subcommands:{r}
+  update                       Update the rpi CLI from crates.io
   auth login|check|logout        Manage persisted credentials in ~/.rpi/auth.json
                                 (see `rpi auth --help`)
+  package list|add|remove|update Update Rust-native packages and manage Pi package settings
+                                (see `rpi package --help`)
+  install <crate>                Build and install a Rust cdylib extension
+                                (see `rpi install --help`)
+  install-pi <spec>              Install an npm/git/local Pi package
+                                (see `rpi install-pi --help`)
+  pi-package update             Update configured Pi npm/Git packages
+  uninstall <crate>              Remove an installed Rust cdylib extension
+                                (use `rpi uninstall pi <spec>` for Pi packages)
+  uninstall-pi <spec>            Remove an installed npm/git/local Pi package
+                                (see `rpi uninstall-pi --help`)
+  dev [options]                  Build, watch, and hot-reload a Rust extension
+                                (see `rpi dev --help`)
+  dev-local [options]            Debug only the current Rust extension
+                                (shortcut for `rpi dev --local-only`)
 
 {u}Built-in Tools:{r}
-  {builtin}  (enabled by default; grep/find/ls are read-only)
+  {builtin}  (enabled by default)
 
 {u}Examples:{r}
   # Interactive with an initial prompt
@@ -542,15 +686,17 @@ pub fn print_help() {
   ANTHROPIC_API_KEY              Anthropic API key (x-api-key) — fallback when no stored credential
   ANTHROPIC_AUTH_TOKEN           Bearer token (Authorization: Bearer) for third-party gateways
   ANTHROPIC_BASE_URL             Override the Anthropic endpoint (e.g. a compatible proxy)
-  OPENAI_API_KEY                 Bearer token for openai-completions
+  OPENAI_API_KEY                 Bearer token for openai-completions/responses
+  PI_OFFLINE                     Disable startup network operations when set to 1/true/yes
   RPI_CODING_AGENT_DIR           Override the ~/.rpi config directory (auth.json + models.json)
 
 {u}Notes:{r}
   Supported HTTP protocols are Anthropic Messages and OpenAI Chat Completions.
   Define custom model catalogs and provider apiKey values in
-  ~/.rpi/agent/models.json. The interactive TUI, extensions, skills, prompt
-  templates, themes, model cycling, session fork/export, and trust commands are
-  available in the current build. OAuth, package manager, and HTML export remain
+  ~/.rpi/agent/models.json. The interactive TUI, Rust and JS/TS extensions,
+  opt-in Pi package resources, skills, prompt templates, themes, model cycling, session
+  fork/export, and trust commands are
+  available in the current build. OAuth, RPC, and full model cycling remain
   outside the current implementation.
 ",
         name = crate::APP_NAME,
@@ -568,6 +714,17 @@ pub fn print_version() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct RestoreOfflineEnv(Option<std::ffi::OsString>);
+
+    impl Drop for RestoreOfflineEnv {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var(PI_OFFLINE_ENV, value),
+                None => std::env::remove_var(PI_OFFLINE_ENV),
+            }
+        }
+    }
 
     fn s(args: &[&str]) -> Vec<String> {
         args.iter().map(|a| a.to_string()).collect()
@@ -633,10 +790,36 @@ mod tests {
     }
 
     #[test]
-    fn unknown_long_flag_warns_not_errors() {
+    fn unknown_long_flag_is_retained_for_extensions() {
         let a = parse_args(&s(&["--frobnicate", "value"]));
         assert!(a.errors.is_empty());
-        assert!(!a.ignored.is_empty());
+        assert_eq!(
+            a.unknown_flags.get("frobnicate"),
+            Some(&serde_json::Value::String("value".into()))
+        );
+        assert!(a.ignored.is_empty());
+    }
+
+    #[test]
+    fn unknown_long_boolean_flag_is_retained() {
+        let a = parse_args(&s(&["--server"]));
+        assert_eq!(
+            a.unknown_flags.get("server"),
+            Some(&serde_json::Value::Bool(true))
+        );
+    }
+
+    #[test]
+    fn unknown_long_flags_keep_string_and_equals_values() {
+        let a = parse_args(&s(&["--port", "8080", "--bind=127.0.0.1"]));
+        assert_eq!(
+            a.unknown_flags.get("port"),
+            Some(&serde_json::Value::String("8080".into()))
+        );
+        assert_eq!(
+            a.unknown_flags.get("bind"),
+            Some(&serde_json::Value::String("127.0.0.1".into()))
+        );
     }
 
     #[test]
@@ -650,6 +833,107 @@ mod tests {
         );
         // The value is consumed, not read as a message:
         assert!(a.messages.is_empty());
+    }
+
+    #[test]
+    fn list_models_accepts_bare_and_search_forms() {
+        let bare = parse_args(&s(&["--list-models"]));
+        assert_eq!(bare.list_models.as_deref(), Some(""));
+        assert!(bare.ignored.is_empty());
+        assert!(bare.messages.is_empty());
+
+        let search = parse_args(&s(&["--list-models", "claude"]));
+        assert_eq!(search.list_models.as_deref(), Some("claude"));
+        assert!(search.messages.is_empty());
+
+        let inline = parse_args(&s(&["--list-models=gpt"]));
+        assert_eq!(inline.list_models.as_deref(), Some("gpt"));
+    }
+
+    #[test]
+    fn offline_flag_is_honored_without_warning() {
+        let args = parse_args(&s(&["--offline"]));
+        assert!(args.offline);
+        assert!(args.ignored.is_empty());
+    }
+
+    #[test]
+    fn timeout_parses_seconds_in_separate_and_equals_forms() {
+        let separate = parse_args(&s(&["--timeout", "45"]));
+        assert!(separate.errors.is_empty());
+        assert_eq!(separate.timeout, Some(Duration::from_secs(45)));
+
+        let inline = parse_args(&s(&["--timeout=90"]));
+        assert!(inline.errors.is_empty());
+        assert_eq!(inline.timeout, Some(Duration::from_secs(90)));
+    }
+
+    #[test]
+    fn timeout_rejects_zero_and_invalid_values() {
+        for value in ["0", "1.5", "forever", "18446744073709551616"] {
+            let args = parse_args(&s(&[&format!("--timeout={value}")]));
+            assert_eq!(args.errors.len(), 1, "value: {value}");
+            assert!(args.timeout.is_none(), "value: {value}");
+        }
+    }
+
+    #[test]
+    fn native_pi_offline_truthy_values_are_case_insensitive() {
+        for value in [
+            Some("1"),
+            Some("true"),
+            Some("TRUE"),
+            Some("Yes"),
+            Some("yEs"),
+        ] {
+            assert!(is_truthy_env_flag(value), "value={value:?}");
+        }
+        for value in [
+            None,
+            Some(""),
+            Some("0"),
+            Some("false"),
+            Some("no"),
+            Some(" true "),
+        ] {
+            assert!(!is_truthy_env_flag(value), "value={value:?}");
+        }
+    }
+
+    #[test]
+    fn pi_offline_env_and_cli_flag_share_one_normalized_gate() {
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore = RestoreOfflineEnv(std::env::var_os(PI_OFFLINE_ENV));
+
+        std::env::set_var(PI_OFFLINE_ENV, "YeS");
+        assert!(parse_args(&[]).offline);
+        assert!(normalize_offline_mode(&[]));
+        assert_eq!(std::env::var(PI_OFFLINE_ENV).as_deref(), Ok("1"));
+
+        std::env::set_var(PI_OFFLINE_ENV, "0");
+        assert!(!parse_args(&[]).offline);
+        let argv = s(&["package", "update", "--offline"]);
+        assert!(normalize_offline_mode(&argv));
+        assert_eq!(std::env::var(PI_OFFLINE_ENV).as_deref(), Ok("1"));
+        assert_eq!(without_offline_flag(&argv), s(&["package", "update"]));
+    }
+
+    #[test]
+    fn project_trust_flags_are_honored_without_warning() {
+        let approved = parse_args(&s(&["--approve"]));
+        assert_eq!(approved.trust_override, Some(true));
+        assert!(approved.ignored.is_empty());
+        let denied = parse_args(&s(&["--no-approve"]));
+        assert_eq!(denied.trust_override, Some(false));
+        assert!(denied.ignored.is_empty());
+    }
+
+    #[test]
+    fn export_flag_captures_input_and_output_position() {
+        let args = parse_args(&s(&["--export", "session.jsonl", "transcript.html"]));
+        assert_eq!(args.export, Some(PathBuf::from("session.jsonl")));
+        assert_eq!(args.messages, vec!["transcript.html".to_string()]);
+        assert!(args.ignored.is_empty());
     }
 
     #[test]
@@ -696,10 +980,20 @@ mod tests {
 
     #[test]
     fn no_extensions_flag_honored() {
-        // `--no-extensions` is now parsed (no-op acceptance until Part B), no
-        // longer a warn-ignored v1 scope cut.
+        // `--no-extensions` is parsed and disables both extension backends.
         let a = parse_args(&s(&["--no-extensions"]));
         assert!(a.no_extensions);
+        assert!(a.ignored.is_empty());
+    }
+
+    #[test]
+    fn pi_packages_are_disabled_by_default_and_explicitly_enabled() {
+        let a = parse_args(&s(&[]));
+        assert!(!a.enable_pi_packages);
+        assert!(a.ignored.is_empty());
+
+        let a = parse_args(&s(&["--enable-pi-packages"]));
+        assert!(a.enable_pi_packages);
         assert!(a.ignored.is_empty());
     }
 
@@ -748,6 +1042,40 @@ mod tests {
         let a = parse_args(&s(&["--model=claude-sonnet-5", "--thinking=low"]));
         assert_eq!(a.model.as_deref(), Some("claude-sonnet-5"));
         assert_eq!(a.thinking, Some(ThinkingLevel::Low));
+    }
+
+    #[test]
+    fn theme_flag_is_honored() {
+        let a = parse_args(&s(&["--theme", "ocean.json"]));
+        assert_eq!(a.theme.as_deref(), Some("ocean.json"));
+        assert!(a.ignored.is_empty());
+    }
+
+    #[test]
+    fn no_themes_is_honored() {
+        let a = parse_args(&s(&["--no-themes"]));
+        assert!(a.no_themes);
+        assert!(a.ignored.is_empty());
+    }
+
+    #[test]
+    fn tui_mode_parses_and_validates() {
+        assert_eq!(
+            parse_args(&s(&["--tui-mode", "regular"])).tui_mode,
+            TuiMode::Regular
+        );
+        assert_eq!(
+            parse_args(&s(&["--tui-mode=fullscreen"])).tui_mode,
+            TuiMode::Fullscreen
+        );
+        let invalid = parse_args(&s(&["--tui-mode", "split"]));
+        assert!(!invalid.errors.is_empty());
+    }
+
+    #[test]
+    fn tui_mode_default_preserves_native_macos_scrollback() {
+        assert_eq!(default_tui_mode_for(true), TuiMode::Regular);
+        assert_eq!(default_tui_mode_for(false), TuiMode::Fullscreen);
     }
 
     #[test]

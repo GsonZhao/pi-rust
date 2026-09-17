@@ -30,6 +30,7 @@ use crate::AiError;
 pub struct OpenAiCompletionsProvider {
     id: String,
     api_key: Option<String>,
+    allow_env_api_key: bool,
     http: reqwest::Client,
     models: Vec<Model>,
 }
@@ -41,9 +42,29 @@ impl OpenAiCompletionsProvider {
         http: reqwest::Client,
         models: Vec<Model>,
     ) -> Self {
+        let id = id.into();
+        let allow_env_api_key = id == "openai";
+        Self {
+            id,
+            api_key,
+            allow_env_api_key,
+            http,
+            models,
+        }
+    }
+
+    /// Build a compatible custom provider without inheriting OpenAI's
+    /// process-wide credential.
+    pub fn with_models_without_env_api_key(
+        id: impl Into<String>,
+        api_key: Option<String>,
+        http: reqwest::Client,
+        models: Vec<Model>,
+    ) -> Self {
         Self {
             id: id.into(),
             api_key,
+            allow_env_api_key: false,
             http,
             models,
         }
@@ -69,12 +90,22 @@ impl Provider for OpenAiCompletionsProvider {
         let (mut producer, stream) = create_assistant_message_event_stream();
         let http = self.http.clone();
         let provider_key = self.api_key.clone();
+        let allow_env_api_key = self.allow_env_api_key;
         let model = model.clone();
         let ctx = Arc::new(ctx.clone());
         let opts = opts.clone();
 
         tokio::spawn(async move {
-            run_stream(&mut producer, http, provider_key, &model, &ctx, &opts).await;
+            run_stream(
+                &mut producer,
+                http,
+                provider_key,
+                allow_env_api_key,
+                &model,
+                &ctx,
+                &opts,
+            )
+            .await;
         });
 
         stream
@@ -85,16 +116,13 @@ async fn run_stream(
     producer: &mut AssistantMessageEventStreamProducer,
     http: reqwest::Client,
     provider_key: Option<String>,
+    allow_env_api_key: bool,
     model: &Model,
     ctx: &Context,
     opts: &SimpleStreamOptions,
 ) {
     let mut state = StreamState::new(model);
-    let api_key = opts.api_key.clone().or(provider_key).or_else(|| {
-        std::env::var("OPENAI_API_KEY")
-            .ok()
-            .filter(|v| !v.is_empty())
-    });
+    let api_key = resolve_api_key(&provider_key, opts, allow_env_api_key);
 
     let mut headers = model.headers.clone().unwrap_or_default();
     if let Some(extra) = &opts.headers {
@@ -102,10 +130,7 @@ async fn run_stream(
             headers.insert(name.clone(), value.clone());
         }
     }
-    if let Some(key) = api_key {
-        headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
-        headers.insert("authorization".into(), format!("Bearer {key}"));
-    }
+    apply_api_key(&mut headers, api_key);
     if !has_auth_header(&headers) {
         state.error(
             producer,
@@ -119,7 +144,7 @@ async fn run_stream(
     let url = chat_completions_url(&model.base_url);
     // A silent/stalled gateway must not leave the harness in Working forever.
     // Callers can override this through SimpleStreamOptions when needed.
-    let timeout = opts.timeout.or(Some(std::time::Duration::from_secs(120)));
+    let timeout = opts.request_timeout();
     let signal = opts.signal.clone();
     let response = retry_provider_request(
         move || {
@@ -129,10 +154,7 @@ async fn run_stream(
             let headers = headers.clone();
             let signal = signal.clone();
             async move {
-                let mut request = http.post(&url);
-                if let Some(timeout) = timeout {
-                    request = request.timeout(timeout);
-                }
+                let mut request = http.post(&url).timeout(timeout);
                 for (name, value) in headers {
                     request = request.header(name, value);
                 }
@@ -432,11 +454,32 @@ fn user_content(content: &UserContent) -> Value {
 
 fn chat_completions_url(base_url: &str) -> String {
     let base = base_url.trim_end_matches('/');
-    if base.ends_with("/v1") {
+    // Pi-compatible configs commonly use either a host root (append `/v1`)
+    // or a provider-specific versioned root such as `/api/coding/v3` (append
+    // only `/chat/completions`). Do not turn the latter into `/v3/v1/...`.
+    if base.ends_with("/chat/completions") {
+        base.to_string()
+    } else if base
+        .rsplit('/')
+        .next()
+        .is_some_and(|segment| is_version_segment(segment))
+    {
         format!("{base}/chat/completions")
     } else {
         format!("{base}/v1/chat/completions")
     }
+}
+
+fn is_version_segment(segment: &str) -> bool {
+    let Some(digits) = segment.strip_prefix('v') else {
+        return false;
+    };
+    let digit_count = digits.chars().take_while(|ch| ch.is_ascii_digit()).count();
+    digit_count > 0
+        && digits
+            .chars()
+            .skip(digit_count)
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_')
 }
 
 fn compat(model: &Model) -> Option<&crate::model::OpenaiCompletionsCompat> {
@@ -519,6 +562,37 @@ fn has_auth_header(headers: &BTreeMap<String, String>) -> bool {
     })
 }
 
+fn resolve_api_key(
+    provider_key: &Option<String>,
+    opts: &SimpleStreamOptions,
+    allow_env_api_key: bool,
+) -> Option<String> {
+    resolve_api_key_with_env(provider_key, opts, allow_env_api_key, || {
+        std::env::var("OPENAI_API_KEY")
+            .ok()
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn resolve_api_key_with_env(
+    provider_key: &Option<String>,
+    opts: &SimpleStreamOptions,
+    allow_env_api_key: bool,
+    read_env_api_key: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    opts.api_key
+        .clone()
+        .or_else(|| provider_key.clone())
+        .or_else(|| allow_env_api_key.then(read_env_api_key).flatten())
+}
+
+fn apply_api_key(headers: &mut BTreeMap<String, String>, api_key: Option<String>) {
+    if let Some(key) = api_key {
+        headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
+        headers.insert("authorization".into(), format!("Bearer {key}"));
+    }
+}
+
 struct ToolState {
     content_index: usize,
     id: String,
@@ -581,7 +655,7 @@ impl StreamState {
         else {
             return;
         };
-        if chunk.get("usage").is_none_or(Value::is_null) {
+        if chunk.get("usage").map_or(true, Value::is_null) {
             if let Some(usage) = choice.get("usage").filter(|v| !v.is_null()) {
                 self.output.usage = parse_usage(usage);
             }
@@ -899,6 +973,49 @@ mod tests {
     }
 
     #[test]
+    fn isolated_custom_provider_never_overwrites_auth_with_openai_env_key() {
+        let opts = SimpleStreamOptions::default();
+        let env_read = std::cell::Cell::new(false);
+        let resolved = resolve_api_key_with_env(&None, &opts, false, || {
+            env_read.set(true);
+            Some("official-openai-key".into())
+        });
+        let mut headers = BTreeMap::from([("authorization".into(), "Bearer gateway-key".into())]);
+        apply_api_key(&mut headers, resolved);
+
+        assert!(
+            !env_read.get(),
+            "isolated providers must not read OpenAI env auth"
+        );
+        assert_eq!(
+            headers.get("authorization").map(String::as_str),
+            Some("Bearer gateway-key")
+        );
+        assert!(headers
+            .values()
+            .all(|value| value != "Bearer official-openai-key"));
+    }
+
+    #[test]
+    fn only_exact_openai_provider_id_inherits_the_environment_key() {
+        let official = OpenAiCompletionsProvider::with_models(
+            "openai",
+            None,
+            reqwest::Client::new(),
+            Vec::new(),
+        );
+        let case_variant = OpenAiCompletionsProvider::with_models(
+            "OpenAI",
+            None,
+            reqwest::Client::new(),
+            Vec::new(),
+        );
+
+        assert!(official.allow_env_api_key);
+        assert!(!case_variant.allow_env_api_key);
+    }
+
+    #[test]
     fn builds_chat_completions_request() {
         let mut context = Context::new(vec![Message::User(UserMessage::new("hello", 0))]);
         context.system_prompt = Some("system".into());
@@ -1080,6 +1197,18 @@ mod tests {
         assert_eq!(
             chat_completions_url("https://gateway.test"),
             "https://gateway.test/v1/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_url("https://ark.cn-beijing.volces.com/api/coding/v3"),
+            "https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_url("https://gateway.test/v1beta/"),
+            "https://gateway.test/v1beta/chat/completions"
+        );
+        assert_eq!(
+            chat_completions_url("https://gateway.test/custom/chat/completions"),
+            "https://gateway.test/custom/chat/completions"
         );
     }
 }

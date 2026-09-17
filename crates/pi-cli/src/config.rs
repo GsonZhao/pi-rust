@@ -36,6 +36,7 @@
 //! (auth.json key, models.json bearer apiKey, provider/model `headers`).
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use rpi_ai::{Api, InputModality, Model, StreamingProtocolCompat};
@@ -143,6 +144,42 @@ pub fn trust_path() -> Result<PathBuf, ConfigError> {
     Ok(agent_dir()?.join("trust.json"))
 }
 
+/// Native Pi's default agent file, used only as a read fallback when rpi's
+/// corresponding file is absent. An explicit rpi agent-dir override is an
+/// isolation boundary and therefore disables fallback reads.
+fn native_pi_agent_file(file_name: &str) -> Option<PathBuf> {
+    if std::env::var_os(CONFIG_DIR_ENV).is_some() {
+        return None;
+    }
+    dirs::home_dir().map(|home| home.join(".pi/agent").join(file_name))
+}
+
+fn read_text_with_fallback(
+    primary: PathBuf,
+    fallback: Option<PathBuf>,
+) -> Result<Option<(PathBuf, String)>, ConfigError> {
+    match std::fs::read_to_string(&primary) {
+        Ok(text) => Ok(Some((primary, text))),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+            let Some(fallback) = fallback.filter(|path| path != &primary) else {
+                return Ok(None);
+            };
+            match std::fs::read_to_string(&fallback) {
+                Ok(text) => Ok(Some((fallback, text))),
+                Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(source) => Err(ConfigError::Read {
+                    path: fallback,
+                    source,
+                }),
+            }
+        }
+        Err(source) => Err(ConfigError::Read {
+            path: primary,
+            source,
+        }),
+    }
+}
+
 /// One-time best-effort migration of a pre-nesting flat layout
 /// (`~/.rpi/{auth.json,models.json,.setup_done,.earendil_seen}`) into the
 /// nested `~/.rpi/agent/` layout. **No-op when `RPI_CODING_AGENT_DIR` is set**
@@ -237,13 +274,11 @@ pub type AuthStore = BTreeMap<String, Credential>;
 /// JSON ⇒ `ConfigError::Json` (we do not silently swallow a corrupt auth file).
 pub fn read_auth() -> Result<AuthStore, ConfigError> {
     let path = auth_path()?;
-    match std::fs::read_to_string(&path) {
-        Ok(text) => Ok(serde_json::from_str(&text).map_err(|e| ConfigError::Json {
-            path: path.clone(),
-            source: e,
-        })?),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(AuthStore::new()),
-        Err(e) => Err(ConfigError::Read { path, source: e }),
+    match read_text_with_fallback(path, native_pi_agent_file("auth.json"))? {
+        Some((path, text)) => {
+            serde_json::from_str(&text).map_err(|source| ConfigError::Json { path, source })
+        }
+        None => Ok(AuthStore::new()),
     }
 }
 
@@ -290,7 +325,9 @@ pub fn delete_credential(provider_id: &str) -> Result<bool, ConfigError> {
 #[serde(rename_all = "camelCase")]
 pub struct ModelsConfig {
     #[serde(default)]
-    pub providers: BTreeMap<String, ProviderConfig>,
+    // Native Pi walks Object.entries(config.providers), so declaration order
+    // participates in the final available-model fallback.
+    pub providers: indexmap::IndexMap<String, ProviderConfig>,
 }
 
 /// A provider entry in `models.json`. The fields mirror the TS `ProviderConfig`
@@ -345,13 +382,11 @@ pub struct ModelDefinition {
 /// Load `~/.rpi/models.json`. Missing file ⇒ empty config (no error).
 pub fn load_models_config() -> Result<ModelsConfig, ConfigError> {
     let path = models_path()?;
-    match std::fs::read_to_string(&path) {
-        Ok(text) => parse_models_json(&text).map_err(|e| ConfigError::Json {
-            path: path.clone(),
-            source: e,
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(ModelsConfig::default()),
-        Err(e) => Err(ConfigError::Read { path, source: e }),
+    match read_text_with_fallback(path, native_pi_agent_file("models.json"))? {
+        Some((path, text)) => {
+            parse_models_json(&text).map_err(|source| ConfigError::Json { path, source })
+        }
+        None => Ok(ModelsConfig::default()),
     }
 }
 
@@ -400,6 +435,16 @@ pub fn set_project_trust(cwd: &Path, trusted: Option<bool>) -> Result<(), Config
     atomic_write(&path, json.as_bytes())?;
     set_owner_only(&path);
     Ok(())
+}
+
+/// Return the stored trust decision for `cwd`. A missing entry (or an entry
+/// explicitly set to `null`) returns `None`; callers choose their safe default.
+pub fn project_trust_decision(cwd: &Path) -> Result<Option<bool>, ConfigError> {
+    let key = std::fs::canonicalize(cwd)
+        .unwrap_or_else(|_| cwd.to_path_buf())
+        .to_string_lossy()
+        .into_owned();
+    Ok(read_trust()?.get(&key).copied().flatten())
 }
 
 /// Parse the models JSON, tolerating `//` line comments (a minimal subset of
@@ -724,6 +769,66 @@ pub fn provider_is_openai_completions(cfg: &ProviderConfig) -> bool {
     matches!(cfg.api.as_deref(), Some("openai-completions"))
 }
 
+pub fn provider_is_openai_responses(cfg: &ProviderConfig) -> bool {
+    matches!(cfg.api.as_deref(), Some("openai-responses"))
+}
+
+/// Resolve an OpenAI-compatible provider key from its explicit config or a
+/// known provider's canonical environment variable. Arbitrary custom provider
+/// ids must declare `apiKey: "$ENV"`: deriving an env name by normalizing the
+/// id would collapse distinct native-Pi identities such as `a-b` and `a_b`.
+pub fn openai_provider_api_key(provider_id: &str, cfg: &ProviderConfig) -> Option<String> {
+    if let Some(raw) = cfg.api_key.as_deref().filter(|key| !key.is_empty()) {
+        if let Some(value) = resolve_config_value(raw, None).filter(|value| !value.is_empty()) {
+            return Some(value);
+        }
+    }
+
+    let name = native_provider_api_key_env_var(provider_id)?;
+    std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+/// Native Pi's provider-id-to-environment-variable mapping. Provider ids are
+/// identities, so aliases and case variants must not inherit another
+/// provider's credential.
+fn native_provider_api_key_env_var(provider_id: &str) -> Option<&'static str> {
+    match provider_id {
+        "ant-ling" => Some("ANT_LING_API_KEY"),
+        "qwen-token-plan" | "qwen-token-plan-individual" => Some("QWEN_TOKEN_PLAN_API_KEY"),
+        "qwen-token-plan-cn" => Some("QWEN_TOKEN_PLAN_CN_API_KEY"),
+        "openai" => Some("OPENAI_API_KEY"),
+        "azure-openai-responses" => Some("AZURE_OPENAI_API_KEY"),
+        "nvidia" => Some("NVIDIA_API_KEY"),
+        "deepseek" => Some("DEEPSEEK_API_KEY"),
+        "google" => Some("GEMINI_API_KEY"),
+        "google-vertex" => Some("GOOGLE_CLOUD_API_KEY"),
+        "groq" => Some("GROQ_API_KEY"),
+        "cerebras" => Some("CEREBRAS_API_KEY"),
+        "xai" => Some("XAI_API_KEY"),
+        "radius" => Some("RADIUS_API_KEY"),
+        "openrouter" => Some("OPENROUTER_API_KEY"),
+        "vercel-ai-gateway" => Some("AI_GATEWAY_API_KEY"),
+        "zai" => Some("ZAI_API_KEY"),
+        "zai-coding-cn" => Some("ZAI_CODING_CN_API_KEY"),
+        "mistral" => Some("MISTRAL_API_KEY"),
+        "minimax" => Some("MINIMAX_API_KEY"),
+        "minimax-cn" => Some("MINIMAX_CN_API_KEY"),
+        "moonshotai" | "moonshotai-cn" => Some("MOONSHOT_API_KEY"),
+        "huggingface" => Some("HF_TOKEN"),
+        "fireworks" => Some("FIREWORKS_API_KEY"),
+        "together" => Some("TOGETHER_API_KEY"),
+        "baseten" => Some("BASETEN_API_KEY"),
+        "opencode" | "opencode-go" => Some("OPENCODE_API_KEY"),
+        "kimi-coding" => Some("KIMI_API_KEY"),
+        "cloudflare-workers-ai" | "cloudflare-ai-gateway" => Some("CLOUDFLARE_API_KEY"),
+        "xiaomi" => Some("XIAOMI_API_KEY"),
+        "xiaomi-token-plan-cn" => Some("XIAOMI_TOKEN_PLAN_CN_API_KEY"),
+        "xiaomi-token-plan-ams" => Some("XIAOMI_TOKEN_PLAN_AMS_API_KEY"),
+        "xiaomi-token-plan-sgp" => Some("XIAOMI_TOKEN_PLAN_SGP_API_KEY"),
+        _ => None,
+    }
+}
+
 /// Convert a `(provider_id, ProviderConfig)` pair into a list of library
 /// [`Model`]s. Provider-level `base_url`/`headers`/`auth_header` fold into each
 /// model. Returns `None` for protocols that do not have a runtime provider.
@@ -732,11 +837,13 @@ pub fn provider_to_models(provider_id: &str, cfg: &ProviderConfig) -> Option<Vec
         Api::AnthropicMessages
     } else if provider_is_openai_completions(cfg) {
         Api::OpenaiCompletions
+    } else if provider_is_openai_responses(cfg) {
+        Api::OpenaiResponses
     } else {
         return None;
     };
     let provider_base = cfg.base_url.clone().unwrap_or_else(|| match api {
-        Api::OpenaiCompletions => "https://api.openai.com".to_string(),
+        Api::OpenaiCompletions | Api::OpenaiResponses => "https://api.openai.com".to_string(),
         _ => default_anthropic_base_url(),
     });
     let mut merged: Vec<Model> = Vec::with_capacity(cfg.models.len());
@@ -746,27 +853,11 @@ pub fn provider_to_models(provider_id: &str, cfg: &ProviderConfig) -> Option<Vec
             .clone()
             .unwrap_or_else(|| provider_base.clone());
         let name = def.name.clone().unwrap_or_else(|| def.id.clone());
-        // v1 routes EVERY anthropic-messages model through the single
-        // `AnthropicProvider` (whose `id()` is "anthropic"). Upstream
-        // `registerProvider(providerName, …)` registers a distinct provider per
-        // models.json key and routes by that key; v1 has no multi-provider
-        // registry, so the models.json provider id is config-namespacing only
-        // — the per-model `base_url` + `headers` carry the actual endpoint/auth
-        // differentiation. Stamping `provider = "anthropic"` here lets the
-        // harness's `resolve_provider` (`provider.id() == model.provider`)
-        // match. Without this, a `gateway/custom-claude` model would carry
-        // `provider = "gateway"` and the run would fail with "No provider
-        // registered for 'gateway'". Divergence documented in
-        // `docs/m6-cli-open-questions.md`.
-        let runtime_provider = match api {
-            Api::OpenaiCompletions => provider_id,
-            _ => DEFAULT_PROVIDER_ID,
-        };
         let mut m = Model::new(
             def.id.clone(),
             name,
             api.clone(),
-            runtime_provider.to_string(),
+            provider_id.to_string(),
             base_url,
         );
         m.reasoning = def.reasoning.unwrap_or(false);
@@ -797,18 +888,17 @@ pub fn provider_to_models(provider_id: &str, cfg: &ProviderConfig) -> Option<Vec
                 headers.insert(k, v);
             }
         }
-        if matches!(api, Api::OpenaiCompletions) {
-            if let Some(key) = cfg
-                .api_key
-                .as_deref()
-                .filter(|key| !key.is_empty())
-                .and_then(|key| resolve_config_value(key, None))
-            {
+        if matches!(api, Api::OpenaiCompletions | Api::OpenaiResponses) {
+            if let Some(key) = openai_provider_api_key(provider_id, cfg) {
                 headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization"));
                 headers.insert("authorization".to_string(), format!("Bearer {key}"));
             }
             if let Some(value) = def.compat.clone() {
-                if let Ok(compat) = serde_json::from_value(value) {
+                if matches!(api, Api::OpenaiResponses) {
+                    if let Ok(compat) = serde_json::from_value(value) {
+                        m.compat = Some(StreamingProtocolCompat::OpenaiResponses(compat));
+                    }
+                } else if let Ok(compat) = serde_json::from_value(value) {
                     m.compat = Some(StreamingProtocolCompat::OpenaiCompletions(compat));
                 }
             }
@@ -864,7 +954,7 @@ pub fn default_anthropic_base_url() -> String {
 // ---------------------------------------------------------------------------
 
 #[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 /// Create the config dir if missing. Mode 0o700 on Unix (mkdir default on
 /// Windows, where the sticky-permission concept doesn't apply).
@@ -885,23 +975,44 @@ fn ensure_dir(dir: &Path) -> Result<(), ConfigError> {
 
 /// Write `bytes` to `path` atomically: a temp sibling → `rename`. The temp
 /// file lives next to the target so the rename stays on one filesystem.
-fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), ConfigError> {
     let dir = path.parent().ok_or_else(|| ConfigError::Write {
         path: path.to_path_buf(),
         source: std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent"),
     })?;
     let tmp = dir.join(format!(
-        ".{}.tmp",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("rpi")
+        ".{}.{}.tmp",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("rpi"),
+        uuid::Uuid::new_v4().simple()
     ));
-    std::fs::write(&tmp, bytes).map_err(|e| ConfigError::Write {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(&tmp).map_err(|source| ConfigError::Write {
         path: tmp.clone(),
-        source: e,
+        source,
     })?;
-    std::fs::rename(&tmp, path).map_err(|e| ConfigError::Write {
-        path: path.to_path_buf(),
-        source: e,
-    })?;
+    if let Err(error) = file.write_all(bytes).and_then(|()| file.sync_all()) {
+        // A partial staging file is never useful to a later caller. Best
+        // effort cleanup also avoids leaving a misleading stale temp behind
+        // when the target itself was left untouched.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ConfigError::Write {
+            path: tmp,
+            source: error,
+        });
+    }
+    drop(file);
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        // `rename` is the publish point; on failure the original target is
+        // still intact. Remove the staging file before returning the error.
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ConfigError::Write {
+            path: path.to_path_buf(),
+            source: error,
+        });
+    }
     Ok(())
 }
 
@@ -1029,6 +1140,38 @@ mod tests {
     }
 
     #[test]
+    fn fallback_reader_prefers_primary_and_only_falls_back_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("primary.json");
+        let fallback = tmp.path().join("fallback.json");
+        std::fs::write(&fallback, "fallback").unwrap();
+
+        let (_, text) = read_text_with_fallback(primary.clone(), Some(fallback.clone()))
+            .unwrap()
+            .expect("fallback should be read");
+        assert_eq!(text, "fallback");
+
+        std::fs::write(&primary, "primary").unwrap();
+        let (path, text) = read_text_with_fallback(primary.clone(), Some(fallback))
+            .unwrap()
+            .expect("primary should be read");
+        assert_eq!(path, primary);
+        assert_eq!(text, "primary");
+    }
+
+    #[test]
+    fn fallback_reader_does_not_mask_primary_read_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let primary = tmp.path().join("primary.json");
+        let fallback = tmp.path().join("fallback.json");
+        std::fs::create_dir(&primary).unwrap();
+        std::fs::write(&fallback, "fallback").unwrap();
+
+        let error = read_text_with_fallback(primary.clone(), Some(fallback)).unwrap_err();
+        assert!(matches!(error, ConfigError::Read { path, .. } if path == primary));
+    }
+
+    #[test]
     fn load_models_config_parses_with_comments() {
         let _cfg = TempConfig::new();
         let json = r#"{
@@ -1091,10 +1234,7 @@ mod tests {
         let m = &models[0];
         assert_eq!(m.id, "claude-sonnet-5");
         assert_eq!(m.base_url, "https://gw.example.com");
-        // v1 stamps `provider = "anthropic"` on every models.json model so the
-        // single AnthropicProvider routes it (the models.json provider id is
-        // config-namespacing only).
-        assert_eq!(m.provider, DEFAULT_PROVIDER_ID);
+        assert_eq!(m.provider, "gateway");
         let headers = m.headers.as_ref().expect("provider headers merged");
         // Declared provider header folds in…
         assert_eq!(
@@ -1139,6 +1279,138 @@ mod tests {
                 .map(String::as_str),
             Some("Bearer secret")
         );
+    }
+
+    #[test]
+    fn custom_openai_provider_resolves_explicit_api_key_environment_reference() {
+        let _guard = env_lock().lock().unwrap();
+        let env_name = "RPI_FAKE_PROVIDER_API_KEY";
+        std::env::set_var(env_name, "env-secret");
+        let cfg = ProviderConfig {
+            name: None,
+            base_url: Some("https://gateway.example.com/v1".into()),
+            api_key: Some("$RPI_FAKE_PROVIDER_API_KEY".into()),
+            api: Some("openai-completions".into()),
+            headers: None,
+            auth_header: None,
+            models: vec![ModelDefinition {
+                id: "fake-model".into(),
+                name: None,
+                base_url: None,
+                reasoning: None,
+                context_window: None,
+                max_tokens: None,
+                input: None,
+                headers: None,
+                compat: None,
+            }],
+        };
+        let models = provider_to_models("rpi-fake-provider", &cfg).unwrap();
+        assert_eq!(
+            models[0]
+                .headers
+                .as_ref()
+                .and_then(|headers| headers.get("authorization"))
+                .map(String::as_str),
+            Some("Bearer env-secret")
+        );
+        std::env::remove_var(env_name);
+    }
+
+    #[test]
+    fn openai_protocol_ids_do_not_inherit_the_official_env_key() {
+        let _guard = env_lock().lock().unwrap();
+        let prev_openai = std::env::var_os("OPENAI_API_KEY");
+        let prev_completions = std::env::var_os("OPENAI_COMPLETIONS_API_KEY");
+        let prev_responses = std::env::var_os("OPENAI_RESPONSES_API_KEY");
+        std::env::set_var("OPENAI_API_KEY", "official-key");
+        std::env::remove_var("OPENAI_COMPLETIONS_API_KEY");
+        std::env::remove_var("OPENAI_RESPONSES_API_KEY");
+        let config = ProviderConfig {
+            name: None,
+            base_url: Some("https://gateway.example.com/v1".into()),
+            api_key: None,
+            api: Some("openai-responses".into()),
+            headers: None,
+            auth_header: None,
+            models: Vec::new(),
+        };
+
+        assert_eq!(
+            openai_provider_api_key("openai", &config).as_deref(),
+            Some("official-key")
+        );
+        assert!(openai_provider_api_key("openai-completions", &config).is_none());
+        assert!(openai_provider_api_key("openai-responses", &config).is_none());
+        assert!(openai_provider_api_key("OpenAI", &config).is_none());
+
+        restore_env("OPENAI_API_KEY", prev_openai);
+        restore_env("OPENAI_COMPLETIONS_API_KEY", prev_completions);
+        restore_env("OPENAI_RESPONSES_API_KEY", prev_responses);
+    }
+
+    #[test]
+    fn native_provider_api_key_env_mapping_uses_exact_provider_ids() {
+        for (provider, env_var) in [
+            ("ant-ling", "ANT_LING_API_KEY"),
+            ("qwen-token-plan", "QWEN_TOKEN_PLAN_API_KEY"),
+            ("qwen-token-plan-cn", "QWEN_TOKEN_PLAN_CN_API_KEY"),
+            ("qwen-token-plan-individual", "QWEN_TOKEN_PLAN_API_KEY"),
+            ("openai", "OPENAI_API_KEY"),
+            ("azure-openai-responses", "AZURE_OPENAI_API_KEY"),
+            ("nvidia", "NVIDIA_API_KEY"),
+            ("deepseek", "DEEPSEEK_API_KEY"),
+            ("google", "GEMINI_API_KEY"),
+            ("google-vertex", "GOOGLE_CLOUD_API_KEY"),
+            ("groq", "GROQ_API_KEY"),
+            ("cerebras", "CEREBRAS_API_KEY"),
+            ("xai", "XAI_API_KEY"),
+            ("radius", "RADIUS_API_KEY"),
+            ("openrouter", "OPENROUTER_API_KEY"),
+            ("vercel-ai-gateway", "AI_GATEWAY_API_KEY"),
+            ("zai", "ZAI_API_KEY"),
+            ("zai-coding-cn", "ZAI_CODING_CN_API_KEY"),
+            ("mistral", "MISTRAL_API_KEY"),
+            ("minimax", "MINIMAX_API_KEY"),
+            ("minimax-cn", "MINIMAX_CN_API_KEY"),
+            ("moonshotai", "MOONSHOT_API_KEY"),
+            ("moonshotai-cn", "MOONSHOT_API_KEY"),
+            ("huggingface", "HF_TOKEN"),
+            ("fireworks", "FIREWORKS_API_KEY"),
+            ("together", "TOGETHER_API_KEY"),
+            ("baseten", "BASETEN_API_KEY"),
+            ("opencode", "OPENCODE_API_KEY"),
+            ("opencode-go", "OPENCODE_API_KEY"),
+            ("kimi-coding", "KIMI_API_KEY"),
+            ("cloudflare-workers-ai", "CLOUDFLARE_API_KEY"),
+            ("cloudflare-ai-gateway", "CLOUDFLARE_API_KEY"),
+            ("xiaomi", "XIAOMI_API_KEY"),
+            ("xiaomi-token-plan-cn", "XIAOMI_TOKEN_PLAN_CN_API_KEY"),
+            ("xiaomi-token-plan-ams", "XIAOMI_TOKEN_PLAN_AMS_API_KEY"),
+            ("xiaomi-token-plan-sgp", "XIAOMI_TOKEN_PLAN_SGP_API_KEY"),
+        ] {
+            assert_eq!(
+                native_provider_api_key_env_var(provider),
+                Some(env_var),
+                "unexpected env mapping for {provider}"
+            );
+        }
+
+        for alias in [
+            "togetherai",
+            "perplexity",
+            "moonshot",
+            "kimi",
+            "qwen",
+            "zhipu",
+            "OpenAI",
+        ] {
+            assert_eq!(
+                native_provider_api_key_env_var(alias),
+                None,
+                "non-native alias {alias} must not inherit credentials"
+            );
+        }
     }
 
     #[test]

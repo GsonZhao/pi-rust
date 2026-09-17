@@ -327,7 +327,11 @@ async fn kill_process_tree(pid: u32) {
         cmd.stdin(std::process::Stdio::null());
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
-        let _ = cmd.spawn();
+        // Wait for taskkill itself to finish. Spawning it fire-and-forget lets
+        // the shell's `child.wait()` race the tree termination, and a listener
+        // can keep its inherited stdout/stderr handles open long enough to
+        // deadlock the capture join after Ctrl+C.
+        let _ = cmd.status().await;
     }
     #[cfg(unix)]
     {
@@ -859,7 +863,15 @@ impl Shell for OsExecutionEnv {
                 let mut buf = vec![0u8; 8192];
                 use tokio::io::AsyncReadExt;
                 loop {
-                    let n = match s.read(&mut buf).await {
+                    let read = s.read(&mut buf);
+                    let read_result = match cancel {
+                        Some(token) => tokio::select! {
+                            result = read => result,
+                            _ = token.cancelled() => break,
+                        },
+                        None => read.await,
+                    };
+                    let n = match read_result {
                         Ok(0) => break,
                         Ok(n) => n,
                         Err(_) => break,
@@ -879,7 +891,15 @@ impl Shell for OsExecutionEnv {
                 let mut buf = vec![0u8; 8192];
                 use tokio::io::AsyncReadExt;
                 loop {
-                    let n = match s.read(&mut buf).await {
+                    let read = s.read(&mut buf);
+                    let read_result = match cancel {
+                        Some(token) => tokio::select! {
+                            result = read => result,
+                            _ = token.cancelled() => break,
+                        },
+                        None => read.await,
+                    };
+                    let n = match read_result {
                         Ok(0) => break,
                         Ok(n) => n,
                         Err(_) => break,

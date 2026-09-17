@@ -6,22 +6,24 @@
 //! v1 scope cuts vs the TS SDK (tracked in `docs/m6-cli-open-questions.md`):
 //! - **Skill / prompt-template / context-file discovery IS wired**
 //!   (`--no-skills`/`-ns`, `--no-prompt-templates`/`-np`, `--no-context-files`/
-//!   `-nc` each suppress one channel; project `.pi/<sub>` + global
+//!   `-nc` each suppress one channel; project `.rpi/<sub>` + legacy
+//!   `.pi/<sub>` + global
 //!   `agent_dir()<sub>` discovery with project-wins dedupe via
 //!   [`crate::resource_dirs`]; SYSTEM.md/APPEND_SYSTEM.md project-wins
 //!   precedence). **Extension `resources_discover` (B5b) feeds the SAME loaders:
 //!   a plugin's discovered skill/prompt paths merge with the static dirs and
 //!   re-run through `load_skills`/`load_prompt_templates` (individual `.md` files
-//!   load too — `load_skills` accepts both dirs and files). Theme discovery is
-//!   accepted but ignored (rpi has no theme system — documented divergence).**
-//!   **Trust gating remains deferred** — project resources are discovered
-//!   unconditionally (a copied `.pi/` drops in and works).
-//! - **No `--models` cycling, no `ModelRuntime`/multi-provider.** One model,
-//!   one provider (Anthropic), resolved up-front by [`crate::provider`].
-//! - **Built-in tools**: `read`, `bash`, `edit`, `write` plus the read-only
-//!   `grep`/`find`/`ls` (the TS `createCodingTools` default set). `grep`/`find`
-//!   use an in-process `FileSystem`+`regex`/`globset` implementation (documented
-//!   divergence from the TS `rg`/`fd` shell-out; see `docs/m4-tools-open-questions.md`).
+//!   load too — `load_skills` accepts both dirs and files). Package themes are
+//!   parsed by the TUI when selected via settings or `--theme`.**
+//!   Project resources load by default without a prompt. `--no-approve` or a
+//!   stored negative `trust.json` decision disables them explicitly.
+//! - **No `ModelRuntime`/multi-provider registry.** The resolver supports the
+//!   built-in Anthropic/OpenAI-compatible providers and `models.json`, but
+//!   runtime catalog mutation remains outside this layer.
+//! - **Built-in tools**: `read`, `bash`, `edit`, `write`, and the read-only
+//!   `docs` lookup tool. The former rpi-only `grep`, `find`, `ls`, and
+//!   `powershell` tools remain library modules but are not registered by the
+//!   CLI.
 //! - **Session restore (`-c`/`-r`/`--session`)** is *partially* supported: a
 //!   fresh session is always created. The harness's `create` rejects sessions
 //!   that already have records unless `allow_existing_session` is enabled.
@@ -32,52 +34,96 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
+use rpi_agent::AgentTool;
 use rpi_ai::Provider;
 use rpi_harness::agent_harness::AgentHarness;
 use rpi_harness::context_files::{format_project_context, load_project_context_files};
 use rpi_harness::session::memory::{InMemorySessionStorage, SystemClock};
 use rpi_harness::session::session::DefaultIdGenerator;
-use rpi_harness::session::types::SessionMetadata;
+use rpi_harness::session::types::{BranchBounds, EntryQuery, SessionMetadata};
 use rpi_harness::session::Session;
 use rpi_harness::system_prompt::compose_system_prompt;
 use rpi_harness::types::{
-    AgentHarnessOptions, AgentHarnessResources, CompactionSettings, DrivingMode, HarnessTool,
-    HarnessToolExecution, RetryPolicy, ToolReplay,
+    AgentHarnessOptions, AgentHarnessResources, AgentHarnessStreamOptions, CompactionSettings,
+    DrivingMode, HarnessTool, HarnessToolExecution, RetryPolicy, ToolReplay,
 };
 use rpi_tools::{
-    create_bash_tool, create_edit_tool, create_find_tool, create_grep_tool, create_ls_tool,
-    create_read_tool, create_write_tool, ExecutionToolContext, MutationQueueRegistry,
-    OsExecutionEnv,
+    create_bash_tool, create_edit_tool, create_read_tool, create_write_tool, ExecutionToolContext,
+    MutationQueueRegistry, OsExecutionEnv,
 };
 
 use crate::args::Args;
+use crate::docs_tool::create_docs_tool;
+use crate::extension_api::ExtensionBackend;
 use crate::provider::ResolvedModel;
 use crate::resource_dirs::{
-    discover_append_system_prompt_file, discover_system_prompt_file, global_dir,
-    load_prompt_templates_with_precedence, load_skills_with_precedence, project_dir,
-    prompt_template_dirs, skill_dirs,
+    discover_append_system_prompt_file_with_packages, discover_system_prompt_file_with_packages,
+    extension_dirs, global_extension_dirs, global_prompt_template_dirs, global_skill_dirs,
+    load_prompt_templates_with_precedence, load_skills_with_precedence,
+    project_prompt_template_dirs, project_skill_dirs, prompt_template_dirs, skill_dirs,
 };
 use rpi_extensions::{
     emit_resources_discover, ExtensionEmitter, ExtensionSession, NullDiagnostics,
     PluginDiagnostics, PluginToolAdapter, TeeEmitter,
 };
 
-/// The subdirectory (under both project `.pi/` and global `agent_dir()/`) where
-/// rpi scans for cdylib plugins. Mirrors pi's `.pi/extensions`.
-const EXTENSIONS_SUBDIR: &str = "extensions";
+/// The Pi-compatible coding tools registered by the CLI by default.
+pub const BUILTIN_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write", "docs"];
 
-/// The built-in tool names v1 ships, in the order the TS `createCodingTools`
-/// registers them: the mutating set (`read`/`bash`/`edit`/`write`) followed by
-/// the read-only search set (`grep`/`find`/`ls`).
-pub const BUILTIN_TOOL_NAMES: &[&str] = &["read", "bash", "edit", "write", "grep", "find", "ls"];
+/// Package-backed JS/TS loading is opt-in. `--no-extensions` remains a final
+/// kill switch even when package loading was explicitly enabled.
+pub(crate) fn should_load_js_packages(args: &Args) -> bool {
+    args.enable_pi_packages && !args.no_extensions
+}
+
+/// Resolve configured package resources once for this session. Keeping the
+/// boundary here ensures disabled package loading never parses settings or
+/// starts the Node host, including during reload.
+pub(crate) fn package_resources_for(
+    args: &Args,
+    cwd: &Path,
+    project_trusted: bool,
+) -> crate::packages::PackageResources {
+    if should_load_js_packages(args) {
+        if crate::args::offline_mode_enabled(args.offline) {
+            if project_trusted {
+                crate::packages::resolve_offline_from_settings(cwd)
+            } else {
+                crate::packages::resolve_offline_from_global_settings(cwd)
+            }
+        } else if project_trusted {
+            crate::packages::resolve_from_settings(cwd)
+        } else {
+            crate::packages::resolve_from_global_settings(cwd)
+        }
+    } else {
+        crate::packages::PackageResources::default()
+    }
+}
+
+/// Resolve package manifests for a metadata-only update check. Unlike runtime
+/// loading, this does not require `--enable-pi-packages`: reading package names
+/// and versions neither starts Node nor executes package code. Project-local
+/// settings remain behind the same trust decision as the runtime loader.
+pub(crate) fn package_resources_for_update_check(
+    args: &Args,
+    cwd: &Path,
+    project_trusted: bool,
+) -> crate::packages::PackageResources {
+    if args.dev_local_only {
+        crate::packages::PackageResources::default()
+    } else if project_trusted {
+        crate::packages::discover_from_settings(cwd)
+    } else {
+        crate::packages::discover_from_global_settings(cwd)
+    }
+}
 
 /// The default coding system prompt. A condensed port of the TS
-/// `packages/coding-agent/src/core/system-prompt.ts` base prompt — the
-/// pi-internal docs/skills/context-file sections are omitted (v1 has none of
-/// that machinery), leaving the role + tools + guidelines core.
+/// `packages/coding-agent/src/core/system-prompt.ts` base prompt.
 pub fn default_system_prompt(cwd: &str) -> String {
     format!(
-        "You are an expert coding assistant operating inside pi, a coding agent harness. \
+        "You are an expert coding assistant operating inside rpi, a coding agent harness. \
 You help users by reading files, executing commands, editing code, and writing new files.
 
 Available tools:
@@ -85,14 +131,13 @@ Available tools:
 - bash  — Execute shell commands
 - edit  — Find/replace edits to existing files
 - write — Create or overwrite files
-- grep  — Search file contents for a pattern
-- find  — Search for files by glob pattern
-- ls    — List directory contents
+- docs  — Look up rpi usage, extension, package, and compatibility documentation
 
 Guidelines:
 - Be concise in your responses
 - Show file paths clearly when working with files
 - Prefer the smallest change that solves the problem
+- When unsure about rpi commands, extensions, Pi package compatibility, or .rpi configuration, consult the project documentation before guessing
 
 Current working directory: {cwd}"
     )
@@ -150,11 +195,17 @@ pub fn select_session(args: &Args, cwd: &Path) -> SessionSelection {
     }
 }
 
-/// The default session directory: `<cwd>/.pi/sessions`. Mirrors the TS
-/// `getDefaultSessionDir` (`.pi/agent/sessions` in TS; v1 uses `.pi/sessions`
-/// under the project — a documented divergence).
+/// The default session directory: prefer `<cwd>/.rpi/sessions`, while keeping
+/// an existing `<cwd>/.pi/sessions` directory usable for compatibility. A new
+/// project therefore starts with the rpi-owned directory.
 pub fn default_session_dir(cwd: &Path) -> PathBuf {
-    cwd.join(".pi").join("sessions")
+    let preferred = cwd.join(".rpi").join("sessions");
+    let legacy = cwd.join(".pi").join("sessions");
+    if preferred.exists() || !legacy.exists() {
+        preferred
+    } else {
+        legacy
+    }
 }
 
 /// Build the `AgentHarness` from the resolved model + parsed args + cwd.
@@ -178,6 +229,7 @@ pub async fn build(
     resolved: &ResolvedModel,
     args: &Args,
     cwd: &Path,
+    project_trusted: bool,
 ) -> Result<
     (
         AgentHarness,
@@ -187,6 +239,19 @@ pub async fn build(
     BuildError,
 > {
     let cwd_str = cwd.to_string_lossy().to_string();
+    if !project_trusted && args.verbose {
+        eprintln!(
+            "warning: current-project settings, resources, and discovered extensions are explicitly disabled (use --approve or /trust yes to re-enable)"
+        );
+    }
+    // Pi packages are explicitly opt-in because discovery can start Node and
+    // execute package code. An explicit project opt-out limits discovery to
+    // global settings.
+    let package_resources = if args.dev_local_only {
+        crate::packages::PackageResources::default()
+    } else {
+        package_resources_for(args, cwd, project_trusted)
+    };
 
     // ---- B5a: build the action bridge BEFORE extension load ----
     // Extensions load before `AgentHarness::create` (extensions provide tools the
@@ -210,6 +275,7 @@ pub async fn build(
         catalog.clone(),
         cwd.to_path_buf(),
         runtime.clone(),
+        args.unknown_flags.clone(),
     );
     let host_arc: Arc<dyn rpi_extensions::RuntimeActionHost> = Arc::new(action_host);
     // `runtime` is reused below (B5c: `PluggableProvider` needs a captured
@@ -250,35 +316,134 @@ pub async fn build(
     let extension_session = if args.no_extensions {
         ExtensionSession::none()
     } else {
-        load_extensions(args, cwd, Some(Arc::clone(&action_bridge)))
+        load_extensions(args, cwd, project_trusted, Some(Arc::clone(&action_bridge)))
     };
+    let js_extension_session = if !should_load_js_packages(args) {
+        None
+    } else {
+        let paths = js_extension_paths(args, cwd, project_trusted, &package_resources);
+        let js_context = serde_json::json!({
+            "cwd": cwd_str,
+            "theme": resolved.theme.clone(),
+            "currentModel": resolved.model.clone(),
+            "models": catalog.clone(),
+            "thinkingLevel": resolved.thinking_level,
+        });
+        match crate::js_extensions::JsExtensionSession::load_with_context(
+            &paths,
+            args.verbose,
+            js_context,
+        ) {
+            Ok(session) => session,
+            Err(error) => {
+                eprintln!("warning: JS/TS extensions were not loaded: {error}");
+                None
+            }
+        }
+    };
+    if js_extension_session.is_some() {
+        eprintln!(
+            "warning: enabled Pi JS/TS extensions execute with the current user's permissions"
+        );
+    }
+    if let Some(session) = &js_extension_session {
+        if let Err(error) =
+            session.enable_provider_runtime(resolved.provider.clone(), runtime.clone())
+        {
+            if args.verbose {
+                eprintln!("warning: JS provider runtime was not enabled: {error}");
+            }
+        }
+    }
     if args.verbose {
+        if let Some(session) = &js_extension_session {
+            let info = session.backend_info();
+            eprintln!(
+                "JS extension backend: {} v{} ({})",
+                info.name,
+                info.api_version,
+                info.capability_names().join(", ")
+            );
+        }
         if let Some(s) = extension_session.summary() {
             eprintln!("extensions: {s}");
         }
         report_deferred_renderers(&extension_session);
     }
     merge_extension_tools(&mut tools, &extension_session, args);
-    let active = active_tool_names(&tools, args);
+    if let Some(session) = &js_extension_session {
+        merge_js_extension_tools(&mut tools, session, args);
+        if args.verbose && !session.commands.is_empty() {
+            eprintln!("JS extension commands: {}", session.commands.join(", "));
+        }
+    }
+    let mut active = active_tool_names(&tools, args);
+    // JS extensions reconcile their own tools during the initial
+    // `before_agent_start` event. Merge that Node-side subset into the full
+    // Rust tool list so a headless launch can hide UI-only tools such as
+    // ask_user_question without dropping built-ins.
+    if let Some(session) = &js_extension_session {
+        let js_names = session.tool_names();
+        if let Some(js_active) = session.active_tools() {
+            active.retain(|name| !js_names.iter().any(|js| js == name));
+            active.extend(js_active.into_iter().filter(|name| {
+                js_names.iter().any(|js| js == name) && tool_name_allowed(name, args)
+            }));
+        }
+    }
+    active = filter_active_tool_names(active, args);
 
     // ---- Session storage ----
     let selection = select_session(args, cwd);
     let session = build_session(&selection, &cwd_str).await?;
+    if let Some(js) = &js_extension_session {
+        let session_id = session
+            .get_metadata()
+            .await
+            .ok()
+            .map(|metadata| metadata.id);
+        let leaf_id = session.get_leaf_id().await.ok().flatten();
+        if let Some(session_id) = session_id {
+            let branch = session
+                .find_entries_on_branch(&EntryQuery::default(), &BranchBounds::default())
+                .await
+                .ok()
+                .unwrap_or_default();
+            let branch_json =
+                serde_json::to_value(&branch).unwrap_or_else(|_| serde_json::json!([]));
+            let runtime_context = serde_json::json!({
+                "session": {
+                    "id": session_id,
+                    "leafId": leaf_id,
+                    "branch": branch_json,
+                    "entries": branch_json.clone(),
+                },
+            });
+            if let Err(error) = js.set_runtime_context(runtime_context) {
+                if args.verbose {
+                    eprintln!("warning: could not sync JS session context: {error}");
+                }
+            }
+        }
+    }
 
     // ---- System prompt base (precedence: --system-prompt > SYSTEM.md > default) ----
     // Mirrors pi `discoverSystemPromptFile` (`resource-loader.ts:1022-1034`):
     // an explicit `--system-prompt` flag wins; otherwise a discovered
-    // `<cwd>/.pi/SYSTEM.md` (project) overrides `<agent_dir>/SYSTEM.md`
+    // `<cwd>/.rpi/SYSTEM.md` wins, then legacy `<cwd>/.pi/SYSTEM.md`, then
+    // `<agent_dir>/SYSTEM.md`.
     // (global); otherwise the built-in default. **Project-wins** — the same
     // direction as skills/prompts precedence.
     let base_prompt = match args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
-        None => match discover_system_prompt_file(cwd) {
-            Some(path) => {
-                std::fs::read_to_string(&path).unwrap_or_else(|_| default_system_prompt(&cwd_str))
+        None if project_trusted => {
+            match discover_system_prompt_file_with_packages(cwd, &package_resources) {
+                Some(path) => std::fs::read_to_string(&path)
+                    .unwrap_or_else(|_| default_system_prompt(&cwd_str)),
+                None => default_system_prompt(&cwd_str),
             }
-            None => default_system_prompt(&cwd_str),
-        },
+        }
+        None => default_system_prompt(&cwd_str),
     };
 
     // ---- Append-text sources (precedence: --append-system-prompt > APPEND_SYSTEM.md) ----
@@ -293,7 +458,10 @@ pub async fn build(
         append_texts.push(text);
     }
     if args.append_system_prompt.is_empty() {
-        if let Some(path) = discover_append_system_prompt_file(cwd) {
+        if let Some(path) = project_trusted
+            .then(|| discover_append_system_prompt_file_with_packages(cwd, &package_resources))
+            .flatten()
+        {
             if let Ok(text) = std::fs::read_to_string(&path) {
                 append_texts.push(text);
             }
@@ -307,20 +475,22 @@ pub async fn build(
 
     // ---- Resource discovery (skills + prompt-templates + context-files) ----
     // The env is OS-backed, rooted at cwd. Each `--no-*` flag suppresses its
-    // channel independently (pi parity). Skills/prompts load project→global then
-    // dedupe first-wins-by-name (project wins). Context files walk
+    // channel independently (pi parity). Skills/prompts load project→global,
+    // explicit/plugin paths, then static packages; dedupe first-wins-by-name
+    // keeps project and user resources ahead of packages. Context files walk
     // global→ancestor(cwd→root), deepest-last (pi parity).
     //
-    // **Trust gate (v1 divergence):** pi gates project `.pi/*` discovery on
+    // **Trust gate (v1 divergence):** pi gates project config discovery on
     // `isProjectTrusted()` (global resources are unconditional). rpi v1 has no
     // trust prompt — project resources are discovered unconditionally (a copied
-    // `.pi/` drops in and works). Full trust gating is deferred.
+    // `.rpi/` or `.pi/` drops in and works). Full trust gating is deferred.
     let agent_dir = crate::config::agent_dir().ok();
 
     // ---- B5b: extension resources_discover ----
     // If any plugin registered a `resources_discover` handler, fan the event out
     // (reason "startup") and collect skill/prompt/theme paths. These plugin-
-    // contributed paths merge WITH the static Part-A dirs (project `.pi/skills` +
+    // contributed paths merge WITH the static Part-A dirs (project
+    // `.rpi/skills`, legacy `.pi/skills` +
     // `agent_dir/skills`, etc.) and the loaders re-run over the union — the
     // coherence point: a plugin's discovered skills land through the SAME loaders
     // as static skills. Static dirs load FIRST so project skills keep winning name
@@ -328,7 +498,8 @@ pub async fn build(
     // mirrors pi `extendResources` running AFTER the default load's first-wins
     // map). `load_skills` now accepts both dirs and individual `.md` files, so a
     // plugin returning bare `SKILL.md` paths loads them (the gap this closes).
-    // Themes are accepted but ignored (rpi has no theme system — documented).
+    // Theme paths are available to the TUI through the package resource list;
+    // skill/prompt loaders are the only resources needed by the harness here.
     // A `--no-*` flag suppresses its channel for BOTH static and discovered paths.
     let discovered = extension_session
         .snapshot_arc()
@@ -338,9 +509,19 @@ pub async fn build(
     let mut skills: Vec<rpi_harness::types::Skill> = Vec::new();
     let mut skill_diags: Vec<rpi_harness::skills::SkillDiagnostic> = Vec::new();
     if !args.no_skills {
-        let mut dirs = skill_dirs(cwd);
+        let mut dirs = if args.dev_local_only {
+            project_skill_dirs(cwd)
+        } else if project_trusted {
+            skill_dirs(cwd)
+        } else {
+            global_skill_dirs()
+        };
         dirs.extend(args.skill.iter().cloned());
         dirs.extend(discovered.skill_paths.iter().map(PathBuf::from));
+        if let Some(session) = &js_extension_session {
+            dirs.extend(session.resources.skill_paths.iter().cloned());
+        }
+        dirs.extend(package_resources.skill_dirs());
         let result = load_skills_with_precedence(&env_dyn, &dirs).await;
         skills = result.skills;
         skill_diags = result.diagnostics;
@@ -349,15 +530,25 @@ pub async fn build(
     let mut prompt_templates: Vec<rpi_harness::types::PromptTemplate> = Vec::new();
     let mut prompt_diags: Vec<rpi_harness::prompt_templates::PromptTemplateDiagnostic> = Vec::new();
     if !args.no_prompt_templates {
-        let mut dirs = prompt_template_dirs(cwd);
+        let mut dirs = if args.dev_local_only {
+            project_prompt_template_dirs(cwd)
+        } else if project_trusted {
+            prompt_template_dirs(cwd)
+        } else {
+            global_prompt_template_dirs()
+        };
         dirs.extend(args.prompt_template.iter().cloned());
         dirs.extend(discovered.prompt_paths.iter().map(PathBuf::from));
+        if let Some(session) = &js_extension_session {
+            dirs.extend(session.resources.prompt_paths.iter().cloned());
+        }
+        dirs.extend(package_resources.prompt_dirs());
         let result = load_prompt_templates_with_precedence(&env_dyn, &dirs).await;
         prompt_templates = result.prompt_templates;
         prompt_diags = result.diagnostics;
     }
 
-    let context_block = if args.no_context_files {
+    let context_block = if args.no_context_files || !project_trusted {
         String::new()
     } else {
         // `load_project_context_files` walks the global agentDir first then
@@ -371,6 +562,9 @@ pub async fn build(
 
     // Surface resource-discovery diagnostics as startup warnings (verbose-only).
     if args.verbose {
+        for d in &package_resources.diagnostics {
+            eprintln!("warning: package {}: {}", d.spec, d.message);
+        }
         for d in &skill_diags {
             eprintln!(
                 "warning: skill {} ({}): {}",
@@ -420,7 +614,7 @@ pub async fn build(
         eprintln!("=== --debug-system-prompt ===");
         let base_src = if args.system_prompt.is_some() {
             "--system-prompt"
-        } else if discover_system_prompt_file(cwd).is_some() {
+        } else if discover_system_prompt_file_with_packages(cwd, &package_resources).is_some() {
             "SYSTEM.md"
         } else {
             "default"
@@ -460,9 +654,10 @@ pub async fn build(
             eprintln!("    /{}", t.name);
         }
         // B5b: surface plugin-contributed discovery paths so a smoke can confirm
-        // the resources_discover round-trip fed the loaders (themes ignored).
+        // the resources_discover round-trip fed the loaders; package themes are
+        // selected by the TUI rather than injected into the harness prompt.
         eprintln!(
-            "--- discovered via resources_discover: {} skill(s), {} prompt(s), {} theme(s) (ignored) ---",
+            "--- discovered via resources_discover: {} skill(s), {} prompt(s), {} theme(s) ---",
             discovered.skill_paths.len(),
             discovered.prompt_paths.len(),
             discovered.theme_paths.len(),
@@ -533,7 +728,10 @@ pub async fn build(
                 | SessionSelection::ByExactId { .. }
                 | SessionSelection::Fork { .. }
         ),
-        stream_options: Default::default(),
+        stream_options: AgentHarnessStreamOptions {
+            timeout: args.timeout,
+            ..Default::default()
+        },
         retry: RetryPolicy::default(),
         compaction: CompactionSettings::default(),
         steering_mode: Default::default(),
@@ -591,15 +789,19 @@ pub async fn build(
     // of a harness back-reference so it can be `Clone` into the reload callback).
     let reload_context = ReloadContext {
         extension_session: Arc::new(Mutex::new(extension_session)),
+        js_extension_session: js_extension_session.clone(),
+        package_resources: Arc::new(package_resources.clone()),
         action_bridge: Arc::new(Mutex::new(Some(Arc::clone(&action_bridge)))),
         catalog,
         gateway: resolved.provider.clone(),
         runtime: runtime.clone(),
         cwd: cwd.to_path_buf(),
+        project_trusted,
         args: args.clone(),
         resolved_model: resolved.model.clone(),
         broadcast: broadcast_for_context,
         mailbox: reload_mailbox,
+        dev_extension: None,
     };
 
     Ok((harness, event_rx, reload_context))
@@ -668,6 +870,12 @@ pub type ActionBridgeCell = Arc<Mutex<Option<Arc<rpi_extensions::ActionBridge>>>
 pub struct ReloadContext {
     /// The live extension-session cell (swapped on reload).
     pub extension_session: ExtensionSessionCell,
+    /// JS/TS Pi extension host kept alive for the interactive session.
+    pub js_extension_session: Option<crate::js_extensions::JsExtensionSession>,
+    /// The exact trust-gated package set resolved during initial build. The TUI
+    /// reuses this snapshot so failed startup remediation is not retried or
+    /// accidentally exposed by a second best-effort discovery pass.
+    pub package_resources: Arc<crate::packages::PackageResources>,
     /// The live action-bridge cell (swapped + old invalidated on reload).
     pub action_bridge: ActionBridgeCell,
     /// The model catalog (read-only) the host uses to resolve `set_model(id)`.
@@ -684,6 +892,10 @@ pub struct ReloadContext {
     pub runtime: tokio::runtime::Handle,
     /// The cwd (for static resource-dir resolution + context-file walk).
     pub cwd: PathBuf,
+    /// The project-trust decision captured before provider and session setup.
+    /// Startup consumers reuse this value so extension code cannot change the
+    /// effective policy by mutating the process cwd while it is loading.
+    pub project_trusted: bool,
     /// The parsed args (cloned) — `--no-*`/`--tools`/`--exclude-tools`/
     /// `--extensions-dir`/`--no-extensions`/`--system-prompt`/etc all apply on
     /// reload exactly as at startup (a reload re-reads the same flags; it does
@@ -706,6 +918,10 @@ pub struct ReloadContext {
     /// THIS mailbox (not a fresh default) when building the fresh bridge, so the
     /// bridge always carries the mailbox the TUI installed across reloads.
     pub mailbox: rpi_extensions::ReloadMailbox,
+    /// Active `rpi dev` extension builder. `/reload` rebuilds it before
+    /// swapping plugin sessions; its watcher signals `mailbox` after a
+    /// successful background build.
+    pub dev_extension: Option<Arc<crate::dev_extension::DevExtension>>,
 }
 
 /// The outcome of a reload: a human-readable status line for the transcript
@@ -716,6 +932,31 @@ pub struct ReloadOutcome {
     pub summary: String,
     /// True iff at least one extension load warning fired (ABI mismatch / skip).
     pub had_warnings: bool,
+}
+
+struct PreparedReloadInputs {
+    package_resources: crate::packages::PackageResources,
+    extension_dirs: Vec<PathBuf>,
+    skill_base_dirs: Vec<PathBuf>,
+    prompt_base_dirs: Vec<PathBuf>,
+}
+
+/// Append the resource sources that are specific to a reload after the
+/// conventional project/global directories. Keep this order aligned with the
+/// initial build: explicit CLI paths must remain available after `/reload`,
+/// while discovered and package resources retain their lower precedence.
+fn append_reload_resource_paths(
+    mut paths: Vec<PathBuf>,
+    explicit: &[PathBuf],
+    discovered: &[String],
+    js_paths: &[PathBuf],
+    package_paths: &[PathBuf],
+) -> Vec<PathBuf> {
+    paths.extend(explicit.iter().cloned());
+    paths.extend(discovered.iter().map(PathBuf::from));
+    paths.extend(js_paths.iter().cloned());
+    paths.extend(package_paths.iter().cloned());
+    paths
 }
 
 /// Re-run extension + resource discovery and push the rebuilt state into the
@@ -733,7 +974,56 @@ pub async fn reload_extension_resources(
     harness: &AgentHarness,
     ctx: &ReloadContext,
 ) -> ReloadOutcome {
+    reload_extension_resources_inner(harness, ctx, || {}).await
+}
+
+async fn reload_extension_resources_inner<F>(
+    harness: &AgentHarness,
+    ctx: &ReloadContext,
+    after_prepare: F,
+) -> ReloadOutcome
+where
+    F: FnOnce() + Send,
+{
+    // Resolve the arguments once for this reload. `rpi dev` may append its
+    // freshly staged extension directory; every subsequent loader and policy
+    // decision must observe that same effective set rather than falling back
+    // to the pre-dev snapshot held in `ctx.args`.
+    let mut effective_args = ctx.args.clone();
+    if let Some(dev) = &ctx.dev_extension {
+        if let Err(error) = dev
+            .rebuild()
+            .and_then(|_| dev.apply_to_args(&mut effective_args))
+        {
+            return ReloadOutcome {
+                summary: format!(
+                    "Extension build failed for {}: {error}. Keeping the currently loaded version.",
+                    dev.package_name()
+                ),
+                had_warnings: true,
+            };
+        }
+    }
     let cwd_str = ctx.cwd.to_string_lossy().to_string();
+    let project_trusted = resolve_project_trust(&effective_args, &ctx.cwd);
+    let prepared = match prepare_reload_inputs(&effective_args, &ctx.cwd, project_trusted) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            return ReloadOutcome {
+                summary: format!(
+                    "Settings reload failed: {error}. Keeping the currently loaded resources."
+                ),
+                had_warnings: true,
+            };
+        }
+    };
+    after_prepare();
+    let PreparedReloadInputs {
+        package_resources,
+        extension_dirs,
+        skill_base_dirs,
+        prompt_base_dirs,
+    } = prepared;
     let mut warnings = false;
 
     // ---- 1. Build a fresh ActionBridge + ExtensionSession ----
@@ -752,6 +1042,7 @@ pub async fn reload_extension_resources(
                 ctx.catalog.clone(),
                 ctx.cwd.clone(),
                 ctx.runtime.clone(),
+                ctx.args.unknown_flags.clone(),
             );
             crate::extensions_actions::HarnessActionHost::set_harness(
                 &_cell,
@@ -765,16 +1056,20 @@ pub async fn reload_extension_resources(
     let fresh_bridge =
         rpi_extensions::ActionBridge::with_reload(ctx.runtime.clone(), host, reload_cb);
 
-    let extension_session = if ctx.args.no_extensions {
+    let extension_session = if effective_args.no_extensions {
         rpi_extensions::ExtensionSession::none()
     } else {
-        load_extensions(&ctx.args, &ctx.cwd, Some(Arc::clone(&fresh_bridge)))
+        load_extensions_from_dirs(
+            &effective_args,
+            &extension_dirs,
+            Some(Arc::clone(&fresh_bridge)),
+        )
     };
-    if extension_session.is_empty() && !ctx.args.no_extensions {
+    if extension_session.is_empty() && !effective_args.no_extensions {
         // The fresh session may be empty if no cdylibs are present — not a
         // warning per se, but note it.
     }
-    if ctx.args.verbose {
+    if effective_args.verbose {
         if let Some(s) = extension_session.summary() {
             eprintln!("reload: {s}");
         }
@@ -831,9 +1126,23 @@ pub async fn reload_extension_resources(
 
     let mut skills: Vec<rpi_harness::types::Skill> = Vec::new();
     let mut skill_diags: Vec<rpi_harness::skills::SkillDiagnostic> = Vec::new();
-    if !ctx.args.no_skills {
-        let mut dirs = skill_dirs(&ctx.cwd);
-        dirs.extend(discovered.skill_paths.iter().map(PathBuf::from));
+    if !effective_args.no_skills {
+        // JS discovery is backed by the session-long lazy Node host. Until
+        // that host is swapped as part of a future full JS reload, preserve
+        // the paths it contributed at startup across `/reload`.
+        let js_paths: &[PathBuf] = ctx
+            .js_extension_session
+            .as_ref()
+            .map(|js| js.resources.skill_paths.as_slice())
+            .unwrap_or(&[]);
+        let package_paths = package_resources.skill_dirs();
+        let dirs = append_reload_resource_paths(
+            skill_base_dirs,
+            &effective_args.skill,
+            &discovered.skill_paths,
+            js_paths,
+            &package_paths,
+        );
         let result = load_skills_with_precedence(&env_dyn, &dirs).await;
         skills = result.skills;
         skill_diags = result.diagnostics;
@@ -841,15 +1150,26 @@ pub async fn reload_extension_resources(
 
     let mut prompt_templates: Vec<rpi_harness::types::PromptTemplate> = Vec::new();
     let mut prompt_diags: Vec<rpi_harness::prompt_templates::PromptTemplateDiagnostic> = Vec::new();
-    if !ctx.args.no_prompt_templates {
-        let mut dirs = prompt_template_dirs(&ctx.cwd);
-        dirs.extend(discovered.prompt_paths.iter().map(PathBuf::from));
+    if !effective_args.no_prompt_templates {
+        let js_paths: &[PathBuf] = ctx
+            .js_extension_session
+            .as_ref()
+            .map(|js| js.resources.prompt_paths.as_slice())
+            .unwrap_or(&[]);
+        let package_paths = package_resources.prompt_dirs();
+        let dirs = append_reload_resource_paths(
+            prompt_base_dirs,
+            &effective_args.prompt_template,
+            &discovered.prompt_paths,
+            js_paths,
+            &package_paths,
+        );
         let result = load_prompt_templates_with_precedence(&env_dyn, &dirs).await;
         prompt_templates = result.prompt_templates;
         prompt_diags = result.diagnostics;
     }
 
-    let context_block = if ctx.args.no_context_files {
+    let context_block = if effective_args.no_context_files {
         String::new()
     } else {
         let agent_dir = crate::config::agent_dir().ok();
@@ -858,9 +1178,15 @@ pub async fn reload_extension_resources(
         format_project_context(&files)
     };
 
-    if !skill_diags.is_empty() || !prompt_diags.is_empty() {
+    if !skill_diags.is_empty()
+        || !prompt_diags.is_empty()
+        || !package_resources.diagnostics.is_empty()
+    {
         warnings = true;
-        if ctx.args.verbose {
+        if effective_args.verbose {
+            for d in &package_resources.diagnostics {
+                eprintln!("warning: package {}: {}", d.spec, d.message);
+            }
             for d in &skill_diags {
                 eprintln!(
                     "warning: skill {} ({}): {}",
@@ -881,9 +1207,9 @@ pub async fn reload_extension_resources(
     }
 
     // ---- Re-compose the system prompt (same precedence as build) ----
-    let base_prompt = match ctx.args.system_prompt.as_deref() {
+    let base_prompt = match effective_args.system_prompt.as_deref() {
         Some(explicit) => explicit.to_string(),
-        None => match discover_system_prompt_file(&ctx.cwd) {
+        None => match discover_system_prompt_file_with_packages(&ctx.cwd, &package_resources) {
             Some(path) => {
                 std::fs::read_to_string(&path).unwrap_or_else(|_| default_system_prompt(&cwd_str))
             }
@@ -891,12 +1217,14 @@ pub async fn reload_extension_resources(
         },
     };
     let mut append_texts: Vec<String> = Vec::new();
-    for extra in &ctx.args.append_system_prompt {
+    for extra in &effective_args.append_system_prompt {
         let text = read_append_target(extra).unwrap_or_else(|| extra.clone());
         append_texts.push(text);
     }
-    if ctx.args.append_system_prompt.is_empty() {
-        if let Some(path) = discover_append_system_prompt_file(&ctx.cwd) {
+    if effective_args.append_system_prompt.is_empty() {
+        if let Some(path) =
+            discover_append_system_prompt_file_with_packages(&ctx.cwd, &package_resources)
+        {
             if let Ok(text) = std::fs::read_to_string(&path) {
                 append_texts.push(text);
             }
@@ -962,9 +1290,26 @@ pub async fn reload_extension_resources(
     // on top, mirroring `build`.
     let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
     let tool_ctx = rpi_tools::ExecutionToolContext::new(env_dyn.clone(), Some(mut_env));
-    let mut tools = build_tools(&tool_ctx, &ctx.args);
-    merge_extension_tools(&mut tools, &extension_session, &ctx.args);
-    let active = active_tool_names(&tools, &ctx.args);
+    let mut tools = build_tools(&tool_ctx, &effective_args);
+    merge_extension_tools(&mut tools, &extension_session, &effective_args);
+    if let Some(js) = &ctx.js_extension_session {
+        merge_js_extension_tools(&mut tools, js, &effective_args);
+    }
+    let mut active = active_tool_names(&tools, &effective_args);
+    if let Some(js) = &ctx.js_extension_session {
+        let js_names = js.tool_names();
+        if let Some(js_active) = js.active_tools() {
+            active.retain(|name| {
+                tool_name_allowed(name, &effective_args)
+                    && !js_names.iter().any(|js_name| js_name == name)
+            });
+            active.extend(js_active.into_iter().filter(|name| {
+                js_names.iter().any(|js_name| js_name == name)
+                    && tool_name_allowed(name, &effective_args)
+            }));
+        }
+    }
+    active = filter_active_tool_names(active, &effective_args);
     let _ = harness.set_tools(tools, Some(active)).await;
 
     let summary = format!(
@@ -977,6 +1322,147 @@ pub async fn reload_extension_resources(
         summary,
         had_warnings: warnings,
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReloadSettingsFields {
+    packages: Option<Vec<crate::settings::PackageSetting>>,
+    npm_command: Option<Vec<String>>,
+    skill_dirs: Option<Vec<String>>,
+    prompt_dirs: Option<Vec<String>>,
+    extension_dirs: Option<Vec<String>>,
+}
+
+impl From<crate::settings::Settings> for ReloadSettingsFields {
+    fn from(settings: crate::settings::Settings) -> Self {
+        Self {
+            packages: settings.packages,
+            npm_command: settings.npm_command,
+            skill_dirs: settings.skill_dirs,
+            prompt_dirs: settings.prompt_dirs,
+            extension_dirs: settings.extension_dirs,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ReloadSettingsSnapshot {
+    global: ReloadSettingsFields,
+    project: Option<ReloadSettingsFields>,
+}
+
+fn reload_reads_settings(args: &Args) -> bool {
+    !args.dev_local_only
+        && (should_load_js_packages(args)
+            || !args.no_extensions
+            || !args.no_skills
+            || !args.no_prompt_templates)
+}
+
+/// Strictly read the settings fields consumed while preparing a reload. The
+/// snapshot intentionally excludes UI/model fields that `/reload` does not
+/// use, so an unrelated settings save does not invalidate the operation.
+fn load_reload_settings_snapshot(
+    args: &Args,
+    cwd: &Path,
+    project_trusted: bool,
+) -> Result<Option<ReloadSettingsSnapshot>, String> {
+    if !reload_reads_settings(args) {
+        return Ok(None);
+    }
+    let global = crate::settings::load_settings()
+        .map_err(|error| format!("could not load global settings: {error}"))?
+        .into();
+    let project = if project_trusted {
+        crate::settings::load_active_project_settings(cwd)
+            .map_err(|error| format!("could not load project settings: {error}"))?
+            .map(|(_, settings)| settings.into())
+    } else {
+        None
+    };
+    Ok(Some(ReloadSettingsSnapshot { global, project }))
+}
+
+/// Validate every settings document that this reload will consume before
+/// replacing any live extension, bridge, or harness resource.
+fn validate_settings_for_reload(
+    args: &Args,
+    cwd: &Path,
+    project_trusted: bool,
+) -> Result<(), String> {
+    load_reload_settings_snapshot(args, cwd, project_trusted).map(|_| ())
+}
+
+fn prepare_reload_inputs(
+    args: &Args,
+    cwd: &Path,
+    project_trusted: bool,
+) -> Result<PreparedReloadInputs, String> {
+    prepare_reload_inputs_inner(args, cwd, project_trusted, || {})
+}
+
+fn prepare_reload_inputs_inner<F>(
+    args: &Args,
+    cwd: &Path,
+    project_trusted: bool,
+    before_verify: F,
+) -> Result<PreparedReloadInputs, String>
+where
+    F: FnOnce(),
+{
+    let settings_before = load_reload_settings_snapshot(args, cwd, project_trusted)?;
+
+    let package_resources = if args.dev_local_only {
+        crate::packages::PackageResources::default()
+    } else {
+        package_resources_for(args, cwd, project_trusted)
+    };
+
+    let mut extension_dirs = if args.no_extensions || args.dev_local_only {
+        Vec::new()
+    } else if project_trusted {
+        extension_dirs(cwd)
+    } else {
+        global_extension_dirs()
+    };
+    if !args.no_extensions {
+        extension_dirs.extend(args.extensions_dir.iter().cloned());
+    }
+
+    let skill_base_dirs = if args.no_skills {
+        Vec::new()
+    } else if args.dev_local_only {
+        project_skill_dirs(cwd)
+    } else if project_trusted {
+        skill_dirs(cwd)
+    } else {
+        global_skill_dirs()
+    };
+
+    let prompt_base_dirs = if args.no_prompt_templates {
+        Vec::new()
+    } else if args.dev_local_only {
+        project_prompt_template_dirs(cwd)
+    } else if project_trusted {
+        prompt_template_dirs(cwd)
+    } else {
+        global_prompt_template_dirs()
+    };
+
+    before_verify();
+    let settings_after = load_reload_settings_snapshot(args, cwd, project_trusted)?;
+    if settings_before != settings_after {
+        return Err(
+            "settings changed while reload inputs were being prepared; retry /reload".to_string(),
+        );
+    }
+
+    Ok(PreparedReloadInputs {
+        package_resources,
+        extension_dirs,
+        skill_base_dirs,
+        prompt_base_dirs,
+    })
 }
 
 /// `build_models_with_extensions` for the reload path: the resolved gateway
@@ -1054,22 +1540,47 @@ fn build_models_with_extensions(
     models
 }
 
+/// Resolve project resource loading without prompting. Explicit CLI overrides
+/// win, then a stored decision; projects with no decision load by default.
+pub(crate) fn resolve_project_trust(args: &Args, cwd: &Path) -> bool {
+    if let Some(override_value) = args.trust_override {
+        return override_value;
+    }
+    crate::config::project_trust_decision(cwd)
+        .ok()
+        .flatten()
+        .unwrap_or(true)
+}
+
 /// Resolve the extension dirs to scan and load the cdylib plugins, returning
 /// the loaded session guard (keeps the `Library` handles alive for the harness
-/// lifetime). Scan order: project `.pi/extensions`, global `agent_dir()/`
-/// `extensions`, then any `--extensions-dir` flags (scanned after the defaults
-/// — `args.rs`). Diagnostics are a no-op sink for now; load skips/ABI mismatches
-/// surface via the `--verbose` summary.
+/// lifetime). Scan order: configured project paths, project `.rpi/extensions`,
+/// legacy `.pi/extensions`, configured/global conventional paths, then any
+/// `--extensions-dir` flags (scanned after the defaults — `args.rs`).
+/// Diagnostics are a no-op sink for now; load skips/ABI mismatches surface via
+/// the `--verbose` summary.
 fn load_extensions(
     args: &Args,
     cwd: &Path,
+    project_trusted: bool,
     action_bridge: Option<Arc<rpi_extensions::ActionBridge>>,
 ) -> ExtensionSession {
-    let mut dirs = vec![project_dir(cwd, EXTENSIONS_SUBDIR)];
-    if let Some(g) = global_dir(EXTENSIONS_SUBDIR) {
-        dirs.push(g);
-    }
+    let mut dirs = if args.dev_local_only {
+        Vec::new()
+    } else if project_trusted {
+        extension_dirs(cwd)
+    } else {
+        global_extension_dirs()
+    };
     dirs.extend(args.extensions_dir.iter().cloned());
+    load_extensions_from_dirs(args, &dirs, action_bridge)
+}
+
+fn load_extensions_from_dirs(
+    args: &Args,
+    dirs: &[PathBuf],
+    action_bridge: Option<Arc<rpi_extensions::ActionBridge>>,
+) -> ExtensionSession {
     let diagnostics: Arc<dyn PluginDiagnostics> = Arc::new(NullDiagnostics);
     // B5a: the action bridge is cloned into every loaded plugin's vtable
     // `user_data` so post-register `runtime_action` calls recover the harness
@@ -1077,7 +1588,52 @@ fn load_extensions(
     // `!no_extensions` and threads `Some(bridge)`; `None` is only passed by the
     // `--no-extensions` branch (which calls `ExtensionSession::none()` directly)
     // and tests. Explicit `--extension`/`-e` files load after the dirs.
-    rpi_extensions::load_session_mixed(&dirs, &args.extension, diagnostics, action_bridge)
+    rpi_extensions::load_session_mixed(dirs, &args.extension, diagnostics, action_bridge)
+}
+
+fn js_extension_paths(
+    args: &Args,
+    cwd: &Path,
+    project_trusted: bool,
+    packages: &crate::packages::PackageResources,
+) -> Vec<PathBuf> {
+    if args.dev_local_only {
+        return Vec::new();
+    }
+    let mut paths = packages.extension_paths();
+    let discovered_dirs = if project_trusted {
+        extension_dirs(cwd)
+    } else {
+        global_extension_dirs()
+    };
+    for dir in discovered_dirs {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            paths.extend(entries.flatten().map(|entry| entry.path()).filter(|path| {
+                matches!(
+                    path.extension()
+                        .and_then(|ext| ext.to_str())
+                        .map(|ext| ext.to_ascii_lowercase())
+                        .as_deref(),
+                    Some("js" | "mjs" | "cjs" | "ts" | "tsx")
+                )
+            }));
+        }
+    }
+    paths.extend(
+        args.extension
+            .iter()
+            .filter(|path| {
+                matches!(
+                    path.extension()
+                        .and_then(|ext| ext.to_str())
+                        .map(|ext| ext.to_ascii_lowercase())
+                        .as_deref(),
+                    Some("js" | "mjs" | "cjs" | "ts" | "tsx")
+                )
+            })
+            .cloned(),
+    );
+    paths
 }
 
 /// Merge the loaded extension tools into the built-in set. An extension tool
@@ -1091,19 +1647,33 @@ fn merge_extension_tools(tools: &mut Vec<HarnessTool>, session: &ExtensionSessio
     };
     for et in snapshot.tools() {
         let name = &et.tool.name;
-        if let Some(allow) = &args.tools {
-            if !allow.iter().any(|a| a == name) {
-                continue;
-            }
-        }
-        if let Some(deny) = &args.exclude_tools {
-            if deny.iter().any(|d| d == name) {
-                continue;
-            }
+        if !tool_name_allowed(name, args) {
+            continue;
         }
         let adapter = PluginToolAdapter::new(et.tool.clone(), et.handle(), session.keepalive());
         let harness_tool = HarnessTool::new(Arc::new(adapter));
         match tools.iter_mut().find(|t| t.tool.schema().name == *name) {
+            Some(slot) => *slot = harness_tool,
+            None => tools.push(harness_tool),
+        }
+    }
+}
+
+fn merge_js_extension_tools(
+    tools: &mut Vec<HarnessTool>,
+    session: &crate::js_extensions::JsExtensionSession,
+    args: &Args,
+) {
+    for adapter in session.tools() {
+        let name = adapter.schema().name.clone();
+        if !tool_name_allowed(&name, args) {
+            continue;
+        }
+        let harness_tool = HarnessTool::new(Arc::new(adapter));
+        match tools
+            .iter_mut()
+            .find(|tool| tool.tool.schema().name == name)
+        {
             Some(slot) => *slot = harness_tool,
             None => tools.push(harness_tool),
         }
@@ -1132,9 +1702,8 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
     if args.no_tools {
         return Vec::new();
     }
-    // Construct every built-in once (cheap; the allowlist filters below).
-    // Read-only search tools (grep/find/ls) take the same context and need no
-    // mutation queue — they go through the `FileSystem` trait only.
+    // Keep the coding tools aligned with Pi and expose rpi's read-only docs
+    // lookup as a default assistant capability.
     let mut all: Vec<(&'static str, HarnessTool)> = vec![
         ("read", HarnessTool::new(create_read_tool(ctx, None))),
         (
@@ -1143,9 +1712,7 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
         ),
         ("edit", HarnessTool::new(create_edit_tool(ctx))),
         ("write", HarnessTool::new(create_write_tool(ctx))),
-        ("grep", HarnessTool::new(create_grep_tool(ctx, None))),
-        ("find", HarnessTool::new(create_find_tool(ctx, None))),
-        ("ls", HarnessTool::new(create_ls_tool(ctx, None))),
+        ("docs", HarnessTool::new(create_docs_tool())),
     ];
 
     // `--no-builtin-tools` disables the built-in set but would keep
@@ -1173,22 +1740,44 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
 /// `--tools` allowlist was given. Mirrors the TS default: all registered tools
 /// active.
 fn active_tool_names(tools: &[HarnessTool], args: &Args) -> Vec<String> {
+    filter_active_tool_names(
+        tools.iter().map(|tool| tool.tool.schema().name.clone()),
+        args,
+    )
+}
+
+/// Whether a tool name survives the command-line tool policy. Keep this check
+/// centralized because JS extensions can mutate the active set after the
+/// initial Rust tool list has been built.
+pub(crate) fn tool_name_allowed(name: &str, args: &Args) -> bool {
     if args.no_tools {
-        return Vec::new();
+        return false;
     }
-    if let Some(allow) = &args.tools {
-        // The allowlist IS the active set (TS: `tools` doubles as the active
-        // set when provided). Keep order + only those that exist.
-        let names: Vec<String> = tools.iter().map(|t| t.tool.schema().name.clone()).collect();
-        return allow
-            .iter()
-            .filter(|a| names.iter().any(|n| n == *a))
-            .cloned()
-            .collect();
+    if args
+        .tools
+        .as_ref()
+        .is_some_and(|allow| !allow.iter().any(|value| value == name))
+    {
+        return false;
     }
-    // Default: every constructed tool is active. If `--exclude-tools` dropped
-    // some, they're simply absent from `tools`, so this lands right.
-    tools.iter().map(|t| t.tool.schema().name.clone()).collect()
+    if args
+        .exclude_tools
+        .as_ref()
+        .is_some_and(|deny| deny.iter().any(|value| value == name))
+    {
+        return false;
+    }
+    true
+}
+
+pub(crate) fn filter_active_tool_names<I>(names: I, args: &Args) -> Vec<String>
+where
+    I: IntoIterator<Item = String>,
+{
+    names
+        .into_iter()
+        .filter(|name| tool_name_allowed(name, args))
+        .collect()
 }
 
 /// Build the `Session` facade for the chosen selection.
@@ -1533,9 +2122,505 @@ mod tests {
         assert!(p.contains("bash"));
         assert!(p.contains("edit"));
         assert!(p.contains("write"));
-        assert!(p.contains("grep"));
-        assert!(p.contains("find"));
-        assert!(p.contains("ls"));
+        assert!(p.contains("docs"));
+        assert!(!p.contains("- grep"));
+        assert!(!p.contains("- find"));
+        assert!(!p.contains("- ls"));
+        assert!(!p.contains("powershell"));
+    }
+
+    #[test]
+    fn default_tools_include_docs_lookup() {
+        let env = Arc::new(OsExecutionEnv::with_cwd(PathBuf::from(".")));
+        let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env.clone();
+        let mut_env: Arc<dyn rpi_tools::MutatingEnv> = env.clone();
+        let context = ExecutionToolContext::new(env_dyn, Some(mut_env));
+        let names: Vec<String> = build_tools(&context, &Args::default())
+            .iter()
+            .map(|tool| tool.tool.schema().name.clone())
+            .collect();
+
+        assert_eq!(names, vec!["read", "bash", "edit", "write", "docs"]);
+    }
+
+    #[test]
+    fn pi_package_loading_is_opt_in_and_respects_no_extensions() {
+        let args = Args::default();
+        assert!(!should_load_js_packages(&args));
+        let resources = package_resources_for(&args, Path::new("."), false);
+        assert!(resources.packages.is_empty());
+
+        let args = Args {
+            enable_pi_packages: true,
+            ..Args::default()
+        };
+        assert!(should_load_js_packages(&args));
+
+        let args = Args {
+            enable_pi_packages: true,
+            no_extensions: true,
+            ..Args::default()
+        };
+        assert!(!should_load_js_packages(&args));
+        assert!(package_resources_for(&args, Path::new("."), false)
+            .packages
+            .is_empty());
+    }
+
+    #[test]
+    fn pi_offline_env_disables_startup_package_remediation() {
+        struct RestoreEnv {
+            name: &'static str,
+            value: Option<std::ffi::OsString>,
+        }
+
+        impl Drop for RestoreEnv {
+            fn drop(&mut self) {
+                match self.value.take() {
+                    Some(value) => std::env::set_var(self.name, value),
+                    None => std::env::remove_var(self.name),
+                }
+            }
+        }
+
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore_config = RestoreEnv {
+            name: crate::config::CONFIG_DIR_ENV,
+            value: std::env::var_os(crate::config::CONFIG_DIR_ENV),
+        };
+        let _restore_offline = RestoreEnv {
+            name: crate::args::PI_OFFLINE_ENV,
+            value: std::env::var_os(crate::args::PI_OFFLINE_ENV),
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        let cwd = tmp.path().join("project");
+        let package = agent.join("npm/node_modules/demo");
+        std::fs::create_dir_all(package.join("extensions")).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"name":"demo","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            package.join("extensions/index.js"),
+            "export default () => {};",
+        )
+        .unwrap();
+        std::fs::write(
+            agent.join("settings.json"),
+            r#"{"npmCommand":[""],"packages":["npm:demo@2.0.0"]}"#,
+        )
+        .unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+        std::env::set_var(crate::args::PI_OFFLINE_ENV, "TrUe");
+        let args = Args {
+            enable_pi_packages: true,
+            offline: false,
+            ..Args::default()
+        };
+
+        let resources = package_resources_for(&args, &cwd, false);
+
+        assert!(resources.packages.is_empty());
+        assert_eq!(resources.diagnostics.len(), 1);
+        assert!(resources.diagnostics[0].message.contains("offline"));
+        assert_eq!(
+            std::fs::read(package.join("package.json")).unwrap(),
+            br#"{"name":"demo","version":"1.0.0"}"#
+        );
+    }
+
+    #[test]
+    fn package_discovery_uses_the_callers_trust_snapshot() {
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let previous = std::env::var_os(crate::config::CONFIG_DIR_ENV);
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        let cwd = tmp.path().join("project");
+        let package = cwd.join("package");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(cwd.join(".rpi")).unwrap();
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(agent.join("settings.json"), "{}").unwrap();
+        std::fs::write(
+            package.join("package.json"),
+            r#"{"name":"snapshot-package","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cwd.join(".rpi/settings.json"),
+            serde_json::json!({"packages": [package]}).to_string(),
+        )
+        .unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+
+        let args = Args {
+            enable_pi_packages: true,
+            ..Args::default()
+        };
+        assert_eq!(package_resources_for(&args, &cwd, true).packages.len(), 1);
+        assert!(package_resources_for(&args, &cwd, false)
+            .packages
+            .is_empty());
+        assert_eq!(
+            package_resources_for_update_check(&args, &cwd, true)
+                .packages
+                .len(),
+            1
+        );
+        assert!(package_resources_for_update_check(&args, &cwd, false)
+            .packages
+            .is_empty());
+
+        match previous {
+            Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+            None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+        }
+    }
+
+    #[test]
+    fn reload_settings_preflight_is_independent_of_packages_and_respects_trust() {
+        struct RestoreConfigDir(Option<std::ffi::OsString>);
+
+        impl Drop for RestoreConfigDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        let cwd = tmp.path().join("project");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(cwd.join(".rpi")).unwrap();
+        std::fs::write(agent.join("settings.json"), "{}").unwrap();
+        std::fs::write(cwd.join(".rpi/settings.json"), "{ malformed").unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+        let packages_disabled = Args::default();
+        let packages_enabled = Args {
+            enable_pi_packages: true,
+            ..Args::default()
+        };
+
+        for args in [&packages_disabled, &packages_enabled] {
+            let trusted = validate_settings_for_reload(args, &cwd, true);
+            let untrusted = validate_settings_for_reload(args, &cwd, false);
+            assert!(trusted
+                .unwrap_err()
+                .contains("could not load project settings"));
+            assert!(untrusted.is_ok());
+        }
+
+        std::fs::write(agent.join("settings.json"), "{ malformed").unwrap();
+        for args in [&packages_disabled, &packages_enabled] {
+            assert!(validate_settings_for_reload(args, &cwd, false)
+                .unwrap_err()
+                .contains("could not load global settings"));
+        }
+
+        let local_only = Args {
+            dev_local_only: true,
+            ..Args::default()
+        };
+        assert!(validate_settings_for_reload(&local_only, &cwd, true).is_ok());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reload_with_packages_disabled_preserves_live_resources_when_settings_break() {
+        struct RestoreConfigDir(Option<std::ffi::OsString>);
+
+        impl Drop for RestoreConfigDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        let cwd = tmp.path().join("project");
+        let skill_dir = tmp.path().join("configured-skills");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: keep-me\ndescription: Reload sentinel\n---\nKeep this skill loaded.",
+        )
+        .unwrap();
+        std::fs::write(
+            agent.join("settings.json"),
+            serde_json::json!({"skillDirs": [skill_dir]}).to_string(),
+        )
+        .unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+
+        let resolved = crate::provider::resolve(
+            Some("anthropic"),
+            Some(crate::provider::DEFAULT_MODEL_ID),
+            None,
+            Some("test-key"),
+            None,
+        )
+        .unwrap();
+        let args = Args {
+            trust_override: Some(false),
+            no_session: true,
+            no_extensions: true,
+            no_prompt_templates: true,
+            no_context_files: true,
+            system_prompt: Some("stable system prompt".into()),
+            ..Args::default()
+        };
+        assert!(!should_load_js_packages(&args));
+
+        let (harness, _events, context) = build(&resolved, &args, &cwd, false).await.unwrap();
+        let before_resources = harness.get_resources().await.unwrap();
+        assert_eq!(before_resources.skills.as_ref().unwrap().len(), 1);
+        assert_eq!(before_resources.skills.as_ref().unwrap()[0].name, "keep-me");
+        let before_prompt = harness.get_system_prompt().await.unwrap();
+        let before_tools: Vec<String> = harness
+            .get_tools()
+            .await
+            .unwrap()
+            .iter()
+            .map(|tool| tool.tool.schema().name.clone())
+            .collect();
+        let before_bridge = context
+            .action_bridge
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .clone();
+
+        std::fs::write(agent.join("settings.json"), "{ malformed").unwrap();
+        let outcome = reload_extension_resources(&harness, &context).await;
+
+        assert!(outcome.had_warnings);
+        assert!(outcome.summary.contains("Settings reload failed"));
+        assert!(outcome.summary.contains("could not load global settings"));
+        assert_eq!(harness.get_resources().await.unwrap(), before_resources);
+        assert_eq!(harness.get_system_prompt().await.unwrap(), before_prompt);
+        let after_tools: Vec<String> = harness
+            .get_tools()
+            .await
+            .unwrap()
+            .iter()
+            .map(|tool| tool.tool.schema().name.clone())
+            .collect();
+        assert_eq!(after_tools, before_tools);
+        let after_bridge = context
+            .action_bridge
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert!(Arc::ptr_eq(&after_bridge, &before_bridge));
+    }
+
+    #[test]
+    fn reload_preparation_rejects_settings_changed_during_derivation() {
+        struct RestoreConfigDir(Option<std::ffi::OsString>);
+
+        impl Drop for RestoreConfigDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        let cwd = tmp.path().join("project");
+        let first_skill_dir = tmp.path().join("first-skills");
+        let second_skill_dir = tmp.path().join("second-skills");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::write(
+            agent.join("settings.json"),
+            serde_json::json!({"skillDirs": [first_skill_dir]}).to_string(),
+        )
+        .unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+        let args = Args {
+            trust_override: Some(false),
+            no_extensions: true,
+            no_prompt_templates: true,
+            ..Args::default()
+        };
+
+        let result = prepare_reload_inputs_inner(&args, &cwd, false, || {
+            std::fs::write(
+                agent.join("settings.json"),
+                serde_json::json!({"skillDirs": [second_skill_dir]}).to_string(),
+            )
+            .unwrap();
+        });
+
+        let error = result
+            .err()
+            .expect("settings mutation must fail preparation");
+        assert!(error.contains("settings changed while reload inputs were being prepared"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn reload_uses_frozen_settings_inputs_after_preparation() {
+        struct RestoreConfigDir(Option<std::ffi::OsString>);
+
+        impl Drop for RestoreConfigDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        let cwd = tmp.path().join("project");
+        let skill_dir = tmp.path().join("configured-skills");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: frozen-skill\ndescription: Reload sentinel\n---\nFrozen input.",
+        )
+        .unwrap();
+        std::fs::write(
+            agent.join("settings.json"),
+            serde_json::json!({"skillDirs": [skill_dir]}).to_string(),
+        )
+        .unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+
+        let resolved = crate::provider::resolve(
+            Some("anthropic"),
+            Some(crate::provider::DEFAULT_MODEL_ID),
+            None,
+            Some("test-key"),
+            None,
+        )
+        .unwrap();
+        let args = Args {
+            trust_override: Some(false),
+            no_session: true,
+            no_extensions: true,
+            no_prompt_templates: true,
+            no_context_files: true,
+            system_prompt: Some("stable system prompt".into()),
+            ..Args::default()
+        };
+        let (harness, _events, context) = build(&resolved, &args, &cwd, false).await.unwrap();
+
+        let outcome = reload_extension_resources_inner(&harness, &context, || {
+            std::fs::write(agent.join("settings.json"), "{ malformed").unwrap();
+        })
+        .await;
+
+        assert!(!outcome.summary.contains("Settings reload failed"));
+        assert_eq!(
+            outcome.summary,
+            "Reloaded 0 plugin(s), 1 skill(s), 0 prompt(s)."
+        );
+        let resources = harness.get_resources().await.unwrap();
+        let skills = resources.skills.as_ref().unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "frozen-skill");
+    }
+
+    #[tokio::test]
+    async fn reload_resource_paths_include_explicit_skill_and_prompt_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let skill_path = tmp.path().join("explicit-skill.md");
+        std::fs::write(
+            &skill_path,
+            "---\nname: explicit-skill\ndescription: Explicit skill\n---\nSkill body",
+        )
+        .unwrap();
+        let prompt_path = tmp.path().join("explicit-prompt.md");
+        std::fs::write(
+            &prompt_path,
+            "---\ndescription: Explicit prompt\n---\nPrompt body",
+        )
+        .unwrap();
+
+        let args = Args {
+            skill: vec![skill_path.clone()],
+            prompt_template: vec![prompt_path.clone()],
+            ..Args::default()
+        };
+        let skill_paths = append_reload_resource_paths(Vec::new(), &args.skill, &[], &[], &[]);
+        let prompt_paths =
+            append_reload_resource_paths(Vec::new(), &args.prompt_template, &[], &[], &[]);
+        let env = Arc::new(OsExecutionEnv::with_cwd(tmp.path().to_path_buf()));
+        let env_dyn: Arc<dyn rpi_tools::ExecutionEnv> = env;
+
+        let skills = load_skills_with_precedence(&env_dyn, &skill_paths).await;
+        assert_eq!(skills.skills.len(), 1, "{:?}", skills.diagnostics);
+        assert_eq!(skills.skills[0].name, "explicit-skill");
+
+        let prompts = load_prompt_templates_with_precedence(&env_dyn, &prompt_paths).await;
+        assert_eq!(
+            prompts.prompt_templates.len(),
+            1,
+            "{:?}",
+            prompts.diagnostics
+        );
+        assert_eq!(prompts.prompt_templates[0].name, "explicit-prompt");
+    }
+
+    #[test]
+    fn tool_policy_applies_to_rust_and_js_active_names() {
+        let names = vec![
+            "read".to_string(),
+            "ask_user_question".to_string(),
+            "write".to_string(),
+        ];
+
+        let args = Args {
+            tools: Some(vec!["read".into(), "ask_user_question".into()]),
+            ..Args::default()
+        };
+        assert_eq!(
+            filter_active_tool_names(names.clone(), &args),
+            vec!["read", "ask_user_question"]
+        );
+
+        let args = Args {
+            exclude_tools: Some(vec!["ask_user_question".into()]),
+            ..Args::default()
+        };
+        assert_eq!(
+            filter_active_tool_names(names.clone(), &args),
+            vec!["read", "write"]
+        );
+
+        let args = Args {
+            no_tools: true,
+            ..Args::default()
+        };
+        assert!(filter_active_tool_names(names, &args).is_empty());
     }
 
     #[test]
@@ -1549,6 +2634,72 @@ mod tests {
             select_session(&args, cwd),
             SessionSelection::Ephemeral
         ));
+    }
+
+    #[test]
+    fn project_resources_load_by_default_and_allow_explicit_opt_out() {
+        let defaults = Args::default();
+        assert!(resolve_project_trust(
+            &defaults,
+            Path::new("C:/definitely-not-a-project")
+        ));
+
+        let denied = Args {
+            trust_override: Some(false),
+            ..Args::default()
+        };
+        assert!(!resolve_project_trust(
+            &denied,
+            Path::new("C:/definitely-not-a-project")
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn build_preserves_the_supplied_startup_project_snapshot() {
+        struct RestoreConfigDir(Option<std::ffi::OsString>);
+
+        impl Drop for RestoreConfigDir {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var(crate::config::CONFIG_DIR_ENV, value),
+                    None => std::env::remove_var(crate::config::CONFIG_DIR_ENV),
+                }
+            }
+        }
+
+        let _guard = crate::config::test_support::env_lock().lock().unwrap();
+        let _restore = RestoreConfigDir(std::env::var_os(crate::config::CONFIG_DIR_ENV));
+        let tmp = tempfile::tempdir().unwrap();
+        let agent = tmp.path().join("agent");
+        let cwd = tmp.path().join("project");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::env::set_var(crate::config::CONFIG_DIR_ENV, &agent);
+
+        let resolved = crate::provider::resolve(
+            Some("anthropic"),
+            Some(crate::provider::DEFAULT_MODEL_ID),
+            None,
+            Some("test-key"),
+            None,
+        )
+        .unwrap();
+        let args = Args {
+            trust_override: Some(false),
+            no_session: true,
+            no_tools: true,
+            no_extensions: true,
+            no_skills: true,
+            no_prompt_templates: true,
+            no_context_files: true,
+            system_prompt: Some("test prompt".into()),
+            ..Args::default()
+        };
+
+        let (_, _, context) = build(&resolved, &args, &cwd, true).await.unwrap();
+
+        assert_eq!(context.cwd, cwd);
+        assert!(context.project_trusted);
     }
 
     #[test]
@@ -1605,10 +2756,20 @@ mod tests {
         let cwd = Path::new("/proj");
         match select_session(&args, cwd) {
             SessionSelection::New { dir, .. } => {
-                assert_eq!(dir, Path::new("/proj/.pi/sessions"));
+                assert_eq!(dir, Path::new("/proj/.rpi/sessions"));
             }
             other => panic!("expected New, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn default_session_dir_prefers_rpi_but_reads_legacy_pi() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path();
+        std::fs::create_dir_all(cwd.join(".pi/sessions")).unwrap();
+        assert_eq!(default_session_dir(cwd), cwd.join(".pi/sessions"));
+        std::fs::create_dir_all(cwd.join(".rpi/sessions")).unwrap();
+        assert_eq!(default_session_dir(cwd), cwd.join(".rpi/sessions"));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

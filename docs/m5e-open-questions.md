@@ -5,53 +5,21 @@
 > These are the design divergences from the TS reference that the M5e ports
 > introduced. None are blockers — all are recorded for review.
 
-## 1. YAML-subset frontmatter parser instead of `serde_yaml`
+## 1. YAML frontmatter parser (resolved)
 
 **Where:** `crates/pi-harness/src/frontmatter.rs` (used by `skills.rs` and
 `prompt_templates.rs`).
 
-**What.** The TS loaders parse the fenced frontmatter block with the `yaml` npm
-package. This port uses a hand-rolled minimal YAML-subset parser
-(`parse_frontmatter`/`parse_simple_yaml`/`parse_yaml_value`) to avoid a
-`serde_yaml` dependency, consistent with the workspace's minimal-dep posture
-(already established in M4/M5c: no `serde_yaml`, no `regex`, no `ignore`).
+**Resolution.** The hand-written YAML subset was replaced with `yaml_serde`
+after real package frontmatter used block sequences such as `triggers:`. Skills
+and prompt templates now support standard YAML block sequences, nested mappings,
+flow collections, comments, quoted values, and block scalars. Malformed YAML is
+still surfaced as a `parse_failed` diagnostic.
 
-**Coverage.** The subset handles exactly the frontmatter shapes that occur in
-practice:
-- `key: value` lines (top-level mapping only — no nested block mappings);
-- scalar values: string, `true|True|TRUE`/`false|…` bools, `null|Null|NULL|~`,
-  integers, floats-with-`.`;
-- flow collections `[a, b, c]` and `{k: v, k2: v2}`;
-- double-quoted strings (with `\"`/`\\`/`\n`/`\t` unescaping) and single-quoted
-  strings (`''` escaped quote); plain scalars otherwise.
-
-**Divergences / limitations (NOT handled):**
-- **Block sequences** (`- item` indented lines) — not parsed; would need a
-  recursion level the subset doesn't model. No skill/template frontmatter in the
-  reference uses them.
-- **Block mappings** (nested indented `key: value`) — flat only. Again unused by
-  the reference frontmatter.
-- **Anchors / aliases / multi-document** — out of scope.
-- **Inline trailing comments are NOT stripped.** A line `description: See http://x/#frag`
-  keeps the full URL. The TS `yaml` parser strips `# …` inline comments; our
-  parser intentionally does not, because naive stripping breaks URL/hash values.
-  If a frontmatter value ever needs an inline comment, this will diverge. Full-line
-  `#` comments ARE skipped.
-- **Quoted-key flow mappings** (`{"a": 1}`) — keys are taken as bare scalars;
-  quotes around flow-mapping keys are not stripped. Unused in practice.
-
-**Error parity.** Unterminated flow sequence/mapping and unterminated quoted
-strings yield `Err(message)`, which the loaders surface as a `parse_failed`
-diagnostic — matching the TS behavior for the common malformed-frontmatter case
-(the reference test `description: [unterminated → parse_failed`). Other YAML
-errors the full `yaml` parser would catch (e.g. a tab-indentation error) are not
-flagged here; they'd parse as a flat scalar or a missing-colon error.
-
-**Resolution for review:** acceptable for v1. If real-world skill/template
-frontmatter ever needs block sequences or nested mappings, either (a) pull
-`serde_yaml` (one-line dep, well-maintained) or (b) extend the subset. The
-hand-rolled parser was chosen to keep the dep surface minimal and because the
-reference frontmatter is uniformly flat.
+For backward compatibility, one narrow fallback preserves top-level unquoted
+scalars containing `: `, which older rpi versions accepted even though strict
+YAML requires quotes. The dependency is pinned to `0.10.2`, the maintained fork
+release that remains compatible with the workspace's Rust 1.78 MSRV.
 
 ## 2. `load_sourced_skills` / `load_sourced_prompt_templates` lose the `mapSkill` hook
 

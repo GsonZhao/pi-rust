@@ -61,6 +61,31 @@ async fn loads_skill_md_with_frontmatter() {
 }
 
 #[tokio::test]
+async fn loads_skill_with_block_sequence_frontmatter() {
+    let (typed, env) = fresh_env();
+    typed
+        .create_dir(".agents/skills/flowchart", true, None)
+        .await
+        .unwrap();
+    typed
+        .write_file(
+            ".agents/skills/flowchart/SKILL.md",
+            "---\nname: flowchart\ndescription: Render an animated flowchart\ntriggers:\n  - \"流程图\"\n  - \"原理演示\"\n---\nUse this skill."
+                .into(),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let result = load_skills(&env, &[".agents/skills".to_string()]).await;
+
+    assert!(result.diagnostics.is_empty(), "{:?}", result.diagnostics);
+    assert_eq!(result.skills.len(), 1);
+    assert_eq!(result.skills[0].name, "flowchart");
+    assert_eq!(result.skills[0].content, "Use this skill.");
+}
+
+#[tokio::test]
 async fn drops_skill_with_missing_description_and_emits_diagnostic() {
     let (typed, env) = fresh_env();
     typed.create_dir("user/broken", true, None).await.unwrap();

@@ -1,11 +1,9 @@
 //! The `libloading` loader: discover and register cdylib plugins.
 //!
-//! [`load_one`] loads a single cdylib, looks up `rpi_plugin_register`, builds a
-//! fresh [`HostApi`](crate::HostApi) + [`PluginApiVt`](rpi_plugin_sdk::PluginApiVt),
-//! sets the thread-local current api, calls `register` with
-//! [`RPI_PLUGIN_ABI_VERSION`](rpi_plugin_sdk::RPI_PLUGIN_ABI_VERSION), clears
-//! the api, and takes the registry out. ABI mismatch or a nonzero register
-//! return ⇒ the plugin is skipped with a diagnostic (never crashes).
+//! [`load_one`] loads a single cdylib and prefers `rpi_plugin_register_v2`.
+//! Only when that symbol is absent does it use legacy `rpi_plugin_register`.
+//! The selected entrypoint is called exactly once; a nonzero return never
+//! triggers fallback to the other ABI.
 //!
 //! [`load_dir`] walks a directory for `.{dll,so,dylib}` files and loads each.
 //! The returned [`LoadedPlugin`]s hold the `libloading::Library` (dropping them
@@ -15,10 +13,13 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use libloading::{Library, Symbol};
+use libloading::Library;
 use thiserror::Error;
 
-use rpi_plugin_sdk::{PluginApiVt, RpiPluginRegister, RPI_PLUGIN_ABI_VERSION};
+use rpi_plugin_sdk::{
+    LegacyPluginApiV1, LegacyRpiPluginRegister, PluginApiVt, RpiPluginRegister,
+    LEGACY_PLUGIN_ABI_VERSION, RPI_PLUGIN_ABI_VERSION,
+};
 
 use crate::registry::{ExtensionRegistry, RegistrySnapshot};
 use crate::{
@@ -39,11 +40,13 @@ pub enum PluginLoadError {
         #[source]
         source: libloading::Error,
     },
-    #[error("symbol `rpi_plugin_register` not found in {path}: {source}")]
+    #[error(
+        "neither `rpi_plugin_register_v2` nor legacy `rpi_plugin_register` was found in {path} (v2: {v2_error}; v1: {legacy_error})"
+    )]
     Symbol {
         path: PathBuf,
-        #[source]
-        source: libloading::Error,
+        v2_error: String,
+        legacy_error: String,
     },
     #[error("register returned nonzero code {code} for {path}")]
     RegisterReturned { path: PathBuf, code: i32 },
@@ -70,9 +73,57 @@ pub struct LoadedPlugin {
     pub library: Library,
     /// Where it was loaded from (for diagnostics).
     pub path: PathBuf,
+    /// ABI selected from the exported register symbol (`1` or `2`).
+    pub abi_version: u32,
     /// The registry snapshot built from this plugin's registrations. The host
     /// merges snapshots from all loaded plugins into one session registry.
     pub registry: ExtensionRegistry,
+}
+
+#[derive(Clone, Copy)]
+enum RegisterEntrypoint {
+    V2(RpiPluginRegister),
+    V1(LegacyRpiPluginRegister),
+}
+
+impl RegisterEntrypoint {
+    fn abi_version(self) -> u32 {
+        match self {
+            Self::V2(_) => RPI_PLUGIN_ABI_VERSION,
+            Self::V1(_) => LEGACY_PLUGIN_ABI_VERSION,
+        }
+    }
+}
+
+fn select_register<V, L, E>(
+    v2: Result<V, E>,
+    legacy: impl FnOnce() -> Result<L, E>,
+) -> Result<Result<V, L>, (E, E)> {
+    match v2 {
+        Ok(register) => Ok(Ok(register)),
+        Err(v2_error) => match legacy() {
+            Ok(register) => Ok(Err(register)),
+            Err(legacy_error) => Err((v2_error, legacy_error)),
+        },
+    }
+}
+
+fn call_register(entrypoint: RegisterEntrypoint, host_api: &Arc<HostApi>) -> i32 {
+    match entrypoint {
+        RegisterEntrypoint::V2(register) => {
+            let vtable = host_api.build_vtable();
+            let vt_ref: &PluginApiVt = &vtable;
+            register(vt_ref as *const PluginApiVt, RPI_PLUGIN_ABI_VERSION)
+        }
+        RegisterEntrypoint::V1(register) => {
+            let vtable = host_api.build_legacy_vtable();
+            let vt_ref: &LegacyPluginApiV1 = &vtable;
+            register(
+                vt_ref as *const LegacyPluginApiV1,
+                LEGACY_PLUGIN_ABI_VERSION,
+            )
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -107,14 +158,30 @@ pub fn load_one(
         source: e,
     })?;
 
-    // 2. Look up `rpi_plugin_register`.
-    let register: Symbol<RpiPluginRegister> = unsafe {
-        library.get(rpi_plugin_sdk::REGISTER_SYMBOL)
+    // 2. Prefer ABI v2. The legacy lookup is lazy, so a plugin exporting both
+    // symbols is unambiguously v2 and the legacy path is not even consulted.
+    let entrypoint = unsafe {
+        select_register(
+            library
+                .get::<RpiPluginRegister>(rpi_plugin_sdk::REGISTER_SYMBOL_V2)
+                .map(|symbol| *symbol),
+            || {
+                library
+                    .get::<LegacyRpiPluginRegister>(rpi_plugin_sdk::LEGACY_REGISTER_SYMBOL)
+                    .map(|symbol| *symbol)
+            },
+        )
     }
-    .map_err(|e| PluginLoadError::Symbol {
+    .map(|selected| match selected {
+        Ok(register) => RegisterEntrypoint::V2(register),
+        Err(register) => RegisterEntrypoint::V1(register),
+    })
+    .map_err(|(v2_error, legacy_error)| PluginLoadError::Symbol {
         path: path.clone(),
-        source: e,
+        v2_error: v2_error.to_string(),
+        legacy_error: legacy_error.to_string(),
     })?;
+    let abi_version = entrypoint.abi_version();
 
     // 3. Build a fresh registry + HostApi + vtable for this plugin.
     let registry = ExtensionRegistry::new();
@@ -122,34 +189,17 @@ pub fn load_one(
         Some(bridge) => HostApi::with_action_bridge(registry, Arc::clone(&diagnostics), bridge),
         None => HostApi::new(registry, Arc::clone(&diagnostics)),
     };
-    let vtable = host_api.build_vtable();
-
     // 4. Set the thread-local current api so the register trampolines can reach
     //    the registry. Register is synchronous + single-threaded per plugin.
     // SAFETY: `host_api` is alive for the duration of the register call (held on
     // this stack); we clear_current_api immediately after.
     unsafe { set_current_api(&host_api) };
-    // Keep the vtable reference alive across the call (the plugin borrows it).
-    let vt_ref: &PluginApiVt = &vtable;
-    // Call register; a panic inside the plugin's extern "C" fn would unwind
-    // across FFI — catch_unwind contains that (register runs on the loader
-    // thread, not a blocking-driver thread, so recovery is safe here; we log
-    // + treat as skip). The vtable pointer is valid (vt_ref lives on this stack).
-    let register_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        register(vt_ref as *const PluginApiVt, RPI_PLUGIN_ABI_VERSION)
-    }));
+    // The selected symbol is invoked exactly once. In particular, a nonzero v2
+    // result does not fall back to v1, because registration may have produced
+    // side effects before returning. A panic from an `extern "C"` plugin is not
+    // recoverable in general and is deliberately not advertised as contained.
+    let rc = call_register(entrypoint, &host_api);
     clear_current_api();
-
-    let rc = match register_outcome {
-        Ok(rc) => rc,
-        Err(_) => {
-            diagnostics.warn(&format!(
-                "plugin {} register panicked — skipped (unwind contained)",
-                path.display()
-            ));
-            return Err(PluginLoadError::RegisterReturned { path, code: -1 });
-        }
-    };
 
     if rc != 0 {
         // The plugin refused (its register returned nonzero — e.g. it saw an
@@ -158,8 +208,9 @@ pub fn load_one(
         // far would reference a plugin that "failed", so we honor the plugin's
         // refusal and discard).
         diagnostics.warn(&format!(
-            "plugin {} register returned code {} — skipped",
+            "plugin {} ABI v{} register returned code {} — skipped",
             path.display(),
+            abi_version,
             rc
         ));
         return Err(PluginLoadError::RegisterReturned { path, code: rc });
@@ -175,9 +226,12 @@ pub fn load_one(
             code: -2,
         })?;
 
+    tracing::debug!(path = %path.display(), abi_version, "loaded native plugin");
+
     Ok(LoadedPlugin {
         library,
         path,
+        abi_version,
         registry,
     })
 }
@@ -476,6 +530,7 @@ pub fn load_session_mixed(
             library,
             registry: _,
             path: _,
+            abi_version: _,
         } = p;
         libs.push(library);
     }
@@ -495,7 +550,35 @@ pub fn load_session_mixed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicI32, AtomicU32, AtomicUsize, Ordering};
     use std::sync::Mutex;
+
+    static V2_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static V1_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static V1_LOOKUPS: AtomicUsize = AtomicUsize::new(0);
+    static V2_SEEN_VERSION: AtomicU32 = AtomicU32::new(0);
+    static V1_SEEN_VERSION: AtomicU32 = AtomicU32::new(0);
+    static V2_RETURN: AtomicI32 = AtomicI32::new(0);
+
+    extern "C" fn test_register_v2(api: *const PluginApiVt, abi_version: u32) -> i32 {
+        if api.is_null() {
+            return -99;
+        }
+        V2_CALLS.fetch_add(1, Ordering::SeqCst);
+        V2_SEEN_VERSION.store(abi_version, Ordering::SeqCst);
+        V2_RETURN.load(Ordering::SeqCst)
+    }
+
+    extern "C" fn test_register_v1(api: *const LegacyPluginApiV1, abi_version: u32) -> i32 {
+        if api.is_null() {
+            return -99;
+        }
+        V1_CALLS.fetch_add(1, Ordering::SeqCst);
+        V1_SEEN_VERSION.store(abi_version, Ordering::SeqCst);
+        0
+    }
 
     #[derive(Default)]
     struct CapturingDiag {
@@ -508,6 +591,402 @@ mod tests {
         fn unsupported(&self, msg: &str) {
             self.warn(msg);
         }
+    }
+
+    fn test_host_api() -> Arc<HostApi> {
+        HostApi::new(ExtensionRegistry::new(), Arc::new(CapturingDiag::default()))
+    }
+
+    struct CdylibFixture {
+        dir: PathBuf,
+        path: PathBuf,
+    }
+
+    impl Drop for CdylibFixture {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn build_cdylib_fixture(name: &str, source: &str) -> CdylibFixture {
+        static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
+        let unique = NEXT_FIXTURE.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "rpi-abi-loader-{}-{name}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("create ABI fixture directory");
+        let source_path = dir.join("fixture.rs");
+        fs::write(&source_path, source).expect("write ABI fixture source");
+        let filename = if cfg!(windows) {
+            format!("{name}.dll")
+        } else if cfg!(target_os = "macos") {
+            format!("lib{name}.dylib")
+        } else {
+            format!("lib{name}.so")
+        };
+        let path = dir.join(filename);
+        let output = Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+            .arg("--crate-name")
+            .arg(name)
+            .arg("--crate-type")
+            .arg("cdylib")
+            .arg("--edition")
+            .arg("2021")
+            .arg(&source_path)
+            .arg("-o")
+            .arg(&path)
+            .output()
+            .expect("run rustc for ABI fixture");
+        assert!(
+            output.status.success(),
+            "fixture build failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        CdylibFixture { dir, path }
+    }
+
+    // Self-contained copy of the minimum ABI surface emitted by
+    // rpi-plugin-sdk v0.1.11. It intentionally does not import this workspace's
+    // LegacyPluginApiV1. Unused registrar callback signatures are represented
+    // as opaque C function pointers: they have the same pointer layout and are
+    // never invoked. The exercised free_string and runtime_action slots retain
+    // their exact old signatures, including the RuntimeActionId enum boundary.
+    const V011_PLUGIN_SOURCE: &str = r#"
+use std::ffi::c_void;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct StbString {
+    pub ptr: *mut u8,
+    pub len: usize,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct StbStringRef {
+    pub ptr: *const u8,
+    pub len: usize,
+}
+
+#[repr(u32)]
+#[derive(Clone, Copy)]
+pub enum RuntimeActionId {
+    SendMessage = 0,
+    SendUserMessage = 1,
+    AppendEntry = 2,
+    SetSessionName = 3,
+    GetActiveTools = 4,
+    SetActiveTools = 5,
+    SetModel = 6,
+    GetThinkingLevel = 7,
+    SetThinkingLevel = 8,
+    Compact = 9,
+    GetSystemPrompt = 10,
+    NewSession = 11,
+    Fork = 12,
+    NavigateTree = 13,
+    SwitchSession = 14,
+    Reload = 15,
+}
+
+pub type FreeStringFn = extern "C" fn(StbString);
+pub type OpaqueRegistrarFn = extern "C" fn();
+pub type RuntimeActionFn = extern "C" fn(
+    action: RuntimeActionId,
+    args_json: StbStringRef,
+    out: *mut StbString,
+    user_data: *mut c_void,
+) -> i32;
+
+#[repr(C)]
+pub struct PluginApiVt {
+    pub free_string: FreeStringFn,
+    pub register_tool: Option<OpaqueRegistrarFn>,
+    pub register_command: Option<OpaqueRegistrarFn>,
+    pub register_shortcut: Option<OpaqueRegistrarFn>,
+    pub register_flag: Option<OpaqueRegistrarFn>,
+    pub register_provider: Option<OpaqueRegistrarFn>,
+    pub register_message_renderer: Option<OpaqueRegistrarFn>,
+    pub register_markdown_transformer: Option<OpaqueRegistrarFn>,
+    pub register_entry_renderer: Option<OpaqueRegistrarFn>,
+    pub register_event_handler: Option<OpaqueRegistrarFn>,
+    pub register_resources_discover: Option<OpaqueRegistrarFn>,
+    pub runtime_action: RuntimeActionFn,
+    pub dispatch_event: Option<OpaqueRegistrarFn>,
+    pub user_data: *mut c_void,
+}
+
+#[no_mangle]
+pub extern "C" fn rpi_plugin_register(api: *const PluginApiVt, abi_version: u32) -> i32 {
+    if abi_version != 1 {
+        return 91;
+    }
+    if api.is_null() {
+        return 92;
+    }
+
+    let api = unsafe { &*api };
+    let args = b"{}";
+    let args_ref = StbStringRef {
+        ptr: args.as_ptr(),
+        len: args.len(),
+    };
+    let mut out = StbString {
+        ptr: std::ptr::null_mut(),
+        len: 0,
+    };
+    let rc = (api.runtime_action)(
+        RuntimeActionId::Reload,
+        args_ref,
+        &mut out,
+        api.user_data,
+    );
+    if !out.ptr.is_null() {
+        (api.free_string)(out);
+    }
+    rc
+}
+"#;
+
+    struct LegacyReloadHost {
+        reloads: Arc<AtomicUsize>,
+    }
+
+    fn unexpected_legacy_action() -> Result<serde_json::Value, String> {
+        Err("unexpected action from ABI v1 fixture".to_string())
+    }
+
+    #[async_trait::async_trait]
+    impl crate::RuntimeActionHost for LegacyReloadHost {
+        async fn send_message(&self, _: serde_json::Value) -> Result<serde_json::Value, String> {
+            unexpected_legacy_action()
+        }
+
+        async fn send_user_message(
+            &self,
+            _: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            unexpected_legacy_action()
+        }
+
+        async fn append_entry(&self, _: serde_json::Value) -> Result<serde_json::Value, String> {
+            unexpected_legacy_action()
+        }
+
+        async fn set_session_name(
+            &self,
+            _: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            unexpected_legacy_action()
+        }
+
+        async fn get_active_tools(
+            &self,
+            _: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            unexpected_legacy_action()
+        }
+
+        async fn set_active_tools(
+            &self,
+            _: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            unexpected_legacy_action()
+        }
+
+        async fn set_model(&self, _: serde_json::Value) -> Result<serde_json::Value, String> {
+            unexpected_legacy_action()
+        }
+
+        async fn get_thinking_level(
+            &self,
+            _: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            unexpected_legacy_action()
+        }
+
+        async fn set_thinking_level(
+            &self,
+            _: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            unexpected_legacy_action()
+        }
+
+        async fn compact(&self, _: serde_json::Value) -> Result<serde_json::Value, String> {
+            unexpected_legacy_action()
+        }
+
+        async fn get_system_prompt(
+            &self,
+            _: serde_json::Value,
+        ) -> Result<serde_json::Value, String> {
+            unexpected_legacy_action()
+        }
+
+        async fn new_session(&self, _: serde_json::Value) -> Result<serde_json::Value, String> {
+            unexpected_legacy_action()
+        }
+
+        async fn fork(&self, _: serde_json::Value) -> Result<serde_json::Value, String> {
+            unexpected_legacy_action()
+        }
+
+        async fn navigate_tree(&self, _: serde_json::Value) -> Result<serde_json::Value, String> {
+            unexpected_legacy_action()
+        }
+
+        async fn switch_session(&self, _: serde_json::Value) -> Result<serde_json::Value, String> {
+            unexpected_legacy_action()
+        }
+
+        async fn reload(&self, _: serde_json::Value) -> Result<serde_json::Value, String> {
+            self.reloads.fetch_add(1, Ordering::SeqCst);
+            Ok(serde_json::Value::Null)
+        }
+    }
+
+    #[test]
+    fn entrypoint_selection_supports_v1_v2_and_never_falls_back_after_call() {
+        V2_CALLS.store(0, Ordering::SeqCst);
+        V1_CALLS.store(0, Ordering::SeqCst);
+        V1_LOOKUPS.store(0, Ordering::SeqCst);
+        V2_RETURN.store(0, Ordering::SeqCst);
+
+        let selected = select_register::<RpiPluginRegister, LegacyRpiPluginRegister, &str>(
+            Ok(test_register_v2),
+            || {
+                V1_LOOKUPS.fetch_add(1, Ordering::SeqCst);
+                Ok(test_register_v1)
+            },
+        )
+        .expect("v2 selected");
+        let entrypoint = match selected {
+            Ok(register) => RegisterEntrypoint::V2(register),
+            Err(register) => RegisterEntrypoint::V1(register),
+        };
+        assert_eq!(call_register(entrypoint, &test_host_api()), 0);
+        assert_eq!(V2_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(V1_CALLS.load(Ordering::SeqCst), 0);
+        assert_eq!(V1_LOOKUPS.load(Ordering::SeqCst), 0);
+        assert_eq!(V2_SEEN_VERSION.load(Ordering::SeqCst), 2);
+
+        let selected = select_register::<RpiPluginRegister, LegacyRpiPluginRegister, &str>(
+            Err("v2 missing"),
+            || {
+                V1_LOOKUPS.fetch_add(1, Ordering::SeqCst);
+                Ok(test_register_v1)
+            },
+        )
+        .expect("legacy selected");
+        let entrypoint = match selected {
+            Ok(register) => RegisterEntrypoint::V2(register),
+            Err(register) => RegisterEntrypoint::V1(register),
+        };
+        assert_eq!(call_register(entrypoint, &test_host_api()), 0);
+        assert_eq!(V1_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(V1_LOOKUPS.load(Ordering::SeqCst), 1);
+        assert_eq!(V1_SEEN_VERSION.load(Ordering::SeqCst), 1);
+
+        // A selected v2 entrypoint that fails is still called once and is not
+        // followed by a legacy call.
+        V2_RETURN.store(73, Ordering::SeqCst);
+        let selected = select_register::<RpiPluginRegister, LegacyRpiPluginRegister, &str>(
+            Ok(test_register_v2),
+            || {
+                V1_LOOKUPS.fetch_add(1, Ordering::SeqCst);
+                Ok(test_register_v1)
+            },
+        )
+        .expect("v2 selected even though its later call will fail");
+        let entrypoint = match selected {
+            Ok(register) => RegisterEntrypoint::V2(register),
+            Err(register) => RegisterEntrypoint::V1(register),
+        };
+        assert_eq!(call_register(entrypoint, &test_host_api()), 73);
+        assert_eq!(V2_CALLS.load(Ordering::SeqCst), 2);
+        assert_eq!(V1_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(V1_LOOKUPS.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn loads_real_v011_plugin_and_dispatches_old_enum_reload() {
+        let fixture = build_cdylib_fixture("abi_v011_real", V011_PLUGIN_SOURCE);
+        let reloads = Arc::new(AtomicUsize::new(0));
+        let host: Arc<dyn crate::RuntimeActionHost> = Arc::new(LegacyReloadHost {
+            reloads: Arc::clone(&reloads),
+        });
+        let bridge = ActionBridge::new(tokio::runtime::Handle::current(), host);
+        let diagnostics = Arc::new(CapturingDiag::default());
+
+        let loaded = load_one(
+            &fixture.path,
+            Arc::clone(&diagnostics) as Arc<dyn PluginDiagnostics>,
+            Some(bridge),
+        )
+        .expect("load plugin built against the vendored v0.1.11 ABI");
+
+        assert_eq!(loaded.abi_version, LEGACY_PLUGIN_ABI_VERSION);
+        assert_eq!(reloads.load(Ordering::SeqCst), 1);
+        assert!(diagnostics.warns.lock().unwrap().is_empty());
+        drop(loaded);
+        drop(fixture);
+    }
+
+    #[test]
+    fn load_one_supports_both_abis_prefers_v2_and_never_retries_failed_v2() {
+        const PREFIX: &str = "use std::ffi::c_void;\n";
+        let diag: Arc<dyn PluginDiagnostics> = Arc::new(CapturingDiag::default());
+
+        let v1 = build_cdylib_fixture(
+            "abi_v1_only",
+            &format!(
+                "{PREFIX}#[no_mangle]\npub extern \"C\" fn rpi_plugin_register(api: *const c_void, abi: u32) -> i32 {{ if !api.is_null() && abi == 1 {{ 0 }} else {{ 91 }} }}\n"
+            ),
+        );
+        let loaded_v1 = load_one(&v1.path, Arc::clone(&diag), None).expect("load ABI v1 plugin");
+        assert_eq!(loaded_v1.abi_version, 1);
+        drop(loaded_v1);
+        drop(v1);
+
+        let v2 = build_cdylib_fixture(
+            "abi_v2_only",
+            &format!(
+                "{PREFIX}#[no_mangle]\npub extern \"C\" fn rpi_plugin_register_v2(api: *const c_void, abi: u32) -> i32 {{ if !api.is_null() && abi == 2 {{ 0 }} else {{ 92 }} }}\n"
+            ),
+        );
+        let loaded_v2 = load_one(&v2.path, Arc::clone(&diag), None).expect("load ABI v2 plugin");
+        assert_eq!(loaded_v2.abi_version, 2);
+        drop(loaded_v2);
+        drop(v2);
+
+        let dual = build_cdylib_fixture(
+            "abi_dual",
+            &format!(
+                "{PREFIX}#[no_mangle]\npub extern \"C\" fn rpi_plugin_register(_: *const c_void, _: u32) -> i32 {{ 93 }}\n#[no_mangle]\npub extern \"C\" fn rpi_plugin_register_v2(api: *const c_void, abi: u32) -> i32 {{ if !api.is_null() && abi == 2 {{ 0 }} else {{ 94 }} }}\n"
+            ),
+        );
+        let loaded_dual =
+            load_one(&dual.path, Arc::clone(&diag), None).expect("dual-symbol plugin uses v2");
+        assert_eq!(loaded_dual.abi_version, 2);
+        drop(loaded_dual);
+        drop(dual);
+
+        let failed_v2 = build_cdylib_fixture(
+            "abi_v2_failure",
+            &format!(
+                "{PREFIX}#[no_mangle]\npub extern \"C\" fn rpi_plugin_register(_: *const c_void, _: u32) -> i32 {{ 0 }}\n#[no_mangle]\npub extern \"C\" fn rpi_plugin_register_v2(_: *const c_void, _: u32) -> i32 {{ 73 }}\n"
+            ),
+        );
+        let error = match load_one(&failed_v2.path, diag, None) {
+            Ok(_) => panic!("failed v2 registration must not fall back to v1"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            PluginLoadError::RegisterReturned { code: 73, .. }
+        ));
+        drop(failed_v2);
     }
 
     #[test]

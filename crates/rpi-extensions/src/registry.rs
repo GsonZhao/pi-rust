@@ -67,6 +67,15 @@ pub struct RegisteredCommand {
 unsafe impl Send for RegisteredCommand {}
 unsafe impl Sync for RegisteredCommand {}
 
+/// A CLI flag declared by a native extension. Values are supplied by the
+/// host's parsed `Args::unknown_flags` map and read by the plugin through the
+/// `RuntimeActionId::GetCliFlag` action.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RegisteredFlag {
+    pub name: String,
+    pub description: String,
+}
+
 /// A registered `on(tag)` event handler. `user_data` is the plugin's opaque
 /// context, passed back unchanged on every dispatch.
 ///
@@ -168,6 +177,7 @@ unsafe impl Sync for RegisteredRenderer {}
 pub enum RegistryEntry {
     Tool(ExtensionTool),
     Command(RegisteredCommand),
+    Flag(RegisteredFlag),
 }
 
 // ---------------------------------------------------------------------------
@@ -184,6 +194,7 @@ pub enum RegistryEntry {
 pub struct ExtensionRegistry {
     tools: Vec<ExtensionTool>,
     commands: Vec<RegisteredCommand>,
+    flags: Vec<RegisteredFlag>,
     /// `handlers[tag as usize]` — all handlers subscribed to that tag.
     handlers: [Vec<RegisteredHandler>; EVENT_TAG_COUNT],
     /// `resources_discover` handlers (B5b). Fan-out on discovery, in registration
@@ -212,13 +223,12 @@ impl Default for ExtensionRegistry {
 impl ExtensionRegistry {
     /// Build an empty, active registry.
     pub fn new() -> Self {
-        // `EVENT_TAG_COUNT` is 33; construct the array via `[const { Vec::new() };
-        // N]` (stable since 1.63).
         let handlers: [Vec<RegisteredHandler>; EVENT_TAG_COUNT] =
-            [const { Vec::new() }; EVENT_TAG_COUNT];
+            std::array::from_fn(|_| Vec::new());
         Self {
             tools: Vec::new(),
             commands: Vec::new(),
+            flags: Vec::new(),
             handlers,
             resources_discover: Vec::new(),
             providers: Vec::new(),
@@ -260,6 +270,16 @@ impl ExtensionRegistry {
             handler,
             user_data,
         });
+        false
+    }
+
+    /// Register a CLI flag (first-wins by name). Returns `true` when an
+    /// earlier extension already declared the same flag.
+    pub fn register_flag(&mut self, name: String, description: String) -> bool {
+        if self.flags.iter().any(|flag| flag.name == name) {
+            return true;
+        }
+        self.flags.push(RegisteredFlag { name, description });
         false
     }
 
@@ -338,6 +358,7 @@ impl ExtensionRegistry {
                 })
                 .collect(),
             commands: self.commands.clone(),
+            flags: self.flags.clone(),
             handlers: self.handlers.clone(),
             resources_discover: self.resources_discover.clone(),
             providers: self.providers.clone(),
@@ -377,6 +398,12 @@ impl ExtensionRegistry {
                 continue;
             }
             self.commands.push(c);
+        }
+        for flag in other.flags.drain(..) {
+            if self.flags.iter().any(|existing| existing.name == flag.name) {
+                continue;
+            }
+            self.flags.push(flag);
         }
         for (tag_idx, handlers) in other.handlers.iter_mut().enumerate() {
             self.handlers[tag_idx].append(handlers);
@@ -420,6 +447,7 @@ impl ExtensionRegistry {
 pub struct RegistrySnapshot {
     tools: Vec<ExtensionTool>,
     commands: Vec<RegisteredCommand>,
+    flags: Vec<RegisteredFlag>,
     handlers: [Vec<RegisteredHandler>; EVENT_TAG_COUNT],
     resources_discover: Vec<ResourcesDiscoverHandler>,
     providers: Vec<RegisteredProvider>,
@@ -441,6 +469,11 @@ impl RegistrySnapshot {
     /// The registered slash commands.
     pub fn commands(&self) -> &[RegisteredCommand] {
         &self.commands
+    }
+
+    /// The registered CLI flags, insertion order.
+    pub fn flags(&self) -> &[RegisteredFlag] {
+        &self.flags
     }
 
     /// Handlers subscribed to `tag` (empty slice if none).
@@ -495,6 +528,9 @@ impl RegistrySnapshot {
         for c in &self.commands {
             v.push(RegistryEntry::Command(c.clone()));
         }
+        for flag in &self.flags {
+            v.push(RegistryEntry::Flag(flag.clone()));
+        }
         v
     }
 
@@ -526,4 +562,28 @@ pub(crate) fn stale_error() -> AgentError {
 #[allow(dead_code)]
 fn _ensure_handler_accessor_used(snap: &RegistrySnapshot) {
     let _ = snap.handlers_for(EventTag::MessageEnd);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_flags_snapshot_and_merge_first_wins() {
+        let mut first = ExtensionRegistry::new();
+        assert!(!first.register_flag("server".into(), "Start server".into()));
+        assert!(first.register_flag("server".into(), "Different description".into()));
+
+        let mut second = ExtensionRegistry::new();
+        assert!(!second.register_flag("server".into(), "Second server".into()));
+        assert!(!second.register_flag("port".into(), "Listen port".into()));
+
+        first.absorb(second);
+        let snapshot = first.snapshot();
+        let flags = snapshot.flags();
+        assert_eq!(flags.len(), 2);
+        assert_eq!(flags[0].name, "server");
+        assert_eq!(flags[0].description, "Start server");
+        assert_eq!(flags[1].name, "port");
+    }
 }

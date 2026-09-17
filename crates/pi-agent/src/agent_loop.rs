@@ -273,6 +273,22 @@ async fn run_loop(
                 }
             }
 
+            if !tool_results.is_empty() {
+                if let Some(upd) = after_tool_results(
+                    config,
+                    &message,
+                    &tool_results,
+                    current_context,
+                    new_messages,
+                )
+                .await
+                {
+                    if let Some(ctx) = upd.context {
+                        *current_context = ctx;
+                    }
+                }
+            }
+
             let am = AgentMessage::Assistant(Box::new(message.clone()));
             emit_event(
                 emit,
@@ -319,7 +335,14 @@ async fn run_loop(
                 return Ok(LoopOutcome::Completed);
             }
 
-            if config.signal.is_cancelled() {
+            // Keep the native Pi ordering here: steering is drained after the
+            // tool batch settles, even when the run was cancelled. This makes
+            // messages queued while a blocking tool was active part of the
+            // returned transcript/context instead of leaving them stranded in
+            // the queue. The next stream observes the cancelled signal and
+            // produces the terminal aborted assistant message.
+            pending_messages = drain_steering(config).await;
+            if config.signal.is_cancelled() && pending_messages.is_empty() {
                 emit_event(
                     emit,
                     AgentEvent::AgentEnd {
@@ -329,8 +352,6 @@ async fn run_loop(
                 .await;
                 return Ok(LoopOutcome::Aborted);
             }
-
-            pending_messages = drain_steering(config).await;
         }
 
         // Agent would stop here. Check for follow-up messages.
@@ -1156,6 +1177,23 @@ async fn prepare_next_turn(
     } else {
         None
     }
+}
+
+async fn after_tool_results(
+    config: &AgentLoopConfig,
+    message: &AssistantMessage,
+    tool_results: &[ToolResultMessage],
+    context: &AgentContext,
+    new_messages: &[AgentMessage],
+) -> Option<crate::types::AgentLoopTurnUpdate> {
+    let hook = config.after_tool_results.as_ref()?;
+    let ctx = crate::types::ShouldStopAfterTurnContext {
+        message,
+        tool_results,
+        context,
+        new_messages,
+    };
+    hook(ctx).await
 }
 
 /// Call `should_stop_after_turn` if configured.

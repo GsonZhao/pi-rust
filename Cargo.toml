@@ -28,8 +28,8 @@ resolver = "2"
 edition = "2021"
 rust-version = "1.78"
 license = "MIT"
-repository = "https://github.com/bigfish193/pi-rust"
-version = "0.1.5"
+repository = "https://github.com/bigfish1913/pi-rust"
+version = "0.1.19"
 authors = ["BigFish <bigfish1913@gmail.com>"]
 
 [workspace.dependencies]
@@ -38,10 +38,13 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", 
 tokio-util = { version = "0.7", features = ["rt"] }
 async-trait = "0.1"
 futures = "0.3"
+fs2 = "0.4"
 
 # Serialization / schemas
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
+yaml_serde = "=0.10.2"
+indexmap = { version = "2", features = ["serde"] }
 schemars = { version = "0.8", features = ["preserve_order"] }
 jsonschema = "0.18"
 
@@ -56,25 +59,28 @@ tracing = "0.1"
 
 # Misc
 uuid = { version = "1", features = ["v4", "v7"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
 base64 = "0.22"
+png = "0.18"
 tempfile = "3"
 regex = "1"
-globset = "0.4"
+semver = "1"
+globset = "=0.4.15"
 dirs = "5"
 rpassword = "7"
 
 # pi-rust internal crates (published under the `rpi-` prefix; directories keep
 # the `pi-` name — package `name` is what crates.io + `extern crate` see).
-rpi-telemetry = { path = "crates/pi-telemetry", version = "0.1.5" }
-rpi-ai = { path = "crates/pi-ai", version = "0.1.5" }
-rpi-agent = { path = "crates/pi-agent", version = "0.1.5" }
-rpi-tools = { path = "crates/pi-tools", version = "0.1.5" }
-rpi-harness = { path = "crates/pi-harness", version = "0.1.5" }
+rpi-telemetry = { path = "crates/pi-telemetry", version = "0.1.19" }
+rpi-ai = { path = "crates/pi-ai", version = "0.1.19" }
+rpi-agent = { path = "crates/pi-agent", version = "0.1.19" }
+rpi-tools = { path = "crates/pi-tools", version = "0.1.19" }
+rpi-harness = { path = "crates/pi-harness", version = "0.1.19" }
 
-rpi-tui = { path = "crates/pi-tui", version = "0.1.5" }
+rpi-tui = { path = "crates/pi-tui", version = "0.1.19" }
 
-rpi-plugin-sdk = { path = "crates/rpi-plugin-sdk", version = "0.1.5" }
-rpi-extensions = { path = "crates/rpi-extensions", version = "0.1.5" }
+rpi-plugin-sdk = { path = "crates/rpi-plugin-sdk", version = "0.1.19" }
+rpi-extensions = { path = "crates/rpi-extensions", version = "0.1.19" }
 
 [profile.release]
 lto = "thin"

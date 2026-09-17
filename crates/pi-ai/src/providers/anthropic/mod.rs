@@ -27,7 +27,7 @@ use crate::event_stream::{
 };
 use crate::model::{Model, StreamingProtocolCompat};
 use crate::provider::{CacheRetention, Provider, SimpleStreamOptions};
-use crate::types::{Context, Usage};
+use crate::types::{AssistantMessageEvent, Content, Context, DoneReason, StopReason, Usage};
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -55,6 +55,10 @@ pub struct AnthropicProvider {
     /// Default API key, used when `SimpleStreamOptions::api_key` is `None`.
     /// `None` here means "defer to opts + env at call time".
     api_key: Option<String>,
+    /// Whether a missing explicit/default key may fall back to the built-in
+    /// Anthropic environment variable. Custom provider identities must disable
+    /// this or an official Anthropic key could be sent to their endpoint.
+    allow_env_api_key: bool,
     http: reqwest::Client,
     models: Vec<Model>,
 }
@@ -66,6 +70,7 @@ impl AnthropicProvider {
     pub fn new(api_key: Option<String>, http: reqwest::Client) -> Self {
         Self {
             api_key,
+            allow_env_api_key: true,
             http,
             models: anthropic_models(),
         }
@@ -75,6 +80,26 @@ impl AnthropicProvider {
     pub fn with_models(api_key: Option<String>, http: reqwest::Client, models: Vec<Model>) -> Self {
         Self {
             api_key,
+            allow_env_api_key: true,
+            http,
+            models,
+        }
+    }
+
+    /// Build an Anthropic-wire provider for a non-Anthropic identity.
+    ///
+    /// Unlike [`Self::with_models`], this never consults `ANTHROPIC_API_KEY`
+    /// when the provider has no explicit key. Authentication must come from
+    /// the supplied provider key or request/model headers, preserving the
+    /// provider id as a credential boundary.
+    pub fn with_models_without_env_api_key(
+        api_key: Option<String>,
+        http: reqwest::Client,
+        models: Vec<Model>,
+    ) -> Self {
+        Self {
+            api_key,
+            allow_env_api_key: false,
             http,
             models,
         }
@@ -119,12 +144,22 @@ impl Provider for AnthropicProvider {
 
         let http = self.http.clone();
         let provider_key = self.api_key.clone();
+        let allow_env_api_key = self.allow_env_api_key;
         let model = model.clone();
         let ctx = Arc::new(ctx.clone());
         let opts = opts.clone();
 
         tokio::spawn(async move {
-            run_anthropic_stream(&mut prod, http, provider_key, &model, &ctx, &opts).await;
+            run_anthropic_stream(
+                &mut prod,
+                http,
+                provider_key,
+                allow_env_api_key,
+                &model,
+                &ctx,
+                &opts,
+            )
+            .await;
             // `prod` drops here, closing the mpsc sender so the consumer's
             // `next()` returns `None` after the terminal event.
         });
@@ -153,6 +188,7 @@ async fn run_anthropic_stream(
     prod: &mut AssistantMessageEventStreamProducer,
     http: reqwest::Client,
     provider_key: Option<String>,
+    allow_env_api_key: bool,
     model: &Model,
     ctx: &Context,
     opts: &SimpleStreamOptions,
@@ -165,7 +201,7 @@ async fn run_anthropic_stream(
     );
 
     // ---- resolve auth (assertRequestAuth) ----
-    let resolved_key = resolve_api_key(&provider_key, opts);
+    let resolved_key = resolve_api_key(&provider_key, opts, allow_env_api_key);
     // TS `assertRequestAuth(model.provider, options?.apiKey, options?.headers)`
     // checks `options.headers` alone — but upstream the model-resolution layer
     // has *already merged* `model.headers` into `options.headers` (models.ts
@@ -189,7 +225,7 @@ async fn run_anthropic_stream(
 
     // ---- build params (is_oauth = false in v1) ----
     let built = build_params(model, ctx, false, opts);
-    let body = match serde_json::to_value(&built.request) {
+    let mut body = match serde_json::to_value(&built.request) {
         Ok(v) => v,
         Err(e) => {
             emit_terminal_error(
@@ -201,6 +237,12 @@ async fn run_anthropic_stream(
             return;
         }
     };
+    let non_stream = std::env::var("RPI_ANTHROPIC_NON_STREAM").ok().as_deref() == Some("1");
+    if non_stream {
+        body["stream"] = serde_json::Value::Bool(false);
+        strip_cache_control(&mut body);
+        simplify_non_stream_request(&mut body);
+    }
 
     // ---- assemble headers (createClient, API-key arm) ----
     let headers = assemble_headers(
@@ -211,7 +253,7 @@ async fn run_anthropic_stream(
     );
 
     let url = format!("{}/v1/messages", model.base_url.trim_end_matches('/'));
-    let timeout = opts.timeout;
+    let timeout = opts.request_timeout();
     let signal = opts.signal.clone();
 
     // ---- POST with retry (retryProviderRequest) ----
@@ -229,10 +271,7 @@ async fn run_anthropic_stream(
             let headers = headers.clone();
             let signal = signal.clone();
             async move {
-                let mut req = http.post(&url);
-                if let Some(t) = timeout {
-                    req = req.timeout(t);
-                }
+                let mut req = http.post(&url).timeout(timeout);
                 for (k, v) in &headers {
                     req = req.header(k.as_str(), v.as_str());
                 }
@@ -251,7 +290,16 @@ async fn run_anthropic_stream(
                     let code = status.as_u16();
                     // Read the error body for a diagnostic message; the retry
                     // predicate only needs the status code.
-                    let text = resp.text().await.unwrap_or_default();
+                    let text = tokio::select! {
+                        biased;
+                        _ = signal.cancelled() => return Err(AiError::Abort {
+                            message: "Request aborted".to_string(),
+                        }),
+                        result = resp.text() => result.map_err(|error| AiError::Http {
+                            status: Some(code),
+                            message: format!("error reading HTTP error body: {error}"),
+                        })?,
+                    };
                     return Err(AiError::Http {
                         status: Some(code),
                         message: text,
@@ -270,10 +318,109 @@ async fn run_anthropic_stream(
         Ok(r) => r,
         Err(err) => {
             let aborted = err.is_abort();
+            eprintln!("anthropic request failed: {err}");
             emit_terminal_error(prod, &mut state, err.to_string(), aborted);
             return;
         }
     };
+
+    if non_stream {
+        let response_body = match tokio::select! {
+            biased;
+            _ = opts.signal.cancelled() => Err(AiError::Abort {
+                message: "Request aborted".to_string(),
+            }),
+            result = response.text() => result.map_err(|error| AiError::Http {
+                status: None,
+                message: format!("failed to read non-stream response: {error}"),
+            }),
+        } {
+            Ok(body) => body,
+            Err(error) => {
+                let aborted = error.is_abort();
+                emit_terminal_error(prod, &mut state, error.to_string(), aborted);
+                return;
+            }
+        };
+        let value: serde_json::Value = match serde_json::from_str(&response_body) {
+            Ok(value) => value,
+            Err(error) => {
+                emit_terminal_error(
+                    prod,
+                    &mut state,
+                    format!("failed to parse non-stream response: {error}"),
+                    false,
+                );
+                return;
+            }
+        };
+        let text = value
+            .get("content")
+            .and_then(serde_json::Value::as_array)
+            .map(|blocks| {
+                blocks
+                    .iter()
+                    .filter(|block| {
+                        block.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                    })
+                    .filter_map(|block| block.get("text").and_then(serde_json::Value::as_str))
+                    .collect::<String>()
+            })
+            .unwrap_or_default();
+        if text.trim().is_empty() {
+            emit_terminal_error(
+                prod,
+                &mut state,
+                "non-stream response contained no text content".into(),
+                false,
+            );
+            return;
+        }
+        state.output.content.push(Content::text(text.clone()));
+        state.output.response_id = value
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        state.output.response_model = value
+            .get("model")
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        if let Some(usage) = value.get("usage") {
+            state.output.usage.input = usage
+                .get("input_tokens")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            state.output.usage.output = usage
+                .get("output_tokens")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or(0);
+            state.output.usage.total_tokens = state.output.usage.input + state.output.usage.output;
+        }
+        state.output.stop_reason = StopReason::Stop;
+        let partial = std::sync::Arc::new(state.output.clone());
+        prod.push(AssistantMessageEvent::Start {
+            partial: partial.clone(),
+        });
+        prod.push(AssistantMessageEvent::TextStart {
+            content_index: 0,
+            partial: partial.clone(),
+        });
+        prod.push(AssistantMessageEvent::TextDelta {
+            content_index: 0,
+            delta: text.clone(),
+            partial: partial.clone(),
+        });
+        prod.push(AssistantMessageEvent::TextEnd {
+            content_index: 0,
+            content: text,
+            partial,
+        });
+        prod.push(AssistantMessageEvent::Done {
+            reason: DoneReason::Stop,
+            message: state.output,
+        });
+        return;
+    }
 
     // ---- push start, drive SSE → mapper → terminal ----
     // The TS pushes `start` here right before the event loop; the Rust mapper
@@ -287,6 +434,54 @@ async fn run_anthropic_stream(
     run_mapper(&mut sse, prod, &mut state, cost_fn).await;
 }
 
+fn strip_cache_control(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            map.remove("cache_control");
+            for child in map.values_mut() {
+                strip_cache_control(child);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for child in items {
+                strip_cache_control(child);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn simplify_non_stream_request(value: &mut serde_json::Value) {
+    let text_from_blocks = |blocks: &serde_json::Value| {
+        blocks
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.get("text").and_then(serde_json::Value::as_str))
+                    .collect::<String>()
+            })
+            .unwrap_or_default()
+    };
+    if let Some(messages) = value
+        .get_mut("messages")
+        .and_then(serde_json::Value::as_array_mut)
+    {
+        for message in messages {
+            if let Some(content) = message.get_mut("content") {
+                if content.is_array() {
+                    *content = serde_json::Value::String(text_from_blocks(content));
+                }
+            }
+        }
+    }
+    if let Some(system) = value.get_mut("system") {
+        if system.is_array() {
+            *system = serde_json::Value::String(text_from_blocks(system));
+        }
+    }
+}
+
 // ----------------------------------------------------------------------------
 // Header + auth helpers — mirrors createClient (API-key arm) + assertRequestAuth.
 // ----------------------------------------------------------------------------
@@ -294,15 +489,28 @@ async fn run_anthropic_stream(
 /// Resolve the API key: `opts.api_key` wins, then the provider default, then
 /// `ANTHROPIC_API_KEY` from the environment. Mirrors the TS fallback chain
 /// (`options?.apiKey` → SDK's `apiKey: null` reads the env var internally).
-fn resolve_api_key(provider_key: &Option<String>, opts: &SimpleStreamOptions) -> Option<String> {
+fn resolve_api_key(
+    provider_key: &Option<String>,
+    opts: &SimpleStreamOptions,
+    allow_env_api_key: bool,
+) -> Option<String> {
+    resolve_api_key_with_env(provider_key, opts, allow_env_api_key, || {
+        std::env::var("ANTHROPIC_API_KEY")
+            .ok()
+            .filter(|s| !s.is_empty())
+    })
+}
+
+fn resolve_api_key_with_env(
+    provider_key: &Option<String>,
+    opts: &SimpleStreamOptions,
+    allow_env_api_key: bool,
+    read_env_api_key: impl FnOnce() -> Option<String>,
+) -> Option<String> {
     opts.api_key
         .clone()
         .or_else(|| provider_key.clone())
-        .or_else(|| {
-            std::env::var("ANTHROPIC_API_KEY")
-                .ok()
-                .filter(|s| !s.is_empty())
-        })
+        .or_else(|| allow_env_api_key.then(read_env_api_key).flatten())
 }
 
 /// True when `headers` carries an `authorization`, `x-api-key`, or
@@ -333,10 +541,16 @@ fn assemble_headers(
 ) -> Vec<(String, String)> {
     let mut headers: Vec<(String, String)> = Vec::new();
     headers.push(("accept".into(), "application/json".into()));
-    headers.push((
-        "anthropic-dangerous-direct-browser-access".into(),
-        "true".into(),
-    ));
+    // Keep the request identity aligned with the working third-party
+    // Anthropic clients (including matrixcode). Some gateways use this
+    // identity when classifying requests from coding-agent clients.
+    headers.push(("user-agent".into(), "curl/8.0".into()));
+    if std::env::var("RPI_ANTHROPIC_NON_STREAM").ok().as_deref() != Some("1") {
+        headers.push((
+            "anthropic-dangerous-direct-browser-access".into(),
+            "true".into(),
+        ));
+    }
     headers.push(("anthropic-version".into(), ANTHROPIC_VERSION.into()));
     if let Some(beta) = beta_header {
         headers.push(("anthropic-beta".into(), beta.into()));
@@ -419,6 +633,7 @@ mod tests {
     use super::*;
     use crate::providers::anthropic::models::claude_haiku_4_5;
     use crate::types::{Api, InputModality, ModelCost};
+    use std::collections::BTreeMap;
 
     /// Build a minimal model for header/auth tests (no network).
     fn test_model() -> Model {
@@ -446,6 +661,7 @@ mod tests {
         let headers = assemble_headers(&model, &opts, None, Some("sk-test"));
         let names: Vec<&str> = headers.iter().map(|(k, _)| k.as_str()).collect();
         assert!(names.contains(&"accept"));
+        assert!(names.contains(&"user-agent"));
         assert!(names.contains(&"anthropic-version"));
         assert!(names.contains(&"anthropic-dangerous-direct-browser-access"));
         assert!(names.contains(&"x-api-key"));
@@ -457,6 +673,12 @@ mod tests {
             .map(|(_, v)| v.as_str())
             .unwrap();
         assert_eq!(version, ANTHROPIC_VERSION);
+        let user_agent = headers
+            .iter()
+            .find(|(k, _)| k == "user-agent")
+            .map(|(_, v)| v.as_str())
+            .unwrap();
+        assert_eq!(user_agent, "curl/8.0");
     }
 
     #[test]
@@ -581,14 +803,51 @@ mod tests {
     fn resolve_api_key_prefers_opts_then_provider_then_env() {
         let opts = SimpleStreamOptions::default().with_api_key("opts-key");
         assert_eq!(
-            resolve_api_key(&Some("provider-key".into()), &opts),
+            resolve_api_key(&Some("provider-key".into()), &opts, true),
             Some("opts-key".into())
         );
 
         let opts = SimpleStreamOptions::default();
         assert_eq!(
-            resolve_api_key(&Some("provider-key".into()), &opts),
+            resolve_api_key(&Some("provider-key".into()), &opts, true),
             Some("provider-key".into())
+        );
+    }
+
+    #[test]
+    fn isolated_custom_provider_never_adds_anthropic_env_key_to_headers() {
+        let mut model = test_model();
+        model.provider = "gateway".into();
+        model.base_url = "https://gateway.example.com".into();
+        model.headers = Some(BTreeMap::from([(
+            "authorization".into(),
+            "Bearer gateway-key".into(),
+        )]));
+        let opts = SimpleStreamOptions::default();
+        let env_read = std::cell::Cell::new(false);
+
+        let resolved = resolve_api_key_with_env(&None, &opts, false, || {
+            env_read.set(true);
+            Some("official-anthropic-key".into())
+        });
+        let headers = assemble_headers(&model, &opts, None, resolved.as_deref());
+
+        assert!(
+            !env_read.get(),
+            "isolated providers must not read Anthropic env auth"
+        );
+        assert!(
+            headers.iter().all(|(name, value)| {
+                !name.eq_ignore_ascii_case("x-api-key") && value != "official-anthropic-key"
+            }),
+            "the official key must never reach a custom provider request"
+        );
+        assert_eq!(
+            headers
+                .iter()
+                .find(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                .map(|(_, value)| value.as_str()),
+            Some("Bearer gateway-key")
         );
     }
 

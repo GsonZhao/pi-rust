@@ -50,12 +50,14 @@ pub struct TuiAltScreen {
     main_previous_height: Mutex<usize>,
     main_hardware_row: Mutex<usize>,
     main_viewport_top: Mutex<usize>,
+    main_previous_cursor: Mutex<Option<(usize, usize)>>,
     // Input handlers
     #[allow(dead_code)]
     input_handler: Mutex<Option<Arc<dyn Fn(InputEvent) + Send + Sync>>>,
     #[allow(dead_code)]
     resize_handler: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     overlays: Arc<OverlayManager>,
+    render_suspended: Mutex<bool>,
 }
 
 impl TuiAltScreen {
@@ -89,9 +91,11 @@ impl TuiAltScreen {
             main_previous_height: Mutex::new(0),
             main_hardware_row: Mutex::new(0),
             main_viewport_top: Mutex::new(0),
+            main_previous_cursor: Mutex::new(None),
             input_handler: Mutex::new(None),
             resize_handler: Mutex::new(None),
             overlays: Arc::new(OverlayManager::new()),
+            render_suspended: Mutex::new(false),
         }
     }
 
@@ -125,6 +129,26 @@ impl TuiAltScreen {
 
     fn is_running(&self) -> bool {
         self.running.lock().map(|running| *running).unwrap_or(false)
+    }
+
+    /// Temporarily suspend the outer application renderer while a foreign
+    /// runtime owns the terminal (for example a Node extension's fullscreen
+    /// component). The terminal remains in raw/alternate-screen mode; only
+    /// background repaint requests are suppressed.
+    pub fn set_render_suspended(&self, suspended: bool) {
+        if let Ok(mut value) = self.render_suspended.lock() {
+            *value = suspended;
+        }
+        if !suspended {
+            self.request_render(true);
+        }
+    }
+
+    pub fn is_render_suspended(&self) -> bool {
+        self.render_suspended
+            .lock()
+            .map(|value| *value)
+            .unwrap_or(false)
     }
 
     /// Get the current scroll position.
@@ -262,6 +286,12 @@ impl TuiAltScreen {
         let Ok(_render_guard) = self.render_lock.lock() else {
             return;
         };
+        // A render request may have passed the public suspension check while
+        // a custom UI was opening. Re-check after taking the render lock so an
+        // already queued outer frame cannot overwrite the foreign screen.
+        if self.is_render_suspended() {
+            return;
+        }
         let Ok(terminal) = self.terminal.lock() else {
             return;
         };
@@ -286,10 +316,14 @@ impl TuiAltScreen {
             .unwrap_or_default();
         let previous_width = *self.main_previous_width.lock().unwrap();
         let previous_height = *self.main_previous_height.lock().unwrap();
+        let previous_cursor = *self.main_previous_cursor.lock().unwrap();
 
-        // Width changes alter wrapping everywhere; redraw the document. Normal
-        // streaming updates stay incremental and preserve terminal scrollback.
-        if previous_width != 0 && previous_width != width {
+        // Size changes alter wrapping or viewport coordinates everywhere;
+        // mirror native pi and rebuild once. Normal streaming updates stay
+        // incremental and preserve terminal scrollback.
+        if (previous_width != 0 && previous_width != width)
+            || (previous_height != 0 && previous_height != height)
+        {
             terminal.write("\x1b[2J\x1b[H\x1b[3J");
             terminal.write("\x1b[?2026h");
             terminal.write(&lines.join("\r\n"));
@@ -304,18 +338,26 @@ impl TuiAltScreen {
             *self.main_viewport_top.lock().unwrap() = lines.len().saturating_sub(height);
         } else {
             let mut first_changed = None;
+            let mut last_changed = None;
             let max = previous.len().max(lines.len());
             for index in 0..max {
                 if previous.get(index) != lines.get(index) {
-                    first_changed = Some(index);
-                    break;
+                    first_changed.get_or_insert(index);
+                    last_changed = Some(index);
                 }
             }
-            if let Some(first) = first_changed {
+            if first_changed.is_none() && cursor == previous_cursor {
+                return;
+            }
+            if let (Some(first), Some(last)) = (first_changed, last_changed) {
                 let mut hardware_row = *self.main_hardware_row.lock().unwrap();
                 let mut viewport_top = *self.main_viewport_top.lock().unwrap();
                 let viewport_bottom = viewport_top + height.saturating_sub(1);
-                let move_target = if first == previous.len() && first > 0 {
+                let deleted_tail_only = first >= lines.len();
+                let append_start = first == previous.len() && first > 0;
+                let move_target = if deleted_tail_only {
+                    lines.len().saturating_sub(1)
+                } else if append_start {
                     first - 1
                 } else {
                     first
@@ -341,26 +383,40 @@ impl TuiAltScreen {
                 } else if current_screen > target_screen {
                     output.push_str(&format!("\x1b[{}A", current_screen - target_screen));
                 }
-                output.push_str(if first == previous.len() && first > 0 {
-                    "\r\n"
-                } else {
-                    "\r"
-                });
-                for index in first..lines.len() {
-                    if index > first {
-                        output.push_str("\r\n");
+                output.push_str(if append_start { "\r\n" } else { "\r" });
+                let render_end = last.min(lines.len().saturating_sub(1));
+                if !deleted_tail_only {
+                    for index in first..=render_end {
+                        if index > first {
+                            output.push_str("\r\n");
+                        }
+                        output.push_str("\x1b[2K");
+                        output.push_str(&lines[index]);
                     }
-                    output.push_str("\x1b[2K");
-                    output.push_str(&lines[index]);
                 }
+                let mut final_row = render_end;
                 if previous.len() > lines.len() {
-                    for _ in lines.len()..previous.len() {
-                        output.push_str("\r\n\x1b[2K");
+                    let extra_lines = previous.len() - lines.len();
+                    let clear_start_offset = usize::from(!lines.is_empty());
+                    if clear_start_offset > 0 {
+                        output.push_str("\x1b[1B");
+                    }
+                    for index in 0..extra_lines {
+                        output.push_str("\r\x1b[2K");
+                        if index + 1 < extra_lines {
+                            output.push_str("\x1b[1B");
+                        }
+                    }
+                    let move_back = extra_lines.saturating_sub(1) + clear_start_offset;
+                    if move_back > 0 {
+                        output.push_str(&format!("\x1b[{move_back}A"));
+                    }
+                    if extra_lines > 0 {
+                        final_row = lines.len().saturating_sub(1);
                     }
                 }
                 output.push_str("\x1b[?2026l");
                 terminal.write(&output);
-                let final_row = lines.len().saturating_sub(1);
                 let advanced = final_row.saturating_sub(viewport_top + height.saturating_sub(1));
                 viewport_top += advanced;
                 *self.main_hardware_row.lock().unwrap() = final_row;
@@ -384,7 +440,8 @@ impl TuiAltScreen {
         terminal.flush();
         *self.previous_screen.lock().unwrap() = lines;
         *self.main_previous_width.lock().unwrap() = width;
-        *self.main_previous_height.lock().unwrap() = previous_height.max(height);
+        *self.main_previous_height.lock().unwrap() = height;
+        *self.main_previous_cursor.lock().unwrap() = cursor;
     }
 
     /// Perform a differential render with constrained layout.
@@ -396,6 +453,9 @@ impl TuiAltScreen {
         let Ok(_render_guard) = self.render_lock.lock() else {
             return;
         };
+        if self.is_render_suspended() {
+            return;
+        }
 
         let (width, height) = if let Ok(terminal) = self.terminal.lock() {
             (terminal.columns(), terminal.rows())
@@ -423,6 +483,15 @@ impl TuiAltScreen {
         // Get screen lines and composite modal overlays above the layout.
         let mut visible = frame.lines;
         self.paint_overlays(&mut visible, width, height);
+
+        // Cursor markers are an internal layout protocol, not terminal output.
+        // Extract the location first, then strip every marker before diffing or
+        // writing. Sending the APC marker to some Windows terminals caused the
+        // character under the cursor to be erased when moving left/right.
+        let cursor = extract_cursor_position(&visible, height);
+        for line in &mut visible {
+            *line = line.replace(CURSOR_MARKER, "");
+        }
 
         // Check for full redraw
         let previous = self
@@ -454,8 +523,9 @@ impl TuiAltScreen {
                 buffer.push_str(&format!("\x1b[{};1H\x1b[2K{}", row + 1, line));
             }
 
-            // Find cursor position if present
-            if let Some((row, col)) = extract_cursor_position(&visible, height) {
+            // Position the hardware cursor using the marker location captured
+            // before internal markers were stripped from `visible`.
+            if let Some((row, col)) = cursor {
                 buffer.push_str(&format!("\x1b[{};{}H", row + 1, col + 1));
                 if self.get_show_hardware_cursor() {
                     buffer.push_str("\x1b[?25h");
@@ -564,7 +634,11 @@ impl Component for TuiAltScreen {
 
 impl TUI for TuiAltScreen {
     fn mode(&self) -> TuiMode {
-        TuiMode::Fullscreen
+        if self.uses_main_screen() {
+            TuiMode::Regular
+        } else {
+            TuiMode::Fullscreen
+        }
     }
 
     fn terminal(&self) -> &dyn Terminal {
@@ -700,6 +774,9 @@ impl TUI for TuiAltScreen {
         if !self.is_running() {
             return;
         }
+        if self.is_render_suspended() {
+            return;
+        }
         if force {
             if let Ok(mut prev) = self.previous_screen.lock() {
                 prev.clear();
@@ -709,6 +786,9 @@ impl TUI for TuiAltScreen {
     }
 
     fn request_render(&self, _force: bool) {
+        if self.is_render_suspended() {
+            return;
+        }
         self.render_now(false);
     }
 
@@ -749,7 +829,7 @@ impl TuiAltScreen {
     /// when only the viewport or bottom dock changed. A missing cache or width
     /// change falls back to rendering fresh content automatically.
     pub fn request_render_reusing_scroll_content(&self) {
-        if self.is_running() {
+        if self.is_running() && !self.is_render_suspended() {
             self.do_render(true);
         }
     }
@@ -885,7 +965,8 @@ impl Terminal for TerminalProxy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Text;
+    use crate::{Editor, Focusable, Text};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     struct RecordingTerminal {
         output: Arc<Mutex<String>>,
@@ -928,6 +1009,28 @@ mod tests {
     }
 
     #[test]
+    fn cursor_marker_is_never_written_to_the_terminal() {
+        let output = Arc::new(Mutex::new(String::new()));
+        let terminal = RecordingTerminal {
+            output: output.clone(),
+        };
+        let tui = TuiAltScreen::new(Box::new(terminal), true, None);
+        let editor = Arc::new(Editor::simple());
+        editor.set_focused(true);
+        editor.insert("hello");
+        tui.set_layout_root(Some(editor.clone()));
+        tui.start_readerless();
+
+        editor.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        tui.request_render(false);
+
+        let rendered = output.lock().unwrap().clone();
+        assert!(!rendered.contains(CURSOR_MARKER));
+        assert!(rendered.contains("hello"));
+        assert_eq!(editor.get_text(), "hello");
+    }
+
+    #[test]
     fn layout_does_not_touch_main_screen_and_stop_clears_it() {
         let output = Arc::new(Mutex::new(String::new()));
         let terminal = RecordingTerminal {
@@ -948,5 +1051,68 @@ mod tests {
             .rfind("\x1b[?1049l\x1b[2J\x1b[H\x1b[?25h")
             .expect("stop should leave alt screen and clear the restored main screen");
         assert!(clear_position > content_position);
+    }
+
+    #[test]
+    fn cached_redraw_is_suppressed_while_rendering_is_suspended() {
+        let output = Arc::new(Mutex::new(String::new()));
+        let terminal = RecordingTerminal {
+            output: output.clone(),
+        };
+        let tui = TuiAltScreen::new(Box::new(terminal), true, None);
+        tui.set_layout_root(Some(Arc::new(Text::new("outer frame", 0, 0))));
+        tui.start_readerless();
+
+        tui.set_render_suspended(true);
+        let before = output.lock().unwrap().len();
+        tui.request_render_reusing_scroll_content();
+        assert_eq!(output.lock().unwrap().len(), before);
+
+        tui.set_render_suspended(false);
+        tui.set_layout_root(Some(Arc::new(Text::new("new frame", 0, 0))));
+        assert!(output.lock().unwrap().len() > before);
+    }
+
+    #[test]
+    fn regular_single_line_update_does_not_rewrite_unchanged_tail() {
+        let output = Arc::new(Mutex::new(String::new()));
+        let terminal = RecordingTerminal {
+            output: output.clone(),
+        };
+        let tui = TuiAltScreen::new(Box::new(terminal), true, None);
+        let content = Arc::new(Text::new("header\nstatus\neditor\nfooter", 0, 0));
+        tui.set_main_screen_mode(true);
+        tui.set_layout_root(Some(content.clone()));
+        tui.start_readerless();
+        output.lock().unwrap().clear();
+
+        content.set_text("header\nstatus2\neditor\nfooter");
+        tui.request_render(false);
+
+        let rendered = output.lock().unwrap().clone();
+        assert!(rendered.contains("status2"));
+        assert!(!rendered.contains("editor"));
+        assert!(!rendered.contains("footer"));
+    }
+
+    #[test]
+    fn regular_unchanged_frame_writes_nothing() {
+        let output = Arc::new(Mutex::new(String::new()));
+        let terminal = RecordingTerminal {
+            output: output.clone(),
+        };
+        let tui = TuiAltScreen::new(Box::new(terminal), true, None);
+        tui.set_main_screen_mode(true);
+        tui.set_layout_root(Some(Arc::new(Text::new(
+            "header\nstatus\neditor\nfooter",
+            0,
+            0,
+        ))));
+        tui.start_readerless();
+        output.lock().unwrap().clear();
+
+        tui.request_render(false);
+
+        assert!(output.lock().unwrap().is_empty());
     }
 }

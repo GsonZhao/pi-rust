@@ -18,7 +18,8 @@
 use std::io::{BufRead, IsTerminal, Write};
 use std::sync::{Arc, Mutex};
 
-use rpi_ai::types::{AssistantMessage, Content, StopReason};
+use rpi_agent::events::AgentEvent;
+use rpi_ai::types::{AssistantMessage, Content, ImageContent, StopReason};
 use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome};
 use rpi_harness::events::{HarnessEvent, RunEndOutcome};
 
@@ -53,6 +54,7 @@ pub async fn print(
     _args: &Args,
     initial: Option<String>,
     extra_messages: &[String],
+    initial_images: Vec<ImageContent>,
 ) -> i32 {
     let lane: Arc<dyn AgentLane> = harness.lane("main");
 
@@ -74,8 +76,9 @@ pub async fn print(
         return 0;
     }
 
+    let mut images = initial_images;
     for prompt in prompts {
-        match lane.prompt_text(&prompt, Vec::new()).await {
+        match lane.prompt_text(&prompt, std::mem::take(&mut images)).await {
             Ok(result) => {
                 last_exit = outcome_exit_code(&result.outcome);
                 match &result.outcome {
@@ -146,6 +149,8 @@ pub async fn json(
     _args: &Args,
     initial: Option<String>,
     extra_messages: &[String],
+    initial_images: Vec<ImageContent>,
+    mut agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
 ) -> i32 {
     let lane: Arc<dyn AgentLane> = harness.lane("main");
     let collected: Arc<Mutex<Vec<HarnessEvent>>> = Arc::new(Mutex::new(Vec::new()));
@@ -163,6 +168,28 @@ pub async fn json(
     // single-shot CLI process (the bus outlives this scope anyway).
     std::mem::forget(watch);
 
+    // The harness bus carries run lifecycle events; the agent receiver carries
+    // the native fine-grained stream (turns, message deltas, and tools).
+    let (agent_done_tx, mut agent_done_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    let agent_event_task = agent_events.take().map(|mut rx| {
+        tokio::spawn(async move {
+            let done_tx = agent_done_tx;
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        let terminal = event.is_terminal();
+                        emit_agent_event(&event);
+                        if terminal {
+                            let _ = done_tx.send(());
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        })
+    });
+
     let mut prompts: Vec<String> = Vec::new();
     if let Some(init) = initial {
         prompts.push(init);
@@ -174,9 +201,20 @@ pub async fn json(
     let mut last_exit = 0;
     let mut final_outcome: Option<HarnessRunOutcome> = None;
 
+    let mut images = initial_images;
     for prompt in prompts {
-        match lane.prompt_text(&prompt, Vec::new()).await {
+        match lane.prompt_text(&prompt, std::mem::take(&mut images)).await {
             Ok(result) => {
+                // The harness resolves after its run outcome, while the
+                // broadcast listener may still be scheduling the terminal
+                // AgentEnd line. Wait briefly so JSON consumers see the full
+                // lifecycle before the final result summary. The timeout is
+                // deliberately bounded for custom/older harness emitters.
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_millis(250),
+                    agent_done_rx.recv(),
+                )
+                .await;
                 last_exit = outcome_exit_code(&result.outcome);
                 final_outcome = Some(result.outcome);
             }
@@ -187,6 +225,9 @@ pub async fn json(
                     "error": e.to_string(),
                 });
                 println!("{line}");
+                if let Some(task) = agent_event_task {
+                    task.abort();
+                }
                 return 1;
             }
         }
@@ -213,7 +254,138 @@ pub async fn json(
         "finalText": final_text,
     });
     println!("{result_line}");
+    if let Some(task) = agent_event_task {
+        task.abort();
+    }
     last_exit
+}
+
+fn emit_agent_event(event: &AgentEvent) {
+    println!("{}", agent_event_json(event));
+}
+
+/// Stable JSON projection for the fine-grained agent lifecycle stream.
+/// Complex payloads use their serde representation instead of being dropped,
+/// while convenience fields keep the stream easy to consume incrementally.
+fn agent_event_json(event: &AgentEvent) -> serde_json::Value {
+    use rpi_ai::types::AssistantMessageEvent;
+    match event {
+        AgentEvent::AgentStart => serde_json::json!({"type":"agent_start"}),
+        AgentEvent::AgentEnd { messages } => serde_json::json!({
+            "type":"agent_end", "messageCount": messages.len(),
+            "messages": serde_json::to_value(messages).unwrap_or(serde_json::Value::Null)
+        }),
+        AgentEvent::RetryScheduled {
+            attempt,
+            max_retries,
+            delay_ms,
+            error,
+        } => serde_json::json!({
+            "type":"retry_scheduled", "attempt":attempt,
+            "maxRetries":max_retries, "delayMs":delay_ms, "error":error
+        }),
+        AgentEvent::TurnStart => serde_json::json!({"type":"turn_start"}),
+        AgentEvent::TurnEnd {
+            message,
+            tool_results,
+        } => serde_json::json!({
+            "type":"turn_end", "message": serde_json::to_value(message).ok(),
+            "toolResultCount": tool_results.len(),
+            "toolResults": serde_json::to_value(tool_results).unwrap_or(serde_json::Value::Null)
+        }),
+        AgentEvent::MessageStart { message } => serde_json::json!({
+            "type":"message_start", "message": serde_json::to_value(message).ok()
+        }),
+        AgentEvent::MessageEnd { message } => serde_json::json!({
+            "type":"message_end", "message": serde_json::to_value(message).ok()
+        }),
+        AgentEvent::MessageUpdate {
+            message,
+            assistant_message_event,
+        } => {
+            let mut value = serde_json::json!({
+                "type":"message_update",
+                "message": serde_json::to_value(message).unwrap_or(serde_json::Value::Null),
+                "assistantMessageEvent": serde_json::to_value(assistant_message_event)
+                    .unwrap_or(serde_json::Value::Null),
+                "eventType": assistant_message_event.type_tag(),
+            });
+            let object = value.as_object_mut().expect("json object");
+            match assistant_message_event {
+                AssistantMessageEvent::TextDelta {
+                    content_index,
+                    delta,
+                    ..
+                }
+                | AssistantMessageEvent::ThinkingDelta {
+                    content_index,
+                    delta,
+                    ..
+                }
+                | AssistantMessageEvent::ToolCallDelta {
+                    content_index,
+                    delta,
+                    ..
+                } => {
+                    object.insert("contentIndex".into(), (*content_index).into());
+                    object.insert("delta".into(), delta.clone().into());
+                }
+                _ => {}
+            }
+            value
+        }
+        AgentEvent::ToolExecutionStart {
+            tool_call_id,
+            tool_name,
+            args,
+        } => serde_json::json!({
+            "type":"tool_execution_start", "toolCallId":tool_call_id,
+            "toolName":tool_name, "args":args
+        }),
+        AgentEvent::ToolExecutionUpdate {
+            tool_call_id,
+            tool_name,
+            args,
+            partial_result,
+        } => serde_json::json!({
+            "type":"tool_execution_update", "toolCallId":tool_call_id, "toolName":tool_name,
+            "args": args,
+            "partialResult": tool_result_json(partial_result)
+        }),
+        AgentEvent::ToolExecutionEnd {
+            tool_call_id,
+            tool_name,
+            result,
+            is_error,
+        } => serde_json::json!({
+            "type":"tool_execution_end", "toolCallId":tool_call_id,
+            "toolName":tool_name, "isError":is_error,
+            "result": tool_result_json(result)
+        }),
+    }
+}
+
+fn tool_result_json(result: &rpi_agent::types::AgentToolResult) -> serde_json::Value {
+    let content: Vec<serde_json::Value> = result
+        .content
+        .iter()
+        .map(|item| match item {
+            rpi_agent::types::TextContentOrImage::Text(text) => serde_json::json!({
+                "type": "text",
+                "text": text.text,
+            }),
+            rpi_agent::types::TextContentOrImage::Image(image) => {
+                serde_json::to_value(image).unwrap_or(serde_json::Value::Null)
+            }
+        })
+        .collect();
+    serde_json::json!({
+        "content": content,
+        "details": result.details,
+        "usage": result.usage.as_ref().and_then(|usage| serde_json::to_value(usage).ok()),
+        "addedToolNames": result.added_tool_names,
+        "terminate": result.terminate,
+    })
 }
 
 /// Emit a single harness event as a JSON line on stdout. Mirrors the TS
@@ -260,7 +432,9 @@ pub async fn interactive(
     model_catalog: Vec<rpi_ai::Model>,
     initial: Option<String>,
     extra_messages: &[String],
+    initial_images: Vec<ImageContent>,
     theme: Option<&str>,
+    no_themes: bool,
     reload_context: &crate::session::ReloadContext,
 ) -> i32 {
     // Check if TUI is supported
@@ -276,13 +450,15 @@ pub async fn interactive(
             model_catalog,
             initial,
             extra_messages,
+            initial_images,
             theme,
+            no_themes,
             reload_context,
         )
         .await
     } else {
         // Fall back to simple REPL
-        interactive_repl(harness, args, initial, extra_messages).await
+        interactive_repl(harness, args, initial, extra_messages, initial_images).await
     }
 }
 
@@ -292,6 +468,7 @@ pub async fn interactive_repl(
     #[allow(unused_variables)] args: &Args,
     initial: Option<String>,
     extra_messages: &[String],
+    initial_images: Vec<ImageContent>,
 ) -> i32 {
     // Debug: confirm we entered REPL mode
     let lane: Arc<dyn AgentLane> = harness.lane("main");
@@ -312,8 +489,9 @@ pub async fn interactive_repl(
     for m in extra_messages {
         prompts.push(m.clone());
     }
+    let mut images = initial_images;
     for prompt in prompts {
-        if let Err(code) = run_one(&lane, &prompt).await {
+        if let Err(code) = run_one(&lane, &prompt, std::mem::take(&mut images)).await {
             return code;
         }
     }
@@ -343,7 +521,7 @@ pub async fn interactive_repl(
             eprintln!("(aborted)");
             continue;
         }
-        if let Err(code) = run_one(&lane, trimmed).await {
+        if let Err(code) = run_one(&lane, trimmed, Vec::new()).await {
             return code;
         }
     }
@@ -353,8 +531,12 @@ pub async fn interactive_repl(
 /// Run a single prompt in interactive mode, printing the assistant reply (or
 /// the error). Returns `Ok(())` on success/soft-failure, `Err(exit_code)` on a
 /// hard rejection.
-async fn run_one(lane: &Arc<dyn AgentLane>, prompt: &str) -> Result<(), i32> {
-    match lane.prompt_text(prompt, Vec::new()).await {
+async fn run_one(
+    lane: &Arc<dyn AgentLane>,
+    prompt: &str,
+    images: Vec<ImageContent>,
+) -> Result<(), i32> {
+    match lane.prompt_text(prompt, images).await {
         Ok(result) => {
             match &result.outcome {
                 HarnessRunOutcome::Completed { final_message, .. }
@@ -392,6 +574,8 @@ async fn run_one(lane: &Arc<dyn AgentLane>, prompt: &str) -> Result<(), i32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rpi_agent::events::AgentEvent;
+    use rpi_agent::types::AgentToolResult;
     use rpi_ai::types::{
         AssistantMessage, Content, StopReason, TextContent, TextContentType, Usage,
     };
@@ -451,5 +635,34 @@ mod tests {
         assert_eq!(run_end_outcome_str(RunEndOutcome::Completed), "completed");
         assert_eq!(run_end_outcome_str(RunEndOutcome::Aborted), "aborted");
         assert_eq!(run_end_outcome_str(RunEndOutcome::Failed), "failed");
+    }
+
+    #[test]
+    fn agent_event_projection_keeps_terminal_and_tool_payloads() {
+        let end = agent_event_json(&AgentEvent::AgentEnd { messages: vec![] });
+        assert_eq!(end["type"], "agent_end");
+        assert_eq!(end["messages"], serde_json::json!([]));
+
+        let tool = agent_event_json(&AgentEvent::ToolExecutionEnd {
+            tool_call_id: "call-1".into(),
+            tool_name: "read".into(),
+            result: AgentToolResult::text("hello"),
+            is_error: false,
+        });
+        assert_eq!(tool["type"], "tool_execution_end");
+        assert_eq!(tool["result"]["content"][0]["text"], "hello");
+        assert_eq!(tool["result"]["terminate"], false);
+
+        let retry = agent_event_json(&AgentEvent::RetryScheduled {
+            attempt: 3,
+            max_retries: 10,
+            delay_ms: 8_000,
+            error: "503 service unavailable".into(),
+        });
+        assert_eq!(retry["type"], "retry_scheduled");
+        assert_eq!(retry["attempt"], 3);
+        assert_eq!(retry["maxRetries"], 10);
+        assert_eq!(retry["delayMs"], 8_000);
+        assert_eq!(retry["error"], "503 service unavailable");
     }
 }
