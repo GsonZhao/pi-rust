@@ -70,7 +70,7 @@ use thiserror::Error;
 
 pub use actions::{
     reload_callback_from_mailbox, trampoline_runtime_action, trampoline_runtime_action_v1,
-    ActionBridge, ReloadMailbox, RuntimeActionHost,
+    ActionBridge, ReloadMailbox, RuntimeActionHost, UiDialogMailbox, UiDialogRequest,
 };
 pub use loader::{
     load_dir, load_one, load_session, load_session_mixed, merge_registries, ExtensionSession,

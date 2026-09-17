@@ -762,6 +762,10 @@ pub enum RuntimeActionId {
     /// Read a parsed CLI flag by name. Args: `{"name":"flag"}`; result:
     /// `{"value": <bool|string|null>}`.
     GetCliFlag = 16,
+    /// Open/poll/cancel a host-provided interactive UI request. The payload is
+    /// a JSON object with `op` (`open`, `poll`, or `cancel`) and a unique
+    /// `requestId`; hosts without an attached TUI return an explicit error.
+    UiDialog = 17,
 }
 
 /// Error returned when a plugin passes a numeric runtime-action id that this
@@ -799,6 +803,7 @@ impl TryFrom<u32> for RuntimeActionId {
             14 => Ok(Self::SwitchSession),
             15 => Ok(Self::Reload),
             16 => Ok(Self::GetCliFlag),
+            17 => Ok(Self::UiDialog),
             other => Err(UnknownRuntimeActionId(other)),
         }
     }
@@ -1482,16 +1487,14 @@ mod tests {
             RuntimeActionId::SwitchSession,
             RuntimeActionId::Reload,
             RuntimeActionId::GetCliFlag,
+            RuntimeActionId::UiDialog,
         ];
 
         for (raw, expected) in ids.into_iter().enumerate() {
             assert_eq!(RuntimeActionId::try_from(raw as u32), Ok(expected));
             assert_eq!(u32::from(expected), raw as u32);
         }
-        assert_eq!(
-            RuntimeActionId::try_from(17),
-            Err(UnknownRuntimeActionId(17))
-        );
+        assert_eq!(RuntimeActionId::try_from(18), Err(UnknownRuntimeActionId(18)));
         assert_eq!(
             RuntimeActionId::try_from(u32::MAX),
             Err(UnknownRuntimeActionId(u32::MAX))

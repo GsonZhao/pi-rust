@@ -288,10 +288,17 @@ pub async fn build(
     // `/reload` (the fresh bridge carries `ctx.mailbox`), so the bridge always
     // points at the one TUI-installed sender across reloads.
     let reload_mailbox = rpi_extensions::ReloadMailbox::new();
-    let action_bridge = rpi_extensions::ActionBridge::with_reload(
+    // Session-scoped UI-dialog mailbox (runtime action 17 / `ask_user`). The
+    // initial bridge carries it and the TUI attaches itself once it starts
+    // polling; a headless run leaves it detached so `ask_user` fails loudly
+    // instead of fabricating a user answer. The SAME mailbox is reused across
+    // `/reload` so in-flight prompts + TUI attachment survive a plugin swap.
+    let ui_dialog_mailbox = rpi_extensions::UiDialogMailbox::new();
+    let action_bridge = rpi_extensions::ActionBridge::with_reload_and_ui(
         runtime.clone(),
         host_arc,
         rpi_extensions::reload_callback_from_mailbox(reload_mailbox.clone()),
+        ui_dialog_mailbox.clone(),
     );
 
     // ---- Execution env + tools ----
@@ -801,6 +808,7 @@ pub async fn build(
         resolved_model: resolved.model.clone(),
         broadcast: broadcast_for_context,
         mailbox: reload_mailbox,
+        ui_dialog: ui_dialog_mailbox,
         dev_extension: None,
     };
 
@@ -918,6 +926,12 @@ pub struct ReloadContext {
     /// THIS mailbox (not a fresh default) when building the fresh bridge, so the
     /// bridge always carries the mailbox the TUI installed across reloads.
     pub mailbox: rpi_extensions::ReloadMailbox,
+    /// Session-long UI-dialog mailbox (runtime action 17). The initial bridge
+    /// carries it; the TUI attaches itself and polls `take_pending` from its key
+    /// loop, and `/reload` reuses THIS mailbox when it builds the fresh bridge.
+    /// A detached mailbox makes `ask_user` fail with "requires an interactive
+    /// UI" (headless contract).
+    pub ui_dialog: rpi_extensions::UiDialogMailbox,
     /// Active `rpi dev` extension builder. `/reload` rebuilds it before
     /// swapping plugin sessions; its watcher signals `mailbox` after a
     /// successful background build.
@@ -1053,8 +1067,12 @@ where
     };
 
     let reload_cb = rpi_extensions::reload_callback_from_mailbox(ctx.mailbox.clone());
-    let fresh_bridge =
-        rpi_extensions::ActionBridge::with_reload(ctx.runtime.clone(), host, reload_cb);
+    let fresh_bridge = rpi_extensions::ActionBridge::with_reload_and_ui(
+        ctx.runtime.clone(),
+        host,
+        reload_cb,
+        ctx.ui_dialog.clone(),
+    );
 
     let extension_session = if effective_args.no_extensions {
         rpi_extensions::ExtensionSession::none()

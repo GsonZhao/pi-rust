@@ -35,11 +35,255 @@
 //! (`lib.rs:10-16`: `rpi-extensions` does NOT depend on `rpi-harness`).
 
 use std::ffi::c_void;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 
 use rpi_plugin_sdk::{RuntimeActionId, StbString, StbStringRef};
 use tokio::runtime::Handle;
+
+/// A pending host UI request emitted by a plugin runtime action.
+///
+/// The request and tool-call ids are intentionally separate: a single tool
+/// call may ask more than one question, while concurrent tool calls must never
+/// consume one another's answers. `raw` retains the complete action envelope;
+/// `ui` is the normalized UI payload that TUI renderers generally need.
+#[derive(Clone, Debug, PartialEq)]
+pub struct UiDialogRequest {
+    pub request_id: String,
+    pub tool_call_id: Option<String>,
+    pub ui: serde_json::Value,
+    pub raw: serde_json::Value,
+}
+
+struct UiDialogEntry {
+    request: UiDialogRequest,
+    answer: Option<serde_json::Value>,
+    cancelled: bool,
+}
+
+struct UiDialogState {
+    attached: bool,
+    pending: VecDeque<String>,
+    active: HashMap<String, UiDialogEntry>,
+}
+
+/// Thread-safe mailbox connecting plugin runtime actions to an interactive
+/// host (normally the TUI). It deliberately carries only JSON and primitives,
+/// so the extension crate remains independent of the UI crate.
+#[derive(Clone)]
+pub struct UiDialogMailbox {
+    state: Arc<Mutex<UiDialogState>>,
+}
+
+impl Default for UiDialogMailbox {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl UiDialogMailbox {
+    pub fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(UiDialogState {
+                attached: false,
+                pending: VecDeque::new(),
+                active: HashMap::new(),
+            })),
+        }
+    }
+
+    /// Mark an interactive consumer as available. Re-attaching is idempotent.
+    pub fn attach(&self) {
+        self.state.lock().expect("ui dialog mailbox poisoned").attached = true;
+    }
+
+    /// Detach the consumer and cancel every outstanding request. This prevents
+    /// a TUI restart/reload from leaving plugin polls blocked forever.
+    pub fn detach(&self) {
+        let mut state = self.state.lock().expect("ui dialog mailbox poisoned");
+        state.attached = false;
+        state.pending.clear();
+        for entry in state.active.values_mut() {
+            entry.cancelled = true;
+            entry.answer = None;
+        }
+    }
+
+    pub fn is_attached(&self) -> bool {
+        self.state
+            .lock()
+            .expect("ui dialog mailbox poisoned")
+            .attached
+    }
+
+    /// Remove and return the next request for presentation by the TUI.
+    /// Cancelled/answered requests are skipped; duplicate `open` calls never
+    /// enqueue the same request id twice.
+    pub fn take_pending(&self) -> Option<UiDialogRequest> {
+        let mut state = self.state.lock().expect("ui dialog mailbox poisoned");
+        while let Some(request_id) = state.pending.pop_front() {
+            if let Some(entry) = state.active.get(&request_id) {
+                if !entry.cancelled && entry.answer.is_none() {
+                    return Some(entry.request.clone());
+                }
+            }
+        }
+        None
+    }
+
+    pub fn pending_len(&self) -> usize {
+        self.state
+            .lock()
+            .expect("ui dialog mailbox poisoned")
+            .pending
+            .len()
+    }
+
+    /// Supply an answer for a request. Repeating the same operation is
+    /// idempotent; answering a cancelled/unknown request is an explicit error.
+    pub fn respond(&self, request_id: &str, answer: serde_json::Value) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|_| "ui dialog mailbox poisoned".to_string())?;
+        let entry = state
+            .active
+            .get_mut(request_id)
+            .ok_or_else(|| format!("unknown UI request `{request_id}`"))?;
+        if entry.cancelled {
+            return Err(format!("UI request `{request_id}` was cancelled"));
+        }
+        if entry.answer.is_none() {
+            entry.answer = Some(answer);
+        }
+        Ok(())
+    }
+
+    /// Mark one request cancelled. The terminal state remains visible to the
+    /// plugin's next `poll`, then is reclaimed by that poll.
+    pub fn cancel(&self, request_id: &str) -> Result<(), String> {
+        let mut state = self.state.lock().map_err(|_| "ui dialog mailbox poisoned".to_string())?;
+        let entry = state
+            .active
+            .get_mut(request_id)
+            .ok_or_else(|| format!("unknown UI request `{request_id}`"))?;
+        entry.cancelled = true;
+        entry.answer = None;
+        state.pending.retain(|id| id != request_id);
+        Ok(())
+    }
+
+    /// Cancel all requests currently known to the mailbox.
+    pub fn cancel_all(&self) {
+        let mut state = self.state.lock().expect("ui dialog mailbox poisoned");
+        state.pending.clear();
+        for entry in state.active.values_mut() {
+            entry.cancelled = true;
+            entry.answer = None;
+        }
+    }
+
+    /// Poll a request and consume a terminal answer/cancellation. Pending
+    /// polls are cheap and preserve the request for subsequent calls.
+    pub fn poll(&self, request_id: &str) -> Result<serde_json::Value, String> {
+        let mut state = self.state.lock().map_err(|_| "ui dialog mailbox poisoned".to_string())?;
+        let terminal = match state.active.get(request_id) {
+            Some(entry) if entry.cancelled => Some(serde_json::json!({
+                "status": "cancelled",
+                "requestId": request_id,
+                "toolCallId": entry.request.tool_call_id,
+            })),
+            Some(entry) if entry.answer.is_some() => Some(serde_json::json!({
+                "status": "answered",
+                "requestId": request_id,
+                "toolCallId": entry.request.tool_call_id,
+                "answer": entry.answer.clone().unwrap_or(serde_json::Value::Null),
+            })),
+            Some(entry) => Some(serde_json::json!({
+                "status": "pending",
+                "requestId": request_id,
+                "toolCallId": entry.request.tool_call_id,
+            })),
+            None => None,
+        };
+        let Some(result) = terminal else {
+            return Err(format!("unknown UI request `{request_id}`"));
+        };
+        if result.get("status").and_then(serde_json::Value::as_str) != Some("pending") {
+            state.active.remove(request_id);
+        }
+        Ok(result)
+    }
+
+    /// Parse and execute the JSON action envelope used by runtime action 17.
+    /// Supported operations are `open`, `poll`, `cancel`; `response` is also
+    /// accepted as a convenience for hosts that proxy answers through JSON.
+    pub fn handle(&self, args: serde_json::Value) -> Result<serde_json::Value, String> {
+        let op = args.get("op").and_then(serde_json::Value::as_str).unwrap_or("open");
+        let request_id = || {
+            args.get("requestId")
+                .or_else(|| args.get("request_id"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+                .filter(|id| !id.trim().is_empty())
+                .ok_or_else(|| "missing non-empty `requestId`".to_string())
+        };
+        match op {
+            "open" => {
+                let id = request_id()?;
+                let mut state = self.state.lock().map_err(|_| "ui dialog mailbox poisoned".to_string())?;
+                if !state.attached {
+                    return Err("ask_user requires an interactive UI".to_string());
+                }
+                if let Some(entry) = state.active.get(&id) {
+                    return Ok(if entry.cancelled {
+                        serde_json::json!({"status":"cancelled","requestId":id})
+                    } else if let Some(answer) = &entry.answer {
+                        serde_json::json!({"status":"answered","requestId":id,"answer":answer})
+                    } else {
+                        serde_json::json!({"status":"pending","requestId":id})
+                    });
+                }
+                let tool_call_id = args
+                    .get("toolCallId")
+                    .or_else(|| args.get("tool_call_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_owned);
+                let ui = args.get("ui").cloned().unwrap_or_else(|| args.clone());
+                state.active.insert(
+                    id.clone(),
+                    UiDialogEntry {
+                        request: UiDialogRequest {
+                            request_id: id.clone(),
+                            tool_call_id: tool_call_id.clone(),
+                            ui,
+                            raw: args,
+                        },
+                        answer: None,
+                        cancelled: false,
+                    },
+                );
+                state.pending.push_back(id.clone());
+                Ok(serde_json::json!({"status":"pending","requestId":id,"toolCallId":tool_call_id}))
+            }
+            "poll" => self.poll(&request_id()?),
+            "cancel" => {
+                let id = request_id()?;
+                self.cancel(&id)?;
+                Ok(serde_json::json!({"status":"cancelled","requestId":id}))
+            }
+            "response" | "respond" => {
+                let id = request_id()?;
+                let answer = args
+                    .get("answer")
+                    .or_else(|| args.get("value"))
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                self.respond(&id, answer)?;
+                Ok(serde_json::json!({"status":"answered","requestId":id}))
+            }
+            other => Err(format!("unknown UI dialog operation `{other}`")),
+        }
+    }
+}
 
 /// The host-side implementation the bridge delegates to. Defined in
 /// `rpi-extensions` (NOT `rpi-harness`) so the crate DAG stays a leaf: this is a
@@ -53,7 +297,7 @@ use tokio::runtime::Handle;
 /// to/from JSON at the impl boundary. Errors are `String` (become the action's
 /// nonzero `i32` + `{"error": msg}` JSON on the plugin side).
 ///
-/// The 17 methods map 1:1 to [`RuntimeActionId`]; `dispatch` below is the
+/// The 18 methods map 1:1 to [`RuntimeActionId`]; `dispatch` below is the
 /// exhaustive switch that connects the FFI id to the method.
 #[async_trait::async_trait]
 pub trait RuntimeActionHost: Send + Sync {
@@ -105,6 +349,13 @@ pub trait RuntimeActionHost: Send + Sync {
     async fn get_cli_flag(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
         Err("CLI flag lookup is not configured".to_string())
     }
+
+    /// `UiDialog` fallback for hosts that do not install an interactive
+    /// mailbox. The default is deliberately an error so headless runs cannot
+    /// accidentally report a fabricated user answer.
+    async fn ui_dialog(&self, _args: serde_json::Value) -> Result<serde_json::Value, String> {
+        Err("ask_user requires an interactive UI".to_string())
+    }
 }
 
 /// The host-side bridge carried in [`PluginApiVt::user_data`] so
@@ -143,6 +394,9 @@ pub struct ActionBridge {
     /// B5d reload callback; `None` until the TUI wires `/reload`.
     pub(crate) reload:
         Option<Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>>,
+    /// Session-scoped UI mailbox. It is cloned into reload-created bridges so
+    /// a TUI attachment and in-flight requests survive extension reloads.
+    ui_dialog: UiDialogMailbox,
     /// B5d staleness flag. Shared so [`invalidate`] flips it for every clone.
     /// `true` while this bridge is the live session's bridge.
     active: Arc<AtomicBool>,
@@ -156,6 +410,7 @@ impl ActionBridge {
             runtime,
             host,
             reload: None,
+            ui_dialog: UiDialogMailbox::new(),
             active: Arc::new(AtomicBool::new(true)),
         })
     }
@@ -167,12 +422,43 @@ impl ActionBridge {
         host: Arc<dyn RuntimeActionHost>,
         reload: Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>,
     ) -> Arc<Self> {
+        Self::with_reload_and_ui(runtime, host, reload, UiDialogMailbox::new())
+    }
+
+    /// Build a bridge with an explicit session-scoped UI mailbox.
+    pub fn with_ui_dialog(
+        runtime: Handle,
+        host: Arc<dyn RuntimeActionHost>,
+        ui_dialog: UiDialogMailbox,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            runtime,
+            host,
+            reload: None,
+            ui_dialog,
+            active: Arc::new(AtomicBool::new(true)),
+        })
+    }
+
+    /// `with_reload` variant that preserves a mailbox across bridge swaps.
+    pub fn with_reload_and_ui(
+        runtime: Handle,
+        host: Arc<dyn RuntimeActionHost>,
+        reload: Arc<dyn Fn() -> futures::future::BoxFuture<'static, ()> + Send + Sync>,
+        ui_dialog: UiDialogMailbox,
+    ) -> Arc<Self> {
         Arc::new(Self {
             runtime,
             host,
             reload: Some(reload),
+            ui_dialog,
             active: Arc::new(AtomicBool::new(true)),
         })
+    }
+
+    /// Clone the session mailbox for TUI attachment or a reload-created bridge.
+    pub fn ui_dialog_mailbox(&self) -> UiDialogMailbox {
+        self.ui_dialog.clone()
     }
 
     /// Mark this bridge stale (B5d). A `/reload` that swaps in a fresh bridge
@@ -280,13 +566,14 @@ pub fn reload_callback_from_mailbox(
 // naturally Send+Sync; no manual unsafe impl needed.
 
 /// Dispatch one action to the host. Async — runs on the bridge's runtime.
-/// Handles all 17 ids; `Reload` delegates to [`RuntimeActionHost::reload`]
+/// Handles all 18 ids; `Reload` delegates to [`RuntimeActionHost::reload`]
 /// (the "no callback configured" fallback). When the bridge has a reload
 /// callback, the spawn site intercepts `Reload` and awaits the callback
 /// instead (a CLI concern, not a harness op) — this helper is the plain
 /// host-only path.
 async fn dispatch(
     host: &Arc<dyn RuntimeActionHost>,
+    ui_dialog: &UiDialogMailbox,
     action: RuntimeActionId,
     args: serde_json::Value,
 ) -> Result<serde_json::Value, String> {
@@ -308,6 +595,7 @@ async fn dispatch(
         RuntimeActionId::SwitchSession => host.switch_session(args).await,
         RuntimeActionId::Reload => host.reload(args).await,
         RuntimeActionId::GetCliFlag => host.get_cli_flag(args).await,
+        RuntimeActionId::UiDialog => ui_dialog.handle(args),
     }
 }
 
@@ -342,7 +630,7 @@ pub extern "C" fn trampoline_runtime_action(
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         run_action(
             action_id,
-            u32::from(RuntimeActionId::GetCliFlag),
+            u32::from(RuntimeActionId::UiDialog),
             args_json,
             out,
             user_data,
@@ -466,6 +754,7 @@ fn run_action(
     // an owned `Arc<dyn RuntimeActionHost>` plus a reload-option snapshot so the
     // `dispatch` helper has everything it needs without borrowing `bridge`.
     let host = Arc::clone(&bridge.host);
+    let ui_dialog = bridge.ui_dialog.clone();
     let reload_cb = bridge.reload.clone();
     bridge.runtime.spawn(async move {
         let r = if action == RuntimeActionId::Reload {
@@ -476,7 +765,7 @@ fn run_action(
                 host.reload(args).await
             }
         } else {
-            dispatch(&host, action, args).await
+            dispatch(&host, &ui_dialog, action, args).await
         };
         // If the plugin thread already moved on (dropped rx), discard — a send
         // error is NOT a host fault.
@@ -890,5 +1179,110 @@ mod tests {
             "installed receiver saw the signal"
         );
         mailbox.clear();
+    }
+
+    // ---- UiDialogMailbox (runtime action 17 / ask_user) ----
+
+    fn open_args(id: &str, tool_call: &str) -> serde_json::Value {
+        serde_json::json!({
+            "op": "open",
+            "requestId": id,
+            "toolCallId": tool_call,
+            "ui": {"kind": "selector", "questions": [
+                {"id": "q1", "question": "Which target?", "options": ["Linux"]}
+            ]},
+        })
+    }
+
+    /// Headless hosts (nothing attached) must fail loudly rather than fabricate
+    /// a user answer.
+    #[test]
+    fn ui_dialog_open_requires_an_attached_ui() {
+        let mailbox = UiDialogMailbox::new();
+        let error = mailbox.handle(open_args("r1", "c1")).unwrap_err();
+        assert!(error.contains("interactive UI"), "got: {error}");
+    }
+
+    #[test]
+    fn ui_dialog_open_poll_answer_round_trip() {
+        let mailbox = UiDialogMailbox::new();
+        mailbox.attach();
+
+        let opened = mailbox.handle(open_args("r1", "c1")).unwrap();
+        assert_eq!(opened["status"], "pending");
+        assert_eq!(opened["toolCallId"], "c1");
+
+        let request = mailbox.take_pending().expect("request visible to TUI");
+        assert_eq!(request.request_id, "r1");
+        assert_eq!(request.tool_call_id.as_deref(), Some("c1"));
+        // A pending poll is non-destructive and remains available.
+        assert_eq!(mailbox.poll("r1").unwrap()["status"], "pending");
+        assert_eq!(mailbox.poll("r1").unwrap()["status"], "pending");
+
+        mailbox
+            .respond("r1", serde_json::json!("7890"))
+            .expect("respond");
+        let answered = mailbox.poll("r1").unwrap();
+        assert_eq!(answered["status"], "answered");
+        assert_eq!(answered["answer"], "7890");
+        // Polling consumes the terminal entry.
+        assert!(mailbox.poll("r1").is_err());
+    }
+
+    #[test]
+    fn ui_dialog_cancel_is_reported_once() {
+        let mailbox = UiDialogMailbox::new();
+        mailbox.attach();
+        mailbox.handle(open_args("r1", "c1")).unwrap();
+        mailbox.cancel("r1").unwrap();
+        let cancelled = mailbox.poll("r1").unwrap();
+        assert_eq!(cancelled["status"], "cancelled");
+        assert!(mailbox.poll("r1").is_err());
+    }
+
+    #[test]
+    fn ui_dialog_concurrent_requests_do_not_cross_answers() {
+        let mailbox = UiDialogMailbox::new();
+        mailbox.attach();
+        mailbox.handle(open_args("r1", "c1")).unwrap();
+        mailbox.handle(open_args("r2", "c2")).unwrap();
+
+        let first = mailbox.take_pending().unwrap().request_id;
+        let second = mailbox.take_pending().unwrap().request_id;
+        assert_ne!(first, second);
+
+        // Answer the SECOND request first; the first must stay pending.
+        mailbox.respond(&second, serde_json::json!("second")).unwrap();
+        assert_eq!(mailbox.poll(&first).unwrap()["status"], "pending");
+        let second_answer = mailbox.poll(&second).unwrap();
+        assert_eq!(second_answer["answer"], "second");
+
+        mailbox.respond(&first, serde_json::json!("first")).unwrap();
+        assert_eq!(mailbox.poll(&first).unwrap()["answer"], "first");
+    }
+
+    #[test]
+    fn ui_dialog_detach_cancels_outstanding() {
+        let mailbox = UiDialogMailbox::new();
+        mailbox.attach();
+        mailbox.handle(open_args("r1", "c1")).unwrap();
+        mailbox.detach();
+        assert!(!mailbox.is_attached());
+        assert_eq!(mailbox.pending_len(), 0);
+        // Re-opening without a consumer is an explicit error again.
+        assert!(mailbox.handle(open_args("r2", "c2")).is_err());
+        assert_eq!(mailbox.poll("r1").unwrap()["status"], "cancelled");
+    }
+
+    #[test]
+    fn ui_dialog_duplicate_open_does_not_reenqueue() {
+        let mailbox = UiDialogMailbox::new();
+        mailbox.attach();
+        mailbox.handle(open_args("r1", "c1")).unwrap();
+        let again = mailbox.handle(open_args("r1", "c1")).unwrap();
+        assert_eq!(again["status"], "pending");
+        assert_eq!(mailbox.pending_len(), 1);
+        mailbox.take_pending().unwrap();
+        assert!(mailbox.take_pending().is_none());
     }
 }
