@@ -89,7 +89,7 @@ async fn abort_during_stream_produces_agent_end() {
 
     // Wire the run token into the config (the loop forwards it to stream_opts).
     let mut config = base_config();
-    config.signal = token;
+    config.signal = token.clone();
 
     let (collector, events_buf) = rpi_agent::CollectorEmitter::new();
     let emit: Arc<dyn rpi_agent::AgentEmitter> = Arc::new(collector);
@@ -193,7 +193,25 @@ async fn abort_during_tool_unblocks_and_settles() {
     let token = handle.token();
 
     let mut config = base_config();
-    config.signal = token;
+    config.signal = token.clone();
+
+    // A steering message entered while the blocking tool was active must be
+    // drained after cancellation so it is retained in the returned context,
+    // matching native Pi's post-tool drain ordering.
+    let delivered = Arc::new(AtomicBool::new(false));
+    let delivered_for_hook = Arc::clone(&delivered);
+    let token_for_hook = token.clone();
+    config.get_steering_messages = Some(Arc::new(move || {
+        let delivered = Arc::clone(&delivered_for_hook);
+        let token = token_for_hook.clone();
+        Box::pin(async move {
+            if token.is_cancelled() && !delivered.swap(true, Ordering::SeqCst) {
+                vec![common::user_message("queued while listening")]
+            } else {
+                Vec::new()
+            }
+        })
+    }));
 
     let stream_fn = common::mock_stream_fn(vec![assistant_tool_calls(
         vec![("tool-1", "blocking", serde_json::json!({}))],
@@ -217,11 +235,19 @@ async fn abort_during_tool_unblocks_and_settles() {
     started.notified().await;
     handle.abort();
 
-    let _new_messages = run_handle.await.expect("run task did not panic");
+    let new_messages = run_handle.await.expect("run task did not panic");
+    let new_messages = new_messages.expect("run resolves cleanly on tool abort");
     let events = events_buf.lock().expect("events lock").clone();
     assert!(
         saw_agent_end(&events),
         "abort during tool must still emit AgentEnd: {events:?}"
+    );
+    assert!(
+        new_messages.iter().any(|message| {
+            matches!(message, rpi_agent::AgentMessage::User(user)
+                if user.content.as_text() == Some("queued while listening"))
+        }),
+        "queued steering must be included in the aborted run transcript"
     );
 }
 

@@ -335,7 +335,14 @@ async fn run_loop(
                 return Ok(LoopOutcome::Completed);
             }
 
-            if config.signal.is_cancelled() {
+            // Keep the native Pi ordering here: steering is drained after the
+            // tool batch settles, even when the run was cancelled. This makes
+            // messages queued while a blocking tool was active part of the
+            // returned transcript/context instead of leaving them stranded in
+            // the queue. The next stream observes the cancelled signal and
+            // produces the terminal aborted assistant message.
+            pending_messages = drain_steering(config).await;
+            if config.signal.is_cancelled() && pending_messages.is_empty() {
                 emit_event(
                     emit,
                     AgentEvent::AgentEnd {
@@ -345,8 +352,6 @@ async fn run_loop(
                 .await;
                 return Ok(LoopOutcome::Aborted);
             }
-
-            pending_messages = drain_steering(config).await;
         }
 
         // Agent would stop here. Check for follow-up messages.

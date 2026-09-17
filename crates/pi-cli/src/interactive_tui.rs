@@ -4733,7 +4733,6 @@ pub async fn interactive_tui(
         let run_status = *ctx_for_cb.state.status.lock().unwrap();
         if run_status != RunStatus::Idle {
             let message = AgentMessage::User(UserMessage::new(text.to_string(), 0));
-            let aborting = run_status == RunStatus::Aborting;
             let lane = ctx_for_cb.lane.clone();
             let chat = ctx_for_cb.chat.clone();
             let tui = ctx_for_cb.tui.clone();
@@ -4742,10 +4741,18 @@ pub async fn interactive_tui(
                 // Routing this through the TUI's main channel delayed it until
                 // `prompt_text()` returned, after the loop's drain points had
                 // passed, so the queued message appeared to disappear.
-                let result = if aborting {
-                    lane.next_run(message).await
-                } else {
-                    lane.steer(message).await
+                // Keep using steering while an abort is settling: the native
+                // loop drains steering after the current tool batch, including
+                // a cancelled batch, so the message is retained in context.
+                // `next_run` is intentionally reserved for an explicit future
+                // run and would otherwise sit pending with no automatic wakeup.
+                let result = match lane.steer(message.clone()).await {
+                    Ok(result) => Ok(result),
+                    // Ctrl+C can finish the run between the status snapshot
+                    // and this spawned enqueue task. Preserve the user's
+                    // message for the next explicit run instead of dropping it
+                    // on the idle-race.
+                    Err(_) => lane.next_run(message).await,
                 };
                 if let Err(error) = result {
                     add_error_message(&chat, &format!("Could not queue message: {error}"));
