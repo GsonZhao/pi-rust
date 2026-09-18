@@ -1626,6 +1626,437 @@ fn cancel_js_dialog_ui(ctx: &CommandContext, bridge: &Arc<JsDialogBridge>) {
     }
 }
 
+// ===========================================================================
+// ask_user — plugin UI-dialog bridge (runtime action 17)
+// ===========================================================================
+
+/// Sentinel option value that switches a freeform-capable selector into the
+/// single-line input slot (native `allowFreeform` affordance).
+const ASK_USER_FREEFORM: &str = "\u{0}ask-user-freeform";
+
+/// One in-flight `ask_user` request being shown in the TUI. Unlike
+/// [`JsDialogBridge`], the plugin side is a synchronous `poll` loop that reads
+/// answers back through the shared [`rpi_extensions::UiDialogMailbox`], so this
+/// bridge only tracks which request id currently occupies the input slot.
+#[derive(Clone)]
+struct AskUserBridge {
+    mailbox: rpi_extensions::UiDialogMailbox,
+    visible: Arc<Mutex<Option<String>>>,
+}
+
+impl AskUserBridge {
+    fn new(mailbox: rpi_extensions::UiDialogMailbox) -> Self {
+        Self {
+            mailbox,
+            visible: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Mark the interactive consumer as available. Idempotent.
+    fn attach(&self) {
+        self.mailbox.attach();
+    }
+
+    /// Take the next pending request and mark it visible. Only the single key
+    /// loop calls this while no other dialog is open, so the visible-id
+    /// bookkeeping is race-free without a separate lock.
+    fn take_pending(&self) -> Option<rpi_extensions::UiDialogRequest> {
+        let mut visible = self.visible.lock().ok()?;
+        if visible.is_some() {
+            return None;
+        }
+        let request = self.mailbox.take_pending()?;
+        *visible = Some(request.request_id.clone());
+        Some(request)
+    }
+
+    fn clear_visible(&self, id: &str) {
+        if let Ok(mut visible) = self.visible.lock() {
+            if visible.as_deref() == Some(id) {
+                *visible = None;
+            }
+        }
+    }
+
+    /// Record an answer for `id` and release the input slot.
+    fn respond(&self, id: &str, answer: serde_json::Value) {
+        let _ = self.mailbox.respond(id, answer);
+        self.clear_visible(id);
+    }
+
+    /// Cancel `id` and release the input slot.
+    fn cancel(&self, id: &str) {
+        let _ = self.mailbox.cancel(id);
+        self.clear_visible(id);
+    }
+
+    /// Cancel every outstanding request (run abort). Pending prompts from the
+    /// aborted turn must not surface in a later turn.
+    fn cancel_all(&self) {
+        self.mailbox.cancel_all();
+        if let Ok(mut visible) = self.visible.lock() {
+            *visible = None;
+        }
+    }
+
+    /// Detach + cancel everything (TUI shutdown) so a parked plugin `poll`
+    /// observes a terminal state instead of blocking on a dead session.
+    fn shutdown(&self) {
+        self.mailbox.detach();
+        if let Ok(mut visible) = self.visible.lock() {
+            *visible = None;
+        }
+    }
+}
+
+/// Parsed presentation data for one `ask_user` question. Supports both the
+/// flat native question contract and the earlier `questions[0]` alias, plus a
+/// `confirm` summary.
+#[derive(Clone)]
+struct AskUserPrompt {
+    question_id: String,
+    question: String,
+    header: Option<String>,
+    context: Option<String>,
+    options: Vec<(String, Option<String>)>,
+    allow_multiple: bool,
+    allow_freeform: bool,
+    suggest: Option<String>,
+    kind: String,
+}
+
+fn ask_user_str(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        value
+            .get(*key)
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn ask_user_bool(value: &serde_json::Value, keys: &[&str]) -> Option<bool> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(serde_json::Value::as_bool))
+}
+
+fn ask_user_options(value: &serde_json::Value) -> Vec<(String, Option<String>)> {
+    let mut options = Vec::new();
+    let Some(items) = value.get("options").and_then(serde_json::Value::as_array) else {
+        return options;
+    };
+    for item in items {
+        if let Some(title) = item.as_str() {
+            let title = title.trim();
+            if !title.is_empty() {
+                options.push((title.to_string(), None));
+            }
+            continue;
+        }
+        let Some(object) = item.as_object() else { continue };
+        let title = ["title", "label", "text", "value", "name"]
+            .iter()
+            .find_map(|key| object.get(*key).and_then(serde_json::Value::as_str))
+            .map(str::trim)
+            .filter(|title| !title.is_empty());
+        let Some(title) = title else { continue };
+        let description = object
+            .get("description")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_string);
+        options.push((title.to_string(), description));
+    }
+    options
+}
+
+fn parse_ask_user_prompt(request: &rpi_extensions::UiDialogRequest) -> AskUserPrompt {
+    let ui = &request.ui;
+    let kind = ui
+        .get("kind")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("selector")
+        .to_string();
+    // A request may carry a single flat question or a `questions[]` array. The
+    // plugin emits one question per request, but accepting `questions[0]` keeps
+    // the host compatible with hosts/plugins that batch.
+    let nested = ui
+        .get("questions")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|items| items.first());
+    let source = nested.filter(|value| value.is_object()).unwrap_or(ui);
+
+    let question = ask_user_str(source, &["question", "summary", "title"])
+        .or_else(|| ask_user_str(ui, &["question", "summary", "title"]))
+        .unwrap_or_default();
+    let question_id = ask_user_str(source, &["id", "questionId"])
+        .or_else(|| ask_user_str(ui, &["id", "questionId"]))
+        .unwrap_or_else(|| request.request_id.clone());
+    let header = ask_user_str(source, &["header"]).or_else(|| ask_user_str(ui, &["header"]));
+    let context = ask_user_str(source, &["context", "message"])
+        .or_else(|| ask_user_str(ui, &["context", "message"]));
+    let mut options = ask_user_options(source);
+    if options.is_empty() {
+        options = ask_user_options(ui);
+    }
+    if kind == "confirm" && options.is_empty() {
+        options = vec![
+            ("Yes".to_string(), None),
+            ("No".to_string(), None),
+        ];
+    }
+    let allow_multiple = ask_user_bool(source, &["allowMultiple", "allow_multiple", "multiple"])
+        .or_else(|| ask_user_bool(ui, &["allowMultiple", "allow_multiple", "multiple"]))
+        .unwrap_or(false);
+    // Freeform defaults on when there is nothing to pick from, matching the
+    // "no options ⇒ free input" contract.
+    let allow_freeform = ask_user_bool(
+        source,
+        &["allowFreeform", "allow_freeform", "allow_custom"],
+    )
+    .or_else(|| {
+        ask_user_bool(
+            ui,
+            &["allowFreeform", "allow_freeform", "allow_custom"],
+        )
+    })
+    .unwrap_or(options.is_empty());
+    let suggest = ask_user_str(source, &["suggest", "placeholder"])
+        .or_else(|| ask_user_str(ui, &["suggest", "placeholder"]));
+
+    AskUserPrompt {
+        question_id,
+        question,
+        header,
+        context,
+        options,
+        allow_multiple,
+        allow_freeform,
+        suggest,
+        kind,
+    }
+}
+
+/// Build the shared header frame for an ask-user prompt.
+fn ask_user_frame(
+    prompt: &AskUserPrompt,
+    body: Arc<dyn Component>,
+    hint: &str,
+) -> Arc<Container> {
+    let frame = Arc::new(Container::new());
+    frame.add_child(Arc::new(DynamicBorder::new()));
+    frame.add_child(Arc::new(Spacer::new(1)));
+    if let Some(header) = prompt.header.as_deref() {
+        frame.add_child(extension_dialog_title(header, true));
+    }
+    if !prompt.question.trim().is_empty() {
+        frame.add_child(extension_dialog_title(
+            &prompt.question,
+            prompt.header.is_none(),
+        ));
+    }
+    if let Some(context) = prompt.context.as_deref() {
+        frame.add_child(extension_dialog_hint(context));
+    }
+    frame.add_child(Arc::new(Spacer::new(1)));
+    frame.add_child(body);
+    frame.add_child(Arc::new(Spacer::new(1)));
+    frame.add_child(extension_dialog_hint(hint));
+    frame.add_child(Arc::new(Spacer::new(1)));
+    frame.add_child(Arc::new(DynamicBorder::new()));
+    frame
+}
+
+/// Open one `ask_user` request in the TUI input slot.
+fn open_ask_user_dialog(
+    ctx: &CommandContext,
+    bridge: AskUserBridge,
+    request: rpi_extensions::UiDialogRequest,
+) {
+    let prompt = parse_ask_user_prompt(&request);
+    if prompt.kind == "input" || prompt.options.is_empty() {
+        open_ask_user_input(ctx, bridge, request, prompt);
+    } else {
+        open_ask_user_selector(ctx, bridge, request, prompt);
+    }
+}
+
+fn open_ask_user_selector(
+    ctx: &CommandContext,
+    bridge: AskUserBridge,
+    request: rpi_extensions::UiDialogRequest,
+    prompt: AskUserPrompt,
+) {
+    let multi = prompt.allow_multiple && prompt.kind != "confirm";
+    let mut items: Vec<SelectItem> = Vec::new();
+    for (title, description) in &prompt.options {
+        let item = SelectItem::new(title, title);
+        let item = match description.as_deref() {
+            Some(description) => item.with_description(description),
+            None => item,
+        };
+        items.push(item);
+    }
+    // A freeform-capable single selector gets an extra sentinel row that opens
+    // the input slot for a typed answer.
+    if prompt.allow_freeform && !multi && prompt.kind != "confirm" {
+        items.push(SelectItem::new(ASK_USER_FREEFORM, "Type another answer…"));
+    }
+    let list = if multi {
+        Arc::new(SelectList::new_multi(items, 10))
+    } else {
+        Arc::new(SelectList::new(items, 10))
+    };
+
+    let request_id = request.request_id.clone();
+    let state = ctx.state.clone();
+    let editor_container = ctx.editor_container.clone();
+    let editor = ctx.editor.clone();
+    let tui = ctx.tui.clone();
+
+    // Single-select: respond with the chosen title, or fall through to the
+    // input slot for the freeform sentinel.
+    let bridge_select = bridge.clone();
+    let request_for_freeform = request.clone();
+    let prompt_for_freeform = AskUserPrompt {
+        question_id: prompt.question_id.clone(),
+        question: prompt.question.clone(),
+        header: prompt.header.clone(),
+        context: prompt.context.clone(),
+        options: Vec::new(),
+        allow_multiple: false,
+        allow_freeform: true,
+        suggest: prompt.suggest.clone(),
+        kind: "input".to_string(),
+    };
+    let state_select = state.clone();
+    let ec_select = editor_container.clone();
+    let editor_select = editor.clone();
+    let tui_select = tui.clone();
+    let ctx_select = ctx.clone();
+    list.on_select(Arc::new(move |item: &SelectItem| {
+        if item.value == ASK_USER_FREEFORM {
+            close_selector(&state_select, &ec_select, &editor_select, &tui_select);
+            open_ask_user_input(
+                &ctx_select,
+                bridge_select.clone(),
+                request_for_freeform.clone(),
+                prompt_for_freeform.clone(),
+            );
+            return;
+        }
+        bridge_select.respond(
+            &request_id,
+            serde_json::json!({
+                "values": [item.display_value()],
+                "kind": "selector",
+            }),
+        );
+        close_selector(&state_select, &ec_select, &editor_select, &tui_select);
+    }));
+
+    if multi {
+        let bridge_multi = bridge.clone();
+        let request_id_multi = request.request_id.clone();
+        let state_multi = state.clone();
+        let ec_multi = editor_container.clone();
+        let editor_multi = editor.clone();
+        let tui_multi = tui.clone();
+        list.on_multi_select(Arc::new(move |selected: &[SelectItem]| {
+            let values: Vec<String> = selected
+                .iter()
+                .map(|item| item.display_value().to_string())
+                .collect();
+            bridge_multi.respond(
+                &request_id_multi,
+                serde_json::json!({"values": values, "kind": "selector"}),
+            );
+            close_selector(&state_multi, &ec_multi, &editor_multi, &tui_multi);
+        }));
+    }
+
+    let bridge_cancel = bridge.clone();
+    let request_id_cancel = request.request_id.clone();
+    let state_cancel = state.clone();
+    let ec_cancel = editor_container.clone();
+    let editor_cancel = editor.clone();
+    let tui_cancel = tui.clone();
+    list.on_cancel(Arc::new(move || {
+        bridge_cancel.cancel(&request_id_cancel);
+        close_selector(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
+    }));
+
+    let hint = if multi {
+        "Space toggle · Enter submit · Esc cancel"
+    } else {
+        "Enter select · Esc cancel"
+    };
+    let frame = ask_user_frame(&prompt, list.clone(), hint);
+    open_selector_with_view(
+        &state,
+        &editor_container,
+        &editor,
+        &tui,
+        list,
+        frame,
+        SelectorKind::Extension,
+    );
+}
+
+fn open_ask_user_input(
+    ctx: &CommandContext,
+    bridge: AskUserBridge,
+    request: rpi_extensions::UiDialogRequest,
+    prompt: AskUserPrompt,
+) {
+    let placeholder = prompt
+        .suggest
+        .clone()
+        .unwrap_or_else(|| "Type your answer…".to_string());
+    let input = Arc::new(Input::with_placeholder(&placeholder));
+    input.set_focused(true);
+
+    let frame = ask_user_frame(&prompt, input.clone(), "Enter submit · Esc cancel");
+    *ctx.state.active_extension_editor.lock().unwrap() = None;
+    *ctx.state.active_extension_input.lock().unwrap() = Some(input.clone());
+    ctx.editor_container.clear();
+    ctx.editor_container.add_child(frame);
+    ctx.tui.set_focus(Some(input.clone()));
+    ctx.tui.request_render(false);
+
+    let state = ctx.state.clone();
+    let ec = ctx.editor_container.clone();
+    let editor = ctx.editor.clone();
+    let tui = ctx.tui.clone();
+    let bridge_submit = bridge.clone();
+    let request_id = request.request_id.clone();
+    input.on_submit(Arc::new(move |text: &str| {
+        bridge_submit.respond(
+            &request_id,
+            serde_json::json!({
+                "values": [text],
+                "value": text,
+                "text": text,
+                "kind": "input",
+            }),
+        );
+        close_extension_editor(&state, &ec, &editor, &tui);
+    }));
+
+    let state_cancel = ctx.state.clone();
+    let ec_cancel = ctx.editor_container.clone();
+    let editor_cancel = ctx.editor.clone();
+    let tui_cancel = ctx.tui.clone();
+    let bridge_cancel = bridge.clone();
+    let request_id_cancel = request.request_id.clone();
+    *ctx.state.active_extension_cancel.lock().unwrap() = Some(Arc::new(move || {
+        bridge_cancel.cancel(&request_id_cancel);
+        close_extension_editor(&state_cancel, &ec_cancel, &editor_cancel, &tui_cancel);
+    }));
+}
+
 // ---- Built-in command implementations ----
 
 struct HelpCommand;
@@ -4411,6 +4842,12 @@ pub async fn interactive_tui(
     let terminal = Box::new(ProcessTerminal::new());
     let tui = Arc::new(TuiAltScreen::new(terminal, true, None));
     let js_dialog_bridge = Arc::new(JsDialogBridge::default());
+    // Plugin `ask_user` prompts (runtime action 17). Attaching marks this
+    // session as interactive so a detached/headless host fails loudly instead
+    // of returning a fabricated answer. The mailbox is session-scoped (held in
+    // `ReloadContext`) so in-flight prompts survive a `/reload`.
+    let ask_user_bridge = AskUserBridge::new(reload_context.ui_dialog.clone());
+    ask_user_bridge.attach();
     tui.set_main_screen_mode(matches!(args.tui_mode, crate::args::TuiMode::Regular));
 
     if let Some(js) = &reload_context.js_extension_session {
@@ -4916,6 +5353,7 @@ pub async fn interactive_tui(
     let model_catalog_for_key = model_catalog_arc.clone();
     let js_for_key = reload_context.js_extension_session.clone();
     let js_dialog_for_key = js_dialog_bridge.clone();
+    let ask_user_for_key = ask_user_bridge.clone();
     // Ctrl+L routes through the same registry as `/model` (one path, not two),
     // so the key loop needs the same `CommandContext` + registry the submit
     // handler uses. All fields are `Arc`/cheap, so this clone is free.
@@ -4940,6 +5378,8 @@ pub async fn interactive_tui(
             {
                 if let Some(request) = js_dialog_for_key.take_pending() {
                     open_js_dialog(&ctx_for_key, js_dialog_for_key.clone(), request);
+                } else if let Some(request) = ask_user_for_key.take_pending() {
+                    open_ask_user_dialog(&ctx_for_key, ask_user_for_key.clone(), request);
                 }
             }
             cancel_js_dialog_ui(&ctx_for_key, &js_dialog_for_key);
@@ -5141,6 +5581,8 @@ pub async fn interactive_tui(
                 match status {
                     RunStatus::Working => {
                         state_for_key.set_status(RunStatus::Aborting);
+                        // Drop any outstanding ask_user prompt from this turn.
+                        ask_user_for_key.cancel_all();
                         let lane = lane_for_key.clone();
                         tokio::spawn(async move {
                             let _ = lane.abort().await;
@@ -5197,6 +5639,7 @@ pub async fn interactive_tui(
                 match status {
                     RunStatus::Working => {
                         state_for_key.set_status(RunStatus::Aborting);
+                        ask_user_for_key.cancel_all();
                         let lane = lane_for_key.clone();
                         tokio::spawn(async move {
                             let _ = lane.abort().await;
@@ -5229,6 +5672,7 @@ pub async fn interactive_tui(
                 let status = *state_for_key.status.lock().unwrap();
                 if status == RunStatus::Working {
                     state_for_key.set_status(RunStatus::Aborting);
+                    ask_user_for_key.cancel_all();
                     let lane = lane_for_key.clone();
                     tokio::spawn(async move {
                         let _ = lane.abort().await;
@@ -5722,6 +6166,7 @@ pub async fn interactive_tui(
     // Wake any Node `ctx.ui.*` request that is still waiting on the dialog
     // bridge before joining the key worker and restoring the terminal.
     js_dialog_bridge.cancel_all();
+    ask_user_bridge.shutdown();
     *running.lock().unwrap() = false;
     for handle in update_check_handles {
         handle.abort();
@@ -6353,10 +6798,18 @@ async fn handle_agent_event(
                         } else {
                             let mut tools = state.tool_components.lock().unwrap();
                             if !tools.contains_key(&tc.id) {
+                                let display_args = if is_ask_user_tool(&tc.name) {
+                                    ask_user_args_display(&tc.arguments)
+                                } else {
+                                    tc.arguments.to_string()
+                                };
                                 let comp = Arc::new(ToolExecutionComponent::new(
                                     &tc.name,
-                                    &tc.arguments.to_string(),
+                                    &display_args,
                                 ));
+                                if is_ask_user_tool(&tc.name) {
+                                    comp.set_display_title("ASK USER");
+                                }
                                 comp.set_expanded(*state.tool_outputs_expanded.lock().unwrap());
                                 comp.set_running();
                                 chat.add_child(comp.clone());
@@ -6471,11 +6924,23 @@ async fn handle_agent_event(
                 let _comp = {
                     let mut tools = state.tool_components.lock().unwrap();
                     if let Some(existing) = tools.get(&tool_call_id) {
-                        existing.set_args(&args.to_string());
+                        if is_ask_user_tool(&tool_name) {
+                            existing.set_display_title("ASK USER");
+                            existing.set_args(&ask_user_args_display(&args));
+                        } else {
+                            existing.set_args(&args.to_string());
+                        }
                         existing.clone()
                     } else {
-                        let comp =
-                            Arc::new(ToolExecutionComponent::new(&tool_name, &args.to_string()));
+                        let display_args = if is_ask_user_tool(&tool_name) {
+                            ask_user_args_display(&args)
+                        } else {
+                            args.to_string()
+                        };
+                        let comp = Arc::new(ToolExecutionComponent::new(&tool_name, &display_args));
+                        if is_ask_user_tool(&tool_name) {
+                            comp.set_display_title("ASK USER");
+                        }
                         comp.set_expanded(*state.tool_outputs_expanded.lock().unwrap());
                         // A `read` of a SKILL.md renders as native Pi's
                         // `[skill] <name>` invocation box (custom-message
@@ -6504,7 +6969,11 @@ async fn handle_agent_event(
             if tool_name.trim().is_empty() {
                 return;
             }
-            let partial_text = tool_result_text(&partial_result);
+            let partial_text = if is_ask_user_tool(&tool_name) {
+                ask_user_progress_text(&args, &partial_result)
+            } else {
+                tool_result_text(&partial_result)
+            };
             let has_partial_payload = tool_update_has_payload(&partial_text, &partial_result);
             if tool_name == "bash" {
                 // Append the streamed chunk to the bash component's preview.
@@ -6527,6 +6996,10 @@ async fn handle_agent_event(
                 if let Some(skill) = skill_tool_name(&tool_name, &args) {
                     comp.set_skill_name(skill);
                 }
+                if is_ask_user_tool(&tool_name) {
+                    comp.set_display_title("ASK USER");
+                    comp.set_args(&ask_user_args_display(&args));
+                }
                 // Raw multi-line text — read/ls-style tools must show their
                 // full content, not the single-line ⏎-folded summary.
                 if has_partial_payload {
@@ -6538,7 +7011,15 @@ async fn handle_agent_event(
                 // Empty callbacks are common before ToolExecutionStart; wait
                 // for Start so the first panel has the real arguments instead
                 // of an empty `TOOLS` box.
-                let comp = Arc::new(ToolExecutionComponent::new(&tool_name, &args.to_string()));
+                let display_args = if is_ask_user_tool(&tool_name) {
+                    ask_user_args_display(&args)
+                } else {
+                    args.to_string()
+                };
+                let comp = Arc::new(ToolExecutionComponent::new(&tool_name, &display_args));
+                if is_ask_user_tool(&tool_name) {
+                    comp.set_display_title("ASK USER");
+                }
                 comp.set_expanded(*state.tool_outputs_expanded.lock().unwrap());
                 if let Some(skill) = skill_tool_name(&tool_name, &args) {
                     comp.set_skill_name(skill);
@@ -6593,15 +7074,39 @@ async fn handle_agent_event(
             } else {
                 let comp = state.tool_components.lock().unwrap().remove(&tool_call_id);
                 if let Some(comp) = comp {
-                    comp.set_result(&tool_result_text(&result), is_error);
-                    apply_edit_diff(&comp, &tool_name, &result.details, &tui);
+                    let result_text = if is_ask_user_tool(&tool_name) {
+                        ask_user_result_text(&result)
+                    } else {
+                        tool_result_text(&result)
+                    };
+                    comp.set_result(&result_text, is_error);
+                    if !is_ask_user_tool(&tool_name) {
+                        apply_edit_diff(&comp, &tool_name, &result.details, &tui);
+                    }
                 } else {
                     // Tool ended without a Start/Update (e.g. a very fast tool):
                     // render a finalized component directly.
-                    let comp = Arc::new(ToolExecutionComponent::new(&tool_name, ""));
+                    let comp = Arc::new(ToolExecutionComponent::new(
+                        &tool_name,
+                        &if is_ask_user_tool(&tool_name) {
+                            ask_user_args_display(&serde_json::Value::Null)
+                        } else {
+                            "".to_string()
+                        },
+                    ));
+                    if is_ask_user_tool(&tool_name) {
+                        comp.set_display_title("ASK USER");
+                    }
                     comp.set_expanded(*state.tool_outputs_expanded.lock().unwrap());
-                    comp.set_result(&tool_result_text(&result), is_error);
-                    apply_edit_diff(&comp, &tool_name, &result.details, &tui);
+                    let result_text = if is_ask_user_tool(&tool_name) {
+                        ask_user_result_text(&result)
+                    } else {
+                        tool_result_text(&result)
+                    };
+                    comp.set_result(&result_text, is_error);
+                    if !is_ask_user_tool(&tool_name) {
+                        apply_edit_diff(&comp, &tool_name, &result.details, &tui);
+                    }
                     chat.add_child(comp.clone());
                 }
             }
@@ -6747,6 +7252,128 @@ fn tool_result_text(result: &rpi_agent::AgentToolResult) -> String {
 /// the first tool panel is created from `ToolExecutionStart` with real args.
 fn tool_update_has_payload(text: &str, result: &rpi_agent::AgentToolResult) -> bool {
     !text.trim().is_empty() || !result.details.is_null()
+}
+
+/// Tool names rendered through the dedicated `ASK USER` panel instead of a
+/// generic tool box. Native `ask_user` plus the JS `ask_user_question` alias.
+fn is_ask_user_tool(tool_name: &str) -> bool {
+    matches!(tool_name, "ask_user" | "ask_user_question")
+}
+
+/// Render ask_user tool-call ARGUMENTS as a readable question. The raw
+/// transport JSON must never leak into the transcript.
+fn ask_user_args_display(args: &serde_json::Value) -> String {
+    if args.is_null() {
+        return String::new();
+    }
+    if let Some(summary) = args
+        .get("summary")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+    {
+        return format!("Confirmation requested: {summary}");
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    let questions: Vec<&serde_json::Value> = args
+        .get("questions")
+        .and_then(serde_json::Value::as_array)
+        .filter(|items| !items.is_empty())
+        .map(|items| items.iter().collect())
+        .unwrap_or_else(|| vec![args]);
+
+    for question in questions {
+        let prompt = question
+            .get("question")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                args.get("question")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .map(str::trim)
+            .unwrap_or_default();
+        if prompt.is_empty() {
+            continue;
+        }
+        if let Some(header) = question
+            .get("header")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            lines.push(format!("{header}: {prompt}"));
+        } else {
+            lines.push(prompt.to_string());
+        }
+        let context = question
+            .get("context")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| args.get("context").and_then(serde_json::Value::as_str))
+            .map(str::trim)
+            .filter(|text| !text.is_empty());
+        if let Some(context) = context {
+            lines.push(format!("  {context}"));
+        }
+        let options = question
+            .get("options")
+            .and_then(serde_json::Value::as_array)
+            .or_else(|| args.get("options").and_then(serde_json::Value::as_array));
+        if let Some(options) = options {
+            let labels: Vec<String> = options
+                .iter()
+                .filter_map(|option| {
+                    option
+                        .get("title")
+                        .and_then(serde_json::Value::as_str)
+                        .or_else(|| option.as_str())
+                        .map(str::trim)
+                        .filter(|label| !label.is_empty())
+                        .map(str::to_string)
+                })
+                .collect();
+            if !labels.is_empty() {
+                lines.push(format!("Choices: {}", labels.join(", ")));
+            }
+        }
+        if let Some(suggest) = question
+            .get("suggest")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| args.get("suggest").and_then(serde_json::Value::as_str))
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        {
+            lines.push(format!("Suggestions: {suggest}"));
+        }
+    }
+
+    lines.join("\n")
+}
+
+/// Progress text while an ask_user tool is pending. Prefer the plugin's own
+/// readable `content`, otherwise show the question so the panel is not blank.
+fn ask_user_progress_text(args: &serde_json::Value, result: &rpi_agent::AgentToolResult) -> String {
+    let text = tool_result_text(result);
+    if !text.trim().is_empty() {
+        return text;
+    }
+    let args_text = ask_user_args_display(args);
+    if args_text.trim().is_empty() {
+        "Waiting for your answer…".to_string()
+    } else {
+        args_text
+    }
+}
+
+/// Final result text for an ask_user tool. The plugin returns a human-readable
+/// answer summary in `content`; never surface the transport JSON.
+fn ask_user_result_text(result: &rpi_agent::AgentToolResult) -> String {
+    let text = tool_result_text(result);
+    if text.trim().is_empty() {
+        "Answer recorded.".to_string()
+    } else {
+        text
+    }
 }
 
 // ===========================================================================
@@ -9391,5 +10018,158 @@ mod tests {
             Some(now - std::time::Duration::from_millis(501)),
             now
         ));
+    }
+
+    // ---- ask_user TUI bridge ----
+
+    #[test]
+    fn ask_user_tool_names_are_recognized() {
+        assert!(is_ask_user_tool("ask_user"));
+        assert!(is_ask_user_tool("ask_user_question"));
+        assert!(!is_ask_user_tool("bash"));
+    }
+
+    #[test]
+    fn ask_user_args_display_never_leaks_transport_json() {
+        let text = ask_user_args_display(&serde_json::json!({
+            "question": "你的代理端口是多少？",
+            "context": "本机",
+            "options": ["7890", {"title": "7897", "description": "clash"}],
+            "suggest": "1080"
+        }));
+        assert!(text.contains("你的代理端口是多少？"));
+        assert!(text.contains("本机"));
+        assert!(text.contains("Choices: 7890, 7897"));
+        assert!(text.contains("Suggestions: 1080"));
+        assert!(!text.trim_start().starts_with('{'));
+
+        let multi = ask_user_args_display(&serde_json::json!({
+            "questions": [
+                {"id": "a", "question": "Q1"},
+                {"id": "b", "header": "H", "question": "Q2"}
+            ]
+        }));
+        assert!(multi.contains("Q1"));
+        assert!(multi.contains("H: Q2"));
+
+        assert_eq!(
+            ask_user_args_display(&serde_json::json!({"type": "confirm", "summary": "Deploy?"})),
+            "Confirmation requested: Deploy?"
+        );
+        assert!(ask_user_args_display(&serde_json::Value::Null).is_empty());
+    }
+
+    #[test]
+    fn ask_user_result_and_progress_prefer_readable_content() {
+        let waiting = rpi_agent::AgentToolResult::text("Waiting for your answer\n端口?");
+        assert!(ask_user_progress_text(&serde_json::json!({"question": "端口?"}), &waiting)
+            .contains("端口?"));
+        let empty = rpi_agent::AgentToolResult::default();
+        assert!(
+            ask_user_progress_text(&serde_json::json!({"question": "端口?"}), &empty)
+                .contains("端口?")
+        );
+        let answered = rpi_agent::AgentToolResult::text("端口?: 7897");
+        assert_eq!(ask_user_result_text(&answered), "端口?: 7897");
+        assert_eq!(ask_user_result_text(&empty), "Answer recorded.");
+    }
+
+    #[test]
+    fn ask_user_prompt_parser_supports_flat_and_questions_shapes() {
+        let flat = rpi_extensions::UiDialogRequest {
+            request_id: "r1".into(),
+            tool_call_id: Some("c1".into()),
+            ui: serde_json::json!({
+                "kind": "selector",
+                "id": "proxy_port",
+                "header": "Proxy",
+                "question": "端口?",
+                "options": [{"title": "7890", "description": "text"}, {"title": "7897"}],
+                "allowMultiple": true,
+                "allowFreeform": false,
+                "suggest": "1080"
+            }),
+            raw: serde_json::json!({}),
+        };
+        let prompt = parse_ask_user_prompt(&flat);
+        assert_eq!(prompt.question_id, "proxy_port");
+        assert_eq!(prompt.header.as_deref(), Some("Proxy"));
+        assert_eq!(prompt.options.len(), 2);
+        assert_eq!(prompt.options[0].1.as_deref(), Some("text"));
+        assert!(prompt.allow_multiple);
+        assert!(!prompt.allow_freeform);
+        assert_eq!(prompt.suggest.as_deref(), Some("1080"));
+
+        let alias = rpi_extensions::UiDialogRequest {
+            ui: serde_json::json!({
+                "questions": [{"id": "q", "question": "Q?", "options": []}]
+            }),
+            ..flat.clone()
+        };
+        let prompt = parse_ask_user_prompt(&alias);
+        assert_eq!(prompt.question_id, "q");
+        assert!(prompt.allow_freeform, "no options defaults to freeform");
+
+        let confirm = rpi_extensions::UiDialogRequest {
+            ui: serde_json::json!({"kind": "confirm", "question": "Go?"}),
+            ..flat.clone()
+        };
+        let prompt = parse_ask_user_prompt(&confirm);
+        assert_eq!(prompt.kind, "confirm");
+        assert_eq!(prompt.options.len(), 2);
+        assert_eq!(prompt.options[0].0, "Yes");
+    }
+
+    #[test]
+    fn ask_user_bridge_answers_and_cancels_by_request_id() {
+        let mailbox = rpi_extensions::UiDialogMailbox::new();
+        mailbox.attach();
+        let bridge = AskUserBridge::new(mailbox.clone());
+
+        // Two concurrent requests must not cross answers.
+        mailbox
+            .handle(serde_json::json!({
+                "op": "open", "requestId": "r1", "toolCallId": "call-r1",
+                "ui": {"kind": "input", "question": "Port?"}
+            }))
+            .unwrap();
+        mailbox
+            .handle(serde_json::json!({
+                "op": "open", "requestId": "r2", "toolCallId": "call-r2",
+                "ui": {"kind": "input", "question": "Level?"}
+            }))
+            .unwrap();
+
+        let first = bridge.take_pending().expect("r1 visible");
+        assert_eq!(first.request_id, "r1");
+        assert!(
+            bridge.take_pending().is_none(),
+            "only one request occupies the input slot"
+        );
+        bridge.respond("r1", serde_json::json!({"text": "7897"}));
+        assert_eq!(mailbox.poll("r1").unwrap()["answer"]["text"], "7897");
+
+        let second = bridge.take_pending().expect("r2 visible");
+        assert_eq!(second.request_id, "r2");
+        bridge.cancel("r2");
+        assert_eq!(mailbox.poll("r2").unwrap()["status"], "cancelled");
+
+        // cancel_all drops anything still queued.
+        mailbox
+            .handle(serde_json::json!({
+                "op": "open", "requestId": "r3",
+                "ui": {"kind": "input", "question": "X?"}
+            }))
+            .unwrap();
+        bridge.cancel_all();
+        assert_eq!(mailbox.poll("r3").unwrap()["status"], "cancelled");
+
+        // A detached mailbox rejects new prompts (headless contract).
+        bridge.shutdown();
+        assert!(mailbox
+            .handle(serde_json::json!({
+                "op": "open", "requestId": "r4", "ui": {"kind": "input"}
+            }))
+            .is_err());
     }
 }

@@ -103,10 +103,15 @@ pub struct SelectList {
     items: Mutex<Vec<SelectItem>>,
     filtered_items: Mutex<Vec<SelectItem>>,
     selected_index: Mutex<usize>,
+    /// Values toggled in multi-select mode. Values (rather than indexes) are
+    /// retained so filtering does not lose the user's selections.
+    selected_values: Mutex<std::collections::HashSet<String>>,
+    multi_select: bool,
     max_visible: usize,
     theme: SelectListTheme,
     layout: SelectListLayoutOptions,
     on_select: Mutex<Option<Arc<dyn Fn(&SelectItem) + Send + Sync>>>,
+    on_multi_select: Mutex<Option<Arc<dyn Fn(&[SelectItem]) + Send + Sync>>>,
     on_cancel: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     on_selection_change: Mutex<Option<Arc<dyn Fn(&SelectItem) + Send + Sync>>>,
 }
@@ -118,10 +123,13 @@ impl SelectList {
             filtered_items: Mutex::new(items.clone()),
             items: Mutex::new(items),
             selected_index: Mutex::new(0),
+            selected_values: Mutex::new(std::collections::HashSet::new()),
+            multi_select: false,
             max_visible,
             theme: SelectListTheme::default(),
             layout: SelectListLayoutOptions::default(),
             on_select: Mutex::new(None),
+            on_multi_select: Mutex::new(None),
             on_cancel: Mutex::new(None),
             on_selection_change: Mutex::new(None),
         }
@@ -133,13 +141,72 @@ impl SelectList {
             filtered_items: Mutex::new(items.clone()),
             items: Mutex::new(items),
             selected_index: Mutex::new(0),
+            selected_values: Mutex::new(std::collections::HashSet::new()),
+            multi_select: false,
             max_visible,
             theme,
             layout: SelectListLayoutOptions::default(),
             on_select: Mutex::new(None),
+            on_multi_select: Mutex::new(None),
             on_cancel: Mutex::new(None),
             on_selection_change: Mutex::new(None),
         }
+    }
+
+    /// Create a selector that permits selecting several options with Space
+    /// before submitting with Enter. Existing single-select selectors should
+    /// continue using [`Self::new`].
+    pub fn new_multi(items: Vec<SelectItem>, max_visible: usize) -> Self {
+        let mut list = Self::new(items, max_visible);
+        list.multi_select = true;
+        list
+    }
+
+    /// Whether this list is in multi-select mode.
+    pub fn is_multi_select(&self) -> bool {
+        self.multi_select
+    }
+
+    /// Set a callback invoked with all toggled options when Enter is pressed.
+    pub fn on_multi_select(&self, callback: Arc<dyn Fn(&[SelectItem]) + Send + Sync>) {
+        if let Ok(mut cb) = self.on_multi_select.lock() {
+            *cb = Some(callback);
+        }
+    }
+
+    /// Return the currently toggled options, preserving the source order.
+    pub fn get_selected_items(&self) -> Vec<SelectItem> {
+        let selected = self.selected_values.lock().ok();
+        let items = self.items.lock().ok();
+        match (selected, items) {
+            (Some(selected), Some(items)) => items
+                .iter()
+                .filter(|item| selected.contains(&item.value))
+                .cloned()
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Toggle the currently highlighted option. No-op for a regular selector.
+    pub fn toggle_selected(&self) {
+        if !self.multi_select {
+            return;
+        }
+        let Some(item) = self.get_selected_item() else { return };
+        if let Ok(mut selected) = self.selected_values.lock() {
+            if !selected.insert(item.value.clone()) {
+                selected.remove(&item.value);
+            }
+        }
+    }
+
+    /// Whether an item is currently toggled in multi-select mode.
+    fn is_selected_value(&self, value: &str) -> bool {
+        self.selected_values
+            .lock()
+            .map(|values| values.contains(value))
+            .unwrap_or(false)
     }
 
     /// Set the filter text.
@@ -206,6 +273,9 @@ impl SelectList {
             }
             KeyCode::Enter => {
                 self.confirm();
+            }
+            KeyCode::Char(' ') if self.multi_select => {
+                self.toggle_selected();
             }
             KeyCode::Esc => {
                 self.cancel();
@@ -278,6 +348,23 @@ impl SelectList {
 
     /// Confirm selection.
     fn confirm(&self) {
+        if self.multi_select {
+            let selected = self.get_selected_items();
+            // A bare Enter is still useful when the user did not press Space:
+            // treat the highlighted row as the sole answer, matching native
+            // selector ergonomics while retaining explicit multi-toggle UX.
+            let selected = if selected.is_empty() {
+                self.get_selected_item().into_iter().collect::<Vec<_>>()
+            } else {
+                selected
+            };
+            if let Ok(cb) = self.on_multi_select.lock() {
+                if let Some(callback) = cb.as_ref() {
+                    callback(&selected);
+                }
+            }
+            return;
+        }
         if let Some(item) = self.get_selected_item() {
             if let Ok(cb) = self.on_select.lock() {
                 if let Some(callback) = cb.as_ref() {
@@ -344,8 +431,19 @@ impl SelectList {
         width: usize,
         primary_column_width: usize,
     ) -> String {
-        let prefix = if is_selected { "→ " } else { "  " };
-        let prefix_width = visible_width(prefix);
+        let prefix = if self.multi_select {
+            let marker = if self.is_selected_value(&item.value) { "x" } else { " " };
+            if is_selected {
+                format!("→ [{}] ", marker)
+            } else {
+                format!("  [{}] ", marker)
+            }
+        } else if is_selected {
+            "→ ".to_string()
+        } else {
+            "  ".to_string()
+        };
+        let prefix_width = visible_width(&prefix);
 
         // Handle description
         if let Some(ref description) = item.description {
@@ -521,5 +619,30 @@ mod tests {
         assert_eq!(item.label, "Label");
         assert_eq!(item.description, Some("Description".to_string()));
         assert_eq!(item.display_value(), "Label");
+    }
+
+    #[test]
+    fn test_multi_select_toggle_and_submit() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let list = SelectList::new_multi(
+            vec![SelectItem::new("one", "One"), SelectItem::new("two", "Two")],
+            5,
+        );
+        let submitted = Arc::new(Mutex::new(Vec::<String>::new()));
+        let submitted_copy = submitted.clone();
+        list.on_multi_select(Arc::new(move |items| {
+            *submitted_copy.lock().unwrap() = items.iter().map(|item| item.value.clone()).collect();
+        }));
+
+        list.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        list.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        list.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        list.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(
+            submitted.lock().unwrap().as_slice(),
+            &["one".to_string(), "two".to_string()]
+        );
+        assert!(list.render(40)[0].contains("[x]"));
     }
 }

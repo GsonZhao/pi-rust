@@ -11,7 +11,7 @@ It is a multi-crate Rust implementation of the
 [earendil-works/pi](https://github.com/earendil-works/pi) SDK layer for building
 composable LLM agents with providers, tools, sessions, and plugins.
 
-Repository: `bigfish1913/pi-rust` · Website: <https://rpi.laofu.online/>
+Repository: `bigfish1913/pi-rust` · Website: [https://rpi.laofu.online/](https://rpi.laofu.online/)
 
 The project is useful both as a Rust Agent SDK and as a ready-to-run terminal
 coding agent. Core crates can be embedded independently; the `rpi` CLI provides
@@ -24,26 +24,26 @@ the fastest way to try the complete loop.
 
 ## Crates (published as `rpi-*`)
 
-| Crate (crates.io) | On-disk dir      | What it is                                                          |
-|-------------------|------------------|---------------------------------------------------------------------|
-| `rpi-telemetry`   | `pi-telemetry/`  | Telemetry span/event contracts (noop default).                      |
-| `rpi-ai`          | `pi-ai/`         | Unified multi-provider LLM types + streaming (Anthropic + faux).    |
-| `rpi-agent`       | `pi-agent/`      | Agent runtime + loop, `AgentTool` trait, events, hooks, queues.     |
-| `rpi-tools`       | `pi-tools/`      | Pi-compatible coding tools (`read`/`write`/`edit`/`bash`) + `ExecutionEnv`. |
-| `rpi-harness`     | `pi-harness/`    | `AgentHarness`: session tree, JSONL persistence, compaction, run loop. |
-| `rpi-cli`         | `pi-cli/`        | Terminal coding-agent CLI (`rpi` binary) on top of the library crates. |
-| `rpi-plugin-sdk`   | `rpi-plugin-sdk/` | Stable C ABI for Rust-native plugins and extension discovery.        |
-| `rpi-extensions`   | `rpi-extensions/` | Dynamic plugin loader and `AgentTool` adapter.                       |
-| `rpi-tui`          | `pi-tui/`        | Terminal UI primitives used by the interactive CLI.                 |
+| Crate (crates.io)  | On-disk dir         | What it is                                                                            |
+| ------------------ | ------------------- | ------------------------------------------------------------------------------------- |
+| `rpi-telemetry`  | `pi-telemetry/`   | Telemetry span/event contracts (noop default).                                        |
+| `rpi-ai`         | `pi-ai/`          | Unified multi-provider LLM types + streaming (Anthropic + faux).                      |
+| `rpi-agent`      | `pi-agent/`       | Agent runtime + loop,`AgentTool` trait, events, hooks, queues.                      |
+| `rpi-tools`      | `pi-tools/`       | Pi-compatible coding tools (`read`/`write`/`edit`/`bash`) + `ExecutionEnv`. |
+| `rpi-harness`    | `pi-harness/`     | `AgentHarness`: session tree, JSONL persistence, compaction, run loop.              |
+| `rpi-cli`        | `pi-cli/`         | Terminal coding-agent CLI (`rpi` binary) on top of the library crates.              |
+| `rpi-plugin-sdk` | `rpi-plugin-sdk/` | Stable C ABI for Rust-native plugins and extension discovery.                         |
+| `rpi-extensions` | `rpi-extensions/` | Dynamic plugin loader and`AgentTool` adapter.                                       |
+| `rpi-tui`        | `pi-tui/`         | Terminal UI primitives used by the interactive CLI.                                   |
 
 Dependency direction: `rpi-telemetry → rpi-ai → rpi-agent → rpi-tools → rpi-harness → rpi-cli`.
 
 ### Rust registry links
 
-| Package | crates.io | docs.rs |
-| --- | --- | --- |
-| `rpi-cli` | [crates.io](https://crates.io/crates/rpi-cli) | [docs.rs](https://docs.rs/rpi-cli) |
-| `rpi-agent` | [crates.io](https://crates.io/crates/rpi-agent) | [docs.rs](https://docs.rs/rpi-agent) |
+| Package            | crates.io                                           | docs.rs                                  |
+| ------------------ | --------------------------------------------------- | ---------------------------------------- |
+| `rpi-cli`        | [crates.io](https://crates.io/crates/rpi-cli)        | [docs.rs](https://docs.rs/rpi-cli)        |
+| `rpi-agent`      | [crates.io](https://crates.io/crates/rpi-agent)      | [docs.rs](https://docs.rs/rpi-agent)      |
 | `rpi-plugin-sdk` | [crates.io](https://crates.io/crates/rpi-plugin-sdk) | [docs.rs](https://docs.rs/rpi-plugin-sdk) |
 | `rpi-extensions` | [crates.io](https://crates.io/crates/rpi-extensions) | [docs.rs](https://docs.rs/rpi-extensions) |
 
@@ -241,15 +241,13 @@ require package discovery.
   `ANTHROPIC_BASE_URL`/`ANTHROPIC_AUTH_TOKEN`.
 - **Auth (in priority order):** `--api-key` → `~/.rpi/auth.json` (set via
   `rpi auth login`) → `~/.rpi/agent/models.json` `apiKey` → provider environment
-  variables (`OPENAI_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`). `rpi auth
-  login`/`check`/`logout` manage the stored credential.
+  variables (`OPENAI_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`). `rpi auth login`/`check`/`logout` manage the stored credential.
 - **Tools:** the CLI defaults to Pi's `read`, `write`, `edit`, and `bash`
   tools. The former rpi-only `grep`, `find`, `ls`, `docs`, and `powershell`
   implementations remain library code but are not loaded by default.
 - **Extensions:** Rust `cdylib` plugins can be installed with `rpi install` and
   are discovered from project `.rpi/extensions`, legacy `.pi/extensions`,
   global `~/.rpi/agent/extensions`, and `--extensions-dir`.
-
 - **Project resources:** rpi-owned skills, prompts, system instructions, and
   extensions use `.rpi/` first; the original Pi `.pi/` layout remains a
   compatibility fallback. When both contain the same skill or prompt name,
