@@ -1285,4 +1285,47 @@ mod tests {
         mailbox.take_pending().unwrap();
         assert!(mailbox.take_pending().is_none());
     }
+
+    /// The v2 trampoline must route action 17 into the session mailbox rather
+    /// than rejecting it as unknown, and a detached mailbox must surface the
+    /// explicit "requires an interactive UI" error (headless contract).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn v2_dispatch_routes_ui_dialog_action_17() {
+        let host: Arc<dyn RuntimeActionHost> = Arc::new(MockHost {
+            prompt: String::new(),
+            saw: Mutex::new(Vec::new()),
+        });
+        let bridge = ActionBridge::with_ui_dialog(
+            tokio::runtime::Handle::current(),
+            host,
+            UiDialogMailbox::new(),
+        );
+        let user_data = Arc::as_ptr(&bridge) as *mut c_void;
+
+        let mut out = StbString::empty();
+        let rc = trampoline_runtime_action(
+            17,
+            StbStringRef::from_str(r#"{"op":"open","requestId":"r1","ui":{}}"#),
+            &mut out,
+            user_data,
+        );
+        assert_eq!(rc, 1);
+        let payload: serde_json::Value =
+            serde_json::from_str(&out.to_string_lossy()).expect("structured error JSON");
+        assert!(
+            payload["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("interactive UI")),
+            "unexpected payload: {payload}"
+        );
+        crate::host_free_string(out);
+
+        // The next id remains unknown (no silent acceptance of arbitrary ids).
+        let mut out = StbString::empty();
+        assert_eq!(
+            trampoline_runtime_action(18, StbStringRef::from_str("{}"), &mut out, user_data),
+            2
+        );
+        crate::host_free_string(out);
+    }
 }
