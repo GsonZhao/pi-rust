@@ -5223,22 +5223,14 @@ pub async fn interactive_tui(
                 // Routing this through the TUI's main channel delayed it until
                 // `prompt_text()` returned, after the loop's drain points had
                 // passed, so the queued message appeared to disappear.
-                // Keep using steering while an abort is settling: the native
-                // loop drains steering after the current tool batch, including
-                // a cancelled batch, so the message is retained in context.
-                // `next_run` is intentionally reserved for an explicit future
-                // run and would otherwise sit pending with no automatic wakeup.
-                let result = match lane.steer(message.clone()).await {
-                    Ok(result) => Ok(result),
-                    // Ctrl+C can finish the run between the status snapshot
-                    // and this spawned enqueue task. Preserve the user's
-                    // message for the next explicit run instead of dropping it
-                    // on the idle-race.
-                    Err(_) => lane.next_run(message).await,
-                };
-                if let Err(error) = result {
+                //
+                // Native pi's `steer()` enqueues unconditionally, even after
+                // the run ends, and the message stays in the queue for the
+                // next run. This matches the TS design and avoids the race
+                // between `activeRun` clearing and the status check.
+                if let Err(error) = lane.steer(message).await {
                     add_error_message(&chat, &format!("Could not queue message: {error}"));
-                    tui.request_render(false);
+                    tui.render_now(false);
                 }
             });
             // A queued prompt is still the user's message. Render it through
@@ -5273,6 +5265,14 @@ pub async fn interactive_tui(
         }
     }));
 
+    // Turn on the native-pi frame throttle before the first frame: from here on
+    // `request_render(false)` parks a frame and the scheduler thread paints at
+    // most one per `MIN_RENDER_INTERVAL_MS` (16 ms). A provider that streams one
+    // `MessageUpdate` per delta would otherwise force a full transcript
+    // re-render + full-viewport terminal write per token, which is what made
+    // long output saturate the terminal (and its GPU compositor). Immediate
+    // renders (selectors, the first frame, `render_now(..)`) are unaffected.
+    tui.start_render_scheduler();
     tui.start_readerless();
 
     // Consume local self-update results even when network checks are disabled.
@@ -5629,6 +5629,17 @@ pub async fn interactive_tui(
                         state_for_key.set_status(RunStatus::Aborting);
                         // Drop any outstanding ask_user prompt from this turn.
                         ask_user_for_key.cancel_all();
+                        // Restore the editor if an extension dialog was occupying it.
+                        if !run_extension_cancel(&state_for_key)
+                            && state_for_key.extension_dialog_open()
+                        {
+                            close_extension_editor(
+                                &state_for_key,
+                                &ctx_for_key.editor_container,
+                                &editor_for_key,
+                                &tui_for_key,
+                            );
+                        }
                         let lane = lane_for_key.clone();
                         tokio::spawn(async move {
                             let _ = lane.abort().await;
@@ -5686,6 +5697,16 @@ pub async fn interactive_tui(
                     RunStatus::Working => {
                         state_for_key.set_status(RunStatus::Aborting);
                         ask_user_for_key.cancel_all();
+                        if !run_extension_cancel(&state_for_key)
+                            && state_for_key.extension_dialog_open()
+                        {
+                            close_extension_editor(
+                                &state_for_key,
+                                &ctx_for_key.editor_container,
+                                &editor_for_key,
+                                &tui_for_key,
+                            );
+                        }
                         let lane = lane_for_key.clone();
                         tokio::spawn(async move {
                             let _ = lane.abort().await;
@@ -5719,6 +5740,16 @@ pub async fn interactive_tui(
                 if status == RunStatus::Working {
                     state_for_key.set_status(RunStatus::Aborting);
                     ask_user_for_key.cancel_all();
+                    if !run_extension_cancel(&state_for_key)
+                        && state_for_key.extension_dialog_open()
+                    {
+                        close_extension_editor(
+                            &state_for_key,
+                            &ctx_for_key.editor_container,
+                            &editor_for_key,
+                            &tui_for_key,
+                        );
+                    }
                     let lane = lane_for_key.clone();
                     tokio::spawn(async move {
                         let _ = lane.abort().await;
@@ -6190,8 +6221,17 @@ pub async fn interactive_tui(
                     reload_ctx.extension_session.lock().unwrap().snapshot_arc(),
                 );
                 state.set_markdown_transformer_with_reinstall(fresh_transformer);
-                if outcome.had_warnings {
-                    add_error_message(
+                if outcome.had_errors {
+                    // Hard failure: the summary itself carries the error detail
+                    // (e.g. "Settings reload failed: …"), so render it as an
+                    // error without an extra stderr pointer.
+                    add_error_message(&chat_container, &outcome.summary);
+                } else if outcome.had_warnings {
+                    // Reload succeeded but produced soft diagnostics (skill
+                    // shadowing, name validation, …). The details are printed
+                    // to stderr; keep this as an informational note so a
+                    // successful reload isn't shown as a red ✗ error.
+                    add_note_message(
                         &chat_container,
                         &format!(
                             "{} (with warnings — see stderr for details).",
@@ -7127,7 +7167,9 @@ async fn handle_agent_event(
                         .to_string();
                     if command.trim().is_empty() && tool_result_text(&result).trim().is_empty() {
                         state.sync_working_loader_with_bash();
-                        tui.request_render(false);
+                        // Edge case: empty bash result. Still render immediately
+                        // to clear the panel state for the user.
+                        tui.render_now(false);
                         return;
                     }
                     let comp = Arc::new(BashExecutionComponent::new(command));
@@ -7176,7 +7218,12 @@ async fn handle_agent_event(
                 }
             }
             state.sync_working_loader_with_bash();
-            tui.request_render(false);
+            // Bash tool completion is user-visible: immediate render ensures the
+            // result is displayed even when the scheduler thread is busy or the
+            // throttle window has not elapsed. This single immediate frame does
+            // not regress the streaming-output throttle that keeps CPU/GPU use
+            // low (bash completions are discrete events, not per-token bursts).
+            tui.render_now(false);
         }
     }
 }
