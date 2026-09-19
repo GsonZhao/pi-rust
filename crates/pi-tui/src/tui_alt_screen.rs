@@ -4,7 +4,10 @@
 //! transcript and fixed bottom dock, as described in `tui-plan.md`.
 
 use std::any::Any;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use super::component::Component;
 use super::container::Container;
@@ -22,6 +25,99 @@ use crate::terminal::{InputEvent, Terminal, TerminalInfo};
 
 /// Symbol for ViewportTUI capability check.
 pub const VIEWPORT_TUI: &[u8] = b"@earendil-works/pi-tui/viewport";
+
+/// Upper bound on the coalesced repaint rate, matching native pi's
+/// `TuiBase.MIN_RENDER_INTERVAL_MS` (16 ms ≈ 60 fps).
+///
+/// A provider streams one `MessageUpdate` per delta, and every delta used to
+/// repaint the *whole* transcript (full markdown rebuild + full layout pass +
+/// a full-viewport terminal write). Throttling that to one frame per interval
+/// is what keeps long, fast output from saturating the terminal — and the
+/// GPU-backed compositor behind it.
+pub const MIN_RENDER_INTERVAL_MS: u64 = 16;
+
+/// Merge an incoming frame request into one that is already parked.
+///
+/// `reuse_scroll_content = false` means "the transcript changed, re-render it";
+/// `true` means "only the viewport/dock moved, the cached transcript is fine".
+/// A parked full render is never downgraded to a cached one, so a streamed
+/// delta that lands inside a pure-scroll frame window is still painted.
+fn merge_pending_render(parked: Option<bool>, reuse_scroll_content: bool) -> Option<bool> {
+    match parked {
+        Some(parked) => Some(parked && reuse_scroll_content),
+        None => Some(reuse_scroll_content),
+    }
+}
+
+/// Coalescing render-scheduler state — the Rust port of native pi's
+/// `TuiBase.{renderRequested, renderTimer, lastRenderAt}` trio.
+struct RenderSchedulerState {
+    /// `None` = no frame is owed. `Some(reuse_scroll_content)` records which
+    /// render variant the parked request needs.
+    pending: Option<bool>,
+    /// Set by [`TuiAltScreen::stop`] to end the scheduler thread.
+    shutdown: bool,
+    /// When the last frame was painted (native pi `lastRenderAt`).
+    last_render_at: Instant,
+}
+
+/// One scheduler per TUI (never global), so a parked frame can only ever wake
+/// the thread that belongs to its own screen.
+struct RenderScheduler {
+    state: Mutex<RenderSchedulerState>,
+    cv: Condvar,
+}
+
+impl RenderScheduler {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(RenderSchedulerState {
+                pending: None,
+                shutdown: false,
+                last_render_at: Instant::now(),
+            }),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// Record that a frame is owed and wake the scheduler thread.
+    fn park(&self, reuse_scroll_content: bool) {
+        if let Ok(mut state) = self.state.lock() {
+            state.pending = merge_pending_render(state.pending, reuse_scroll_content);
+        }
+        // The predicate is checked under the same mutex the waiter holds, so the
+        // wakeup cannot be lost between the store above and the wait below.
+        self.cv.notify_all();
+    }
+
+    /// Note that a frame was just painted, restarting the throttle window.
+    fn mark_painted(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.last_render_at = Instant::now();
+        }
+    }
+
+    /// Take the parked frame, if any.
+    fn take_pending(&self) -> Option<bool> {
+        self.state.lock().ok()?.pending.take()
+    }
+
+    /// Discard any parked frame (an immediate render supersedes it).
+    fn clear_pending(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.pending = None;
+        }
+    }
+
+    /// Signal the scheduler thread to exit and reclaim the parked frame.
+    fn shutdown(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.shutdown = true;
+            state.pending = None;
+        }
+        self.cv.notify_all();
+    }
+}
 
 /// Alternate screen TUI with application-owned scrolling.
 pub struct TuiAltScreen {
@@ -58,6 +154,18 @@ pub struct TuiAltScreen {
     resize_handler: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     overlays: Arc<OverlayManager>,
     render_suspended: Mutex<bool>,
+    /// Coalescing render scheduler (native pi `TuiBase` frame throttle). While
+    /// it is active, `request_render(false)` and
+    /// `request_render_reusing_scroll_content()` park a frame instead of
+    /// repainting, and the scheduler thread paints at most one frame per
+    /// [`MIN_RENDER_INTERVAL_MS`].
+    scheduler: Arc<RenderScheduler>,
+    /// Whether [`TuiAltScreen::start_render_scheduler`] succeeded. When false,
+    /// render requests paint inline (standalone/unit-test behaviour).
+    scheduler_started: AtomicBool,
+    /// The scheduler thread, joined by [`TuiAltScreen::stop`] so a parked frame
+    /// cannot repaint the terminal after shutdown.
+    scheduler_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl TuiAltScreen {
@@ -96,7 +204,140 @@ impl TuiAltScreen {
             resize_handler: Mutex::new(None),
             overlays: Arc::new(OverlayManager::new()),
             render_suspended: Mutex::new(false),
+            scheduler: Arc::new(RenderScheduler::new()),
+            scheduler_started: AtomicBool::new(false),
+            scheduler_thread: Mutex::new(None),
         }
+    }
+
+    /// Start the coalescing render scheduler — the Rust port of native pi's
+    /// `TuiBase.scheduleRender()` timer. Idempotent.
+    ///
+    /// Every `request_render(false)` / `request_render_reusing_scroll_content()`
+    /// call after this parks a frame instead of repainting immediately, and the
+    /// scheduler thread paints at most one frame per [`MIN_RENDER_INTERVAL_MS`].
+    /// A burst of streamed deltas therefore collapses into a single repaint of
+    /// the transcript instead of one per token.
+    ///
+    /// Hosts that drive their own event loop may instead leave this off and call
+    /// [`TuiAltScreen::flush_pending_render`] from their own tick; without either
+    /// the requests paint inline (the pre-throttle behaviour).
+    ///
+    /// Takes `&Arc<Self>` because the scheduler thread keeps the TUI alive until
+    /// [`TuiAltScreen::stop`] shuts it down; call it after the TUI has been
+    /// wrapped in the `Arc` the host renders through.
+    pub fn start_render_scheduler(self: &Arc<Self>) {
+        if self.scheduler_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let tui = self.clone();
+        let spawned = std::thread::Builder::new()
+            .name("rpi-tui-render".to_string())
+            .spawn(move || tui.run_render_scheduler());
+        match spawned {
+            Ok(handle) => {
+                if let Ok(mut slot) = self.scheduler_thread.lock() {
+                    *slot = Some(handle);
+                }
+            }
+            Err(_) => {
+                // A failed spawn must not silently disable repaints: fall back
+                // to the synchronous path rather than parking frames forever.
+                self.scheduler_started.store(false, Ordering::Release);
+            }
+        }
+    }
+
+    /// Scheduler thread body: sleep until a frame is owed, then paint at most one
+    /// frame per [`MIN_RENDER_INTERVAL_MS`]. Idle screens pay no wakeups at all —
+    /// the thread is parked on the condvar.
+    fn run_render_scheduler(self: Arc<Self>) {
+        let interval = Duration::from_millis(MIN_RENDER_INTERVAL_MS);
+        loop {
+            // ---- Wait for a frame to be owed (or shutdown) ----
+            {
+                let Ok(mut state) = self.scheduler.state.lock() else {
+                    return;
+                };
+                while state.pending.is_none() && !state.shutdown {
+                    let Ok(next) = self.scheduler.cv.wait(state) else {
+                        return;
+                    };
+                    state = next;
+                }
+                if state.shutdown {
+                    return;
+                }
+            }
+            // ---- Hold the frame back until the throttle window elapses ----
+            loop {
+                let remaining = {
+                    let Ok(state) = self.scheduler.state.lock() else {
+                        return;
+                    };
+                    match interval.checked_sub(state.last_render_at.elapsed()) {
+                        Some(remaining) => remaining,
+                        None => break,
+                    }
+                };
+                let Ok(state) = self.scheduler.state.lock() else {
+                    return;
+                };
+                if state.shutdown {
+                    return;
+                }
+                let Ok((state, _)) = self.scheduler.cv.wait_timeout(state, remaining) else {
+                    return;
+                };
+                if state.shutdown {
+                    return;
+                }
+            }
+            self.flush_pending_render();
+        }
+    }
+
+    /// Paint a frame parked by [`TUI::request_render`] /
+    /// [`TuiAltScreen::request_render_reusing_scroll_content`].
+    ///
+    /// Returns `true` when a frame was painted, `false` when nothing was owed
+    /// (or the owed frame was dropped because the TUI is stopped or a foreign
+    /// runtime owns the terminal — both of those paths force a fresh full frame
+    /// when they end, so nothing is lost on screen).
+    ///
+    /// The scheduler thread calls this; it is also the deterministic hook a host
+    /// tick or a unit test can use to flush a request synchronously.
+    pub fn flush_pending_render(&self) -> bool {
+        let Some(reuse_scroll_content) = self.scheduler.take_pending() else {
+            return false;
+        };
+        if !self.is_running() || self.is_render_suspended() {
+            return false;
+        }
+        self.do_render(reuse_scroll_content);
+        true
+    }
+
+    /// Park a frame request, or paint it inline when no scheduler is running.
+    fn park_render(&self, reuse_scroll_content: bool) {
+        if !self.scheduler_started.load(Ordering::Acquire) {
+            self.do_render(reuse_scroll_content);
+            return;
+        }
+        self.scheduler.park(reuse_scroll_content);
+    }
+
+    /// Test seam: enable frame parking *without* spawning the scheduler thread,
+    /// so a test can drive [`TuiAltScreen::flush_pending_render`] itself and
+    /// observe the coalescing deterministically.
+    #[cfg(test)]
+    fn enable_render_coalescing(&self) {
+        self.scheduler_started.store(true, Ordering::Release);
+    }
+
+    /// Record the frame timestamp that gates the next coalesced repaint.
+    fn mark_frame_painted(&self) {
+        self.scheduler.mark_painted();
     }
 
     /// Use the terminal's main screen and native scrollback instead of the
@@ -446,6 +687,13 @@ impl TuiAltScreen {
 
     /// Perform a differential render with constrained layout.
     fn do_render(&self, reuse_scroll_content: bool) {
+        if self.is_render_suspended() {
+            return;
+        }
+        // native pi stamps the frame time immediately before `doRender()`; the
+        // scheduler reads it to hold the next request back for the remainder of
+        // the throttle window.
+        self.mark_frame_painted();
         if self.uses_main_screen() {
             self.do_render_main_screen();
             return;
@@ -750,6 +998,14 @@ impl TUI for TuiAltScreen {
             *running = false;
         }
 
+        // Stop the coalescing scheduler *before* the terminal goes away, and
+        // join it so a frame already in flight cannot repaint the screen after
+        // shutdown (the class of bug the 0.1.18 regular-mode fix targets).
+        self.scheduler.shutdown();
+        if let Some(handle) = self.scheduler_thread.lock().ok().and_then(|mut s| s.take()) {
+            let _ = handle.join();
+        }
+
         if self.uses_main_screen() {
             if let Ok(terminal) = self.terminal.lock() {
                 // Leave the shell prompt below the rendered footer while
@@ -782,14 +1038,28 @@ impl TUI for TuiAltScreen {
                 prev.clear();
             }
         }
+        // An immediate frame supersedes a parked coalesced one: native pi's
+        // `renderNow` clears `renderRequested` and cancels the render timer.
+        self.scheduler.clear_pending();
         self.do_render(false);
     }
 
-    fn request_render(&self, _force: bool) {
+    fn request_render(&self, force: bool) {
         if self.is_render_suspended() {
             return;
         }
-        self.render_now(false);
+        if force {
+            // native pi `requestRender(true)`: reset the diff state and paint an
+            // immediate frame instead of waiting out the throttle window.
+            self.render_now(true);
+            return;
+        }
+        if !self.is_running() {
+            return;
+        }
+        // Coalesced (native pi `requestRender(false)`): park the frame and let
+        // the scheduler paint it at most once per `MIN_RENDER_INTERVAL_MS`.
+        self.park_render(false);
     }
 
     fn full_redraws(&self) -> usize {
@@ -802,6 +1072,9 @@ impl TuiAltScreen {
     /// `ProcessTerminal` input-reader thread. The caller owns the input loop
     /// (e.g. a `spawn_blocking` `event::read()` loop) and handles resize/key
     /// events directly via [`TuiAltScreen::refresh_size`] / its key dispatch.
+    ///
+    /// The first frame is painted inline. Hosts that want the native-pi frame
+    /// throttle should also call [`TuiAltScreen::start_render_scheduler`].
     ///
     /// This avoids two `event::read()` consumers racing the same stdin queue
     /// (the stub thread in [`TUI::start`] dropped a fraction of keystrokes).
@@ -828,10 +1101,14 @@ impl TuiAltScreen {
     /// Render a frame while reusing scroll-view content. This is appropriate
     /// when only the viewport or bottom dock changed. A missing cache or width
     /// change falls back to rendering fresh content automatically.
+    ///
+    /// Coalesced like [`TUI::request_render`]; a request that upgrades the parked
+    /// frame to a full transcript render wins.
     pub fn request_render_reusing_scroll_content(&self) {
-        if self.is_running() && !self.is_render_suspended() {
-            self.do_render(true);
+        if !self.is_running() || self.is_render_suspended() {
+            return;
         }
+        self.park_render(true);
     }
 }
 
@@ -1114,5 +1391,105 @@ mod tests {
         tui.request_render(false);
 
         assert!(output.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn merge_pending_render_never_downgrades_a_full_render() {
+        // Nothing parked: the request's own variant wins.
+        assert_eq!(merge_pending_render(None, false), Some(false));
+        assert_eq!(merge_pending_render(None, true), Some(true));
+        // A parked cached-content frame is upgraded by a full render...
+        assert_eq!(merge_pending_render(Some(true), false), Some(false));
+        // ...and stays cached when another cached request arrives.
+        assert_eq!(merge_pending_render(Some(true), true), Some(true));
+        // A parked full render is never downgraded by a cached request.
+        assert_eq!(merge_pending_render(Some(false), true), Some(false));
+        assert_eq!(merge_pending_render(Some(false), false), Some(false));
+    }
+
+    #[test]
+    fn rapid_requests_coalesce_into_a_single_frame() {
+        let output = Arc::new(Mutex::new(String::new()));
+        let terminal = RecordingTerminal {
+            output: output.clone(),
+        };
+        let tui = TuiAltScreen::new(Box::new(terminal), true, None);
+        let content = Arc::new(Text::new("first", 0, 0));
+        tui.set_layout_root(Some(content.clone()));
+        tui.enable_render_coalescing();
+        tui.start_readerless();
+        output.lock().unwrap().clear();
+
+        // A streaming burst: many requests, no painting until the host flush.
+        content.set_text("second");
+        for _ in 0..50 {
+            tui.request_render(false);
+        }
+        assert!(
+            output.lock().unwrap().is_empty(),
+            "parked requests must not repaint the transcript"
+        );
+
+        // The host flush paints exactly one frame and clears what was owed.
+        assert!(tui.flush_pending_render());
+        let rendered = output.lock().unwrap().clone();
+        assert!(rendered.contains("second"));
+        assert!(!tui.flush_pending_render(), "nothing owed after the flush");
+    }
+
+    #[test]
+    fn immediate_render_discards_a_parked_frame() {
+        let output = Arc::new(Mutex::new(String::new()));
+        let terminal = RecordingTerminal {
+            output: output.clone(),
+        };
+        let tui = TuiAltScreen::new(Box::new(terminal), true, None);
+        let content = Arc::new(Text::new("before", 0, 0));
+        tui.set_layout_root(Some(content.clone()));
+        tui.enable_render_coalescing();
+        tui.start_readerless();
+        output.lock().unwrap().clear();
+
+        content.set_text("after");
+        tui.request_render(false);
+        // An immediate frame (keyboard input, selector open) wins over the
+        // parked one instead of rendering the same content twice.
+        tui.render_now(true);
+
+        assert!(output.lock().unwrap().contains("after"));
+        assert!(!tui.flush_pending_render());
+    }
+
+    /// End-to-end throttle check on the real scheduler thread. Each frame emits
+    /// exactly one synchronized-output opener (`\x1b[?2026h`), so counting those
+    /// counts painted frames. Before the throttle, every one of the 200
+    /// "streamed deltas" repainted the whole transcript.
+    #[test]
+    fn streaming_burst_paints_at_most_one_frame_per_interval() {
+        let output = Arc::new(Mutex::new(String::new()));
+        let terminal = RecordingTerminal {
+            output: output.clone(),
+        };
+        let tui = Arc::new(TuiAltScreen::new(Box::new(terminal), true, None));
+        let content = Arc::new(Text::new("0", 0, 0));
+        tui.set_layout_root(Some(content.clone()));
+        tui.start_render_scheduler();
+        tui.start_readerless();
+        output.lock().unwrap().clear();
+
+        for i in 0..200 {
+            content.set_text(&format!("delta {i}"));
+            tui.request_render(false);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+
+        let frames = output.lock().unwrap().matches("\x1b[?2026h").count();
+        assert!(frames >= 1, "the scheduler must still paint frames");
+        assert!(
+            frames <= 40,
+            "200 requests in ~250 ms must coalesce into ~16 ms frames, painted {frames}"
+        );
+        tui.stop(TuiStopOptions::default());
     }
 }

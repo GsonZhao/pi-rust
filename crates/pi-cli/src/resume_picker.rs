@@ -61,6 +61,9 @@ pub async fn select(cwd: &Path) -> Result<Option<String>, String> {
         None,
     ));
     tui.set_layout_root(Some(root));
+    // Short-lived selector, but the same native-pi frame throttle applies: its
+    // keystroke bursts coalesce instead of repainting per keypress.
+    tui.start_render_scheduler();
     tui.start_readerless();
 
     let input_tui = tui.clone();

@@ -24,6 +24,11 @@ pub struct MarkdownOptions {
     pub code_block_indent: usize,
     /// Maximum width for wrapping (None = use the render width passed in).
     pub max_width: Option<usize>,
+    /// Base SGR sequence applied to every rendered line (e.g. the dim italic
+    /// style used for thinking blocks). Empty means no base style. The sequence
+    /// is re-applied after every nested SGR reset so inner spans (inline code,
+    /// links, headings) do not permanently drop the enclosing style.
+    pub base_style: String,
 }
 
 impl Default for MarkdownOptions {
@@ -31,6 +36,7 @@ impl Default for MarkdownOptions {
         Self {
             code_block_indent: 2,
             max_width: None,
+            base_style: String::new(),
         }
     }
 }
@@ -67,6 +73,39 @@ impl Markdown {
             padding_x,
             padding_y,
         }
+    }
+
+    /// Apply a base SGR sequence (for example the dim italic ``\x1b[3m\x1b[38;5;244m``
+    /// style) to every rendered line. The base style is re-opened after each
+    /// nested SGR reset so inner spans like inline code or links do not drop it
+    /// for the remainder of the line.
+    pub fn with_base_style(mut self, base_style: impl Into<String>) -> Self {
+        self.options.base_style = base_style.into();
+        self
+    }
+
+    /// Wrap one rendered line with the configured base style, re-opening the
+    /// base after every nested `SGR 0` reset. Returns the line unchanged when
+    /// no base style is configured.
+    fn apply_base_style(&self, line: &str) -> String {
+        let base = self.options.base_style.as_str();
+        if base.is_empty() {
+            return line.to_string();
+        }
+        let reset = "\x1b[0m";
+        let mut out = String::with_capacity(line.len() + base.len() * 4 + reset.len());
+        out.push_str(base);
+        let mut rest = line;
+        while let Some(idx) = rest.find(reset) {
+            out.push_str(&rest[..idx + reset.len()]);
+            out.push_str(base);
+            rest = &rest[idx + reset.len()..];
+        }
+        out.push_str(rest);
+        // Terminate the line so the base style cannot bleed into the next row
+        // (rendered lines are written back-to-back with no implicit reset).
+        out.push_str(reset);
+        out
     }
 
     /// Set the content.
@@ -292,6 +331,14 @@ impl Markdown {
 
         if lines.is_empty() {
             lines.push(String::new());
+        }
+
+        // Apply the configured base style (e.g. the dim italic thinking style)
+        // per rendered line, re-opening it after every nested reset.
+        if !self.options.base_style.is_empty() {
+            for line in lines.iter_mut() {
+                *line = self.apply_base_style(line);
+            }
         }
 
         lines
@@ -898,7 +945,11 @@ mod tests {
 
     #[test]
     fn code_fence_language_metadata_is_not_rendered() {
-        let md = Markdown::new("```text\nplain block\n```\n\n```bash\necho hello\n```", 0, 0);
+        let md = Markdown::new(
+            "```text\nplain block\n```\n\n```bash\necho hello\n```",
+            0,
+            0,
+        );
         let plain = crate::ansi::strip_ansi(&md.render(80).join("\n"));
         assert!(plain.contains("plain block"));
         assert!(plain.contains("echo hello"));
@@ -1076,5 +1127,42 @@ mod tests {
             plain.contains("a|b"),
             "code pipe split a table cell: {plain}"
         );
+    }
+
+    #[test]
+    fn test_base_style_reopened_after_inline_code_reset() {
+        // Regression: inline code (and other colored spans) terminate with an
+        // `SGR 0` reset, which used to drop the enclosing base style for the
+        // rest of the line. The base must be re-opened after that reset.
+        let base = "\x1b[3m\x1b[38;5;244m";
+        let md = Markdown::new("think `code` after", 0, 0).with_base_style(base);
+        let rendered = md.render(80).join("\n");
+        let after = rendered
+            .split("code")
+            .nth(1)
+            .expect("inline code not rendered");
+        assert!(
+            after.contains("\x1b[38;5;244m"),
+            "base style not reopened after inline code: {rendered:?}"
+        );
+        assert!(
+            rendered.ends_with("\x1b[0m"),
+            "rendered line must be reset-terminated: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn test_base_style_applies_to_every_line() {
+        // Multi-paragraph thinking must carry the base style on every line,
+        // not just the first text run.
+        let base = "\x1b[3m\x1b[38;5;244m";
+        let md = Markdown::new("first thought\n\nsecond thought", 0, 0).with_base_style(base);
+        let lines = md.render(80);
+        for line in lines.iter().filter(|l| !l.is_empty()) {
+            assert!(
+                line.contains("\x1b[38;5;244m"),
+                "base style missing on line: {line:?}"
+            );
+        }
     }
 }

@@ -946,6 +946,15 @@ pub struct ReloadOutcome {
     pub summary: String,
     /// True iff at least one extension load warning fired (ABI mismatch / skip).
     pub had_warnings: bool,
+    /// Formatted diagnostic lines (package / skill / prompt-template warnings)
+    /// that the caller should surface in its UI. Kept out of `eprintln!`
+    /// because the TUI owns the terminal: direct stderr writes during a run
+    /// would corrupt the alternate-screen input row.
+    pub details: Vec<String>,
+    /// True iff the reload itself failed hard (e.g. the extension build or
+    /// settings reload errored) and the previous resources were kept. Soft
+    /// diagnostics (skill shadowing, name validation) do not set this.
+    pub had_errors: bool,
 }
 
 struct PreparedReloadInputs {
@@ -1015,6 +1024,8 @@ where
                     dev.package_name()
                 ),
                 had_warnings: true,
+                details: Vec::new(),
+                had_errors: true,
             };
         }
     }
@@ -1028,6 +1039,8 @@ where
                     "Settings reload failed: {error}. Keeping the currently loaded resources."
                 ),
                 had_warnings: true,
+                details: Vec::new(),
+                had_errors: true,
             };
         }
     };
@@ -1196,31 +1209,34 @@ where
         format_project_context(&files)
     };
 
+    let mut details: Vec<String> = Vec::new();
     if !skill_diags.is_empty()
         || !prompt_diags.is_empty()
         || !package_resources.diagnostics.is_empty()
     {
         warnings = true;
-        if effective_args.verbose {
-            for d in &package_resources.diagnostics {
-                eprintln!("warning: package {}: {}", d.spec, d.message);
-            }
-            for d in &skill_diags {
-                eprintln!(
-                    "warning: skill {} ({}): {}",
-                    d.path,
-                    d.code.as_str(),
-                    d.message
-                );
-            }
-            for d in &prompt_diags {
-                eprintln!(
-                    "warning: prompt template {} ({}): {}",
-                    d.path,
-                    d.code.as_str(),
-                    d.message
-                );
-            }
+        // Collect formatted diagnostics for the caller to surface in its UI
+        // instead of writing to stderr directly: the TUI owns the terminal,
+        // and a raw `eprintln!` during a run would scribble over the
+        // alternate-screen input row.
+        for d in &package_resources.diagnostics {
+            details.push(format!("warning: package {}: {}", d.spec, d.message));
+        }
+        for d in &skill_diags {
+            details.push(format!(
+                "warning: skill {} ({}): {}",
+                d.path,
+                d.code.as_str(),
+                d.message
+            ));
+        }
+        for d in &prompt_diags {
+            details.push(format!(
+                "warning: prompt template {} ({}): {}",
+                d.path,
+                d.code.as_str(),
+                d.message
+            ));
         }
     }
 
@@ -1339,6 +1355,10 @@ where
     ReloadOutcome {
         summary,
         had_warnings: warnings,
+        details,
+        // Reload completed; any diagnostics here are soft (shadowing / name
+        // validation / skipped optional resources), not hard failures.
+        had_errors: false,
     }
 }
 

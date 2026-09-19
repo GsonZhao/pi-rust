@@ -726,6 +726,14 @@ impl AgentHarness {
         }
     }
 
+    /// Enqueue a message into a steering/follow-up queue, **requiring an active run**.
+    ///
+    /// This implementation is now **unused** after aligning with native pi's
+    /// design: `steer()` and `follow_up()` now enqueue unconditionally,
+    /// mirroring the TS Agent class and avoiding the race between `activeRun`
+    /// clearing and the TUI status check. The function is kept for reference
+    /// and for potential future queue kinds that may need the active-run guard.
+    #[allow(dead_code)]
     async fn enqueue_active(
         &self,
         message: AgentMessage,
@@ -1963,11 +1971,49 @@ impl AgentLane for AgentHarness {
     }
 
     async fn steer(&self, message: AgentMessage) -> HarnessResult<QueueResult> {
-        self.enqueue_active(message, QueueKind::Steer).await
+        // Mirror native pi's steering queue: enqueue unconditionally, even when
+        // the run has ended. The loop drains via `getSteeringMessages` at each
+        // tool-batch boundary, and a message that lands after the run finishes
+        // stays queued for the next explicit run. This avoids the race between
+        // `activeRun` clearing and the TUI's status check that used to send
+        // messages to `next_run_queue` (which never auto-wakes).
+        let (entry_id, queue) = {
+            let inner = self.inner.lock().unwrap();
+            if inner.closed {
+                return Err(HarnessError::closed());
+            }
+            (
+                self.session.id_generator().next(),
+                Arc::clone(&inner.steering_queue),
+            )
+        };
+        queue.lock().unwrap().pending.push_back(QueuedMessage {
+            entry_id: entry_id.clone(),
+            lane: self.lane.clone(),
+            message,
+        });
+        Ok(QueueResult { entry_id })
     }
 
     async fn follow_up(&self, message: AgentMessage) -> HarnessResult<QueueResult> {
-        self.enqueue_active(message, QueueKind::FollowUp).await
+        // Same as steer: unconditional enqueue, drained by `getFollowUpMessages`
+        // after the loop would otherwise stop.
+        let (entry_id, queue) = {
+            let inner = self.inner.lock().unwrap();
+            if inner.closed {
+                return Err(HarnessError::closed());
+            }
+            (
+                self.session.id_generator().next(),
+                Arc::clone(&inner.follow_up_queue),
+            )
+        };
+        queue.lock().unwrap().pending.push_back(QueuedMessage {
+            entry_id: entry_id.clone(),
+            lane: self.lane.clone(),
+            message,
+        });
+        Ok(QueueResult { entry_id })
     }
 
     async fn next_run(&self, message: AgentMessage) -> HarnessResult<QueueResult> {

@@ -497,10 +497,19 @@ mod tools {
     /// Parse a known builtin tool's args JSON into a compact arg summary.
     /// Returns "" when there's nothing useful to show (e.g. unknown tool or
     /// empty args) so the caller can fall back to a header with no summary.
+    ///
+    /// Handles both complete and incomplete (streaming) JSON — when the args
+    /// are still streaming, we fall back to a simple string search for the
+    /// key fields so the header can show the file path even before the JSON
+    /// is fully received.
     pub fn parse_args_summary(tool: &str, args_json: &str) -> String {
         let map = match parse_json_object(args_json) {
             Some(m) => m,
-            None => return String::new(),
+            None => {
+                // JSON is incomplete (streaming) — fall back to simple
+                // string extraction for the key field.
+                return extract_incomplete_args(tool, args_json);
+            }
         };
         let get = |k: &str| field(&map, k);
         match tool {
@@ -547,6 +556,103 @@ mod tools {
                 map.into_iter().next().map(|(_, v)| v).unwrap_or_default()
             }
         }
+    }
+
+    /// Extract a summary from incomplete/streaming JSON by simple string matching.
+    /// This is a fallback when the JSON is not yet complete (streaming in progress).
+    /// We use regex-like pattern matching to extract key fields like "path".
+    fn extract_incomplete_args(tool: &str, args_json: &str) -> String {
+        match tool {
+            "read" | "write" | "edit" | "ls" => {
+                extract_string_field(args_json, "path")
+            }
+            "find" => {
+                let pattern = extract_string_field(args_json, "pattern");
+                let path = extract_string_field(args_json, "path");
+                if path.is_empty() {
+                    pattern
+                } else if pattern.is_empty() {
+                    path
+                } else {
+                    format!("{} · {}", pattern, path)
+                }
+            }
+            "grep" => {
+                let pattern = extract_string_field(args_json, "pattern");
+                let path = extract_string_field(args_json, "path");
+                let glob = extract_string_field(args_json, "glob");
+                let mut parts = vec![pattern];
+                if !glob.is_empty() {
+                    parts.push(format!("glob {}", glob));
+                }
+                if !path.is_empty() {
+                    parts.push(path);
+                }
+                parts.join(" · ")
+            }
+            "bash" => extract_string_field(args_json, "command"),
+            _ => extract_any_string_field(args_json),
+        }
+    }
+
+    /// Extract a string field value from JSON using simple pattern matching.
+    /// Looks for patterns like `"key":"value"` or `"key": "value"`.
+    /// This is a best-effort extraction for incomplete/streaming JSON.
+    fn extract_string_field(json: &str, key: &str) -> String {
+        // Pattern 1: "key":"value" (no space)
+        let pattern1 = format!("\"{}\":\"", key);
+        if let Some(start) = json.find(&pattern1) {
+            let value_start = start + pattern1.len();
+            let remaining = &json[value_start..];
+            if let Some(end) = remaining.find('"') {
+                let value = &remaining[..end];
+                // Unescape common JSON escapes
+                return value
+                    .replace("\\\"", "\"")
+                    .replace("\\\\", "\\")
+                    .replace("\\n", "\n")
+                    .replace("\\t", "\t");
+            }
+        }
+
+        // Pattern 2: "key": "value" (with space)
+        let pattern2 = format!("\"{}\": \"", key);
+        if let Some(start) = json.find(&pattern2) {
+            let value_start = start + pattern2.len();
+            let remaining = &json[value_start..];
+            if let Some(end) = remaining.find('"') {
+                let value = &remaining[..end];
+                // Unescape common JSON escapes
+                return value
+                    .replace("\\\"", "\"")
+                    .replace("\\\\", "\\")
+                    .replace("\\n", "\n")
+                    .replace("\\t", "\t");
+            }
+        }
+
+        String::new()
+    }
+
+    /// Extract any string field value from incomplete JSON.
+    /// Used as a fallback for unknown tools.
+    fn extract_any_string_field(json: &str) -> String {
+        // Look for the first string value pattern: "something":"value"
+        let pattern = "\":\"";
+        if let Some(start) = json.find(pattern) {
+            let value_start = start + pattern.len();
+            let remaining = &json[value_start..];
+            if let Some(end) = remaining.find('"') {
+                let value = &remaining[..end];
+                // Unescape common JSON escapes
+                return value
+                    .replace("\\\"", "\"")
+                    .replace("\\\\", "\\")
+                    .replace("\\n", "\n")
+                    .replace("\\t", "\t");
+            }
+        }
+        String::new()
     }
 
     /// Look up a field's value (unquoted) in a parsed object map.

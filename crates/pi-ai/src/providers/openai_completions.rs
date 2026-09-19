@@ -308,6 +308,14 @@ fn build_request(model: &Model, ctx: &Context, opts: &SimpleStreamOptions) -> Va
                         _ => None,
                     })
                     .collect();
+                // Strict OpenAI-compatible gateways (DeepSeek, etc.) reject an
+                // assistant message that has neither `content` nor
+                // `tool_calls`. An aborted/empty turn yields exactly that, so
+                // drop it rather than sending an invalid request.
+                if assistant_content.is_null() && tool_calls.is_empty() {
+                    last_was_tool_result = false;
+                    continue;
+                }
                 let mut value = json!({
                     "role": "assistant",
                     "content": assistant_content,
@@ -955,8 +963,8 @@ mod tests {
     use super::*;
     use crate::model::OpenaiCompletionsCompat;
     use crate::types::{
-        ImageContent, ImageContentType, Message, Tool, ToolResultMessage, ToolResultRole,
-        UserMessage,
+        AssistantMessage, ImageContent, ImageContentType, Message, StopReason, Tool,
+        ToolResultMessage, ToolResultRole, UserMessage,
     };
 
     fn model() -> Model {
@@ -1035,6 +1043,36 @@ mod tests {
         assert_eq!(body["reasoning_effort"], "high");
         assert_eq!(body["max_completion_tokens"], 1024);
         assert_eq!(body["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn drops_empty_aborted_assistant_messages() {
+        // A stopped/aborted turn leaves a terminal assistant message with no
+        // content and no tool calls in context. DeepSeek (and other strict
+        // OpenAI-compatible gateways) reject that shape with
+        // "content or tool_calls must be set", so it must be omitted.
+        let aborted = AssistantMessage::terminal(
+            Api::OpenaiCompletions,
+            "gateway",
+            "gpt-test",
+            StopReason::Aborted,
+            "cancelled",
+            1,
+        );
+        let context = Context::new(vec![
+            Message::User(UserMessage::new("hello", 0)),
+            Message::Assistant(Box::new(aborted)),
+            Message::User(UserMessage::new("try again", 2)),
+        ]);
+
+        let body = build_request(&model(), &context, &SimpleStreamOptions::default());
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[1]["role"], "user");
+        assert!(messages
+            .iter()
+            .all(|message| message["role"] != "assistant"));
     }
 
     #[test]

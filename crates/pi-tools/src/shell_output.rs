@@ -165,11 +165,19 @@ impl CaptureState {
 /// Sanitize a chunk: drop C0 controls (except TAB/LF/CR) and interlinear
 /// annotation chars (U+FFF9..U+FFFB), then strip all CR. Mirrors
 /// `sanitizeBinaryOutput` + the per-chunk `.replace(/\r/g, "")`.
+///
+/// ANSI escape sequences are consumed whole rather than having just their
+/// leading ESC byte (a C0 control) dropped: dropping only ESC left the
+/// sequence body behind, so colored output (e.g. `vite` build logs) surfaced
+/// as literal `[36m`-style garbage in the tool response.
 fn sanitize_and_strip_cr(chunk: &str) -> String {
     let mut out = String::with_capacity(chunk.len());
-    for c in chunk.chars() {
+    let mut chars = chunk.chars().peekable();
+    while let Some(c) = chars.next() {
         let u = c as u32;
-        if u == 0x09 || u == 0x0a || u == 0x0d {
+        if c == '\x1b' {
+            skip_escape_sequence(&mut chars);
+        } else if u == 0x09 || u == 0x0a || u == 0x0d {
             out.push(c);
         } else if u <= 0x1f {
             // other C0 controls → drop
@@ -180,6 +188,49 @@ fn sanitize_and_strip_cr(chunk: &str) -> String {
         }
     }
     out.replace('\r', "")
+}
+
+/// Consume one ANSI escape sequence, starting just after the ESC byte the
+/// caller already read. Handles CSI (`ESC [ … final`), OSC (`ESC ] … BEL |
+/// `ESC \`), and charset designators (`ESC ( X`); any other escape swallows a
+/// single following char.
+fn skip_escape_sequence(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    match chars.peek() {
+        Some('[') => {
+            chars.next();
+            // CSI: parameter/intermediate bytes, terminated by a final byte in
+            // the 0x40..=0x7E range.
+            while let Some(c) = chars.next() {
+                if (0x40..=0x7e).contains(&(c as u32)) {
+                    break;
+                }
+            }
+        }
+        Some(']') => {
+            chars.next();
+            // OSC: terminated by BEL (0x07) or ST (ESC \).
+            while let Some(c) = chars.next() {
+                if c == '\x07' {
+                    break;
+                }
+                if c == '\x1b' {
+                    if let Some('\\') = chars.peek() {
+                        chars.next();
+                    }
+                    break;
+                }
+            }
+        }
+        Some('(') | Some(')') => {
+            // Charset designator: ESC ( or ESC ) followed by one char.
+            chars.next();
+            chars.next();
+        }
+        Some(_) => {
+            chars.next();
+        }
+        None => {}
+    }
 }
 
 /// Mirrors `executeShellWithCapture`. Drives `env.exec` with on_stdout/on_stderr
@@ -392,6 +443,22 @@ mod tests {
         let s = "a\u{fff9}b\u{fffb}c";
         let out = sanitize_and_strip_cr(&s);
         assert_eq!(out, "abc");
+    }
+
+    #[test]
+    fn sanitize_strips_full_ansi_sequences() {
+        // Regression: dropping only the ESC byte used to leave `[36m`-style
+        // literal garbage in the captured/output text.
+        let s = "\x1b[36mvite v6.4.3\x1b[39m \x1b[32m\u{2713}\x1b[39m built\n";
+        assert_eq!(sanitize_and_strip_cr(s), "vite v6.4.3 \u{2713} built\n");
+        let s = "a\x1b[1m\x1b[2mX\x1b[22m\x1b[22mb";
+        assert_eq!(sanitize_and_strip_cr(s), "aXb");
+    }
+
+    #[test]
+    fn sanitize_strips_osc_sequences() {
+        assert_eq!(sanitize_and_strip_cr("a\x1b]0;title\x07b"), "ab");
+        assert_eq!(sanitize_and_strip_cr("a\x1b]8;;http://x\x1b\\b"), "ab");
     }
 
     #[test]

@@ -261,17 +261,21 @@ impl AssistantMessageComponent {
                     } else {
                         // Render the joined thinking as one dim italic markdown
                         // section — the TS `color: thinkingText, italic: true`
-                        // styling, applied via the thinking-text color + italic
-                        // wrapper around the markdown lines.
+                        // styling. The base style must be applied per rendered
+                        // line (not by wrapping the whole markdown source with
+                        // ANSI): the renderer's inner spans (inline code,
+                        // links, headings) emit `SGR 0` resets, which would
+                        // otherwise drop the enclosing italic/color from the
+                        // rest of the block.
                         let body = joined.join("\n\n");
                         // B5e: transform the PLAIN thinking markdown first (the
-                        // plugin must see markdown, not ANSI), then apply the
-                        // thinking-text color + italic wrap around the
-                        // transformed text — same order as the text block
-                        // (transform → style → render).
+                        // plugin must see markdown, not ANSI).
                         let transformed = self.transform_markdown(&body);
-                        let wrapped = italic(&theme().colors.thinking_text.fg(&transformed));
-                        let md = Arc::new(Markdown::new(wrapped, opts.output_pad, 0));
+                        let base_style = format!("\x1b[3m{}", theme().colors.thinking_text.to_fg());
+                        let md = Arc::new(
+                            Markdown::new(transformed, opts.output_pad, 0)
+                                .with_base_style(base_style),
+                        );
                         self.content_container.add_child(md);
                     }
 
@@ -452,6 +456,32 @@ mod tests {
         assert!(
             think_pos < text_pos,
             "thinking should precede text: {joined}"
+        );
+    }
+
+    #[test]
+    fn test_thinking_style_survives_inline_code_reset() {
+        // Regression: the thinking base style used to be applied by wrapping
+        // the whole markdown source with ANSI. Inline code emits an `SGR 0`
+        // reset, which dropped the italic + thinking color for the rest of the
+        // block. The base style must be re-opened after that reset.
+        let msg = AssistantMessageComponent::default();
+        msg.update_blocks(&[AssistantBlock::Thinking(
+            "consider `render_inline` then keep thinking".to_string(),
+        )]);
+        let rendered = msg.render(80).join("\n");
+        let fg = theme().colors.thinking_text.to_fg();
+        let after_code = rendered
+            .split("render_inline")
+            .nth(1)
+            .expect("inline code not rendered");
+        assert!(
+            after_code.contains("keep thinking"),
+            "text after inline code missing: {rendered:?}"
+        );
+        assert!(
+            after_code.contains("\x1b[3m") && after_code.contains(&fg),
+            "thinking italic/color lost after inline code: {rendered:?}"
         );
     }
 
