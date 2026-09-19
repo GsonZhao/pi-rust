@@ -202,26 +202,40 @@ pub async fn run() -> i32 {
     if let Some(search) = parsed.list_models.as_deref() {
         return list_models(search).await;
     }
-
     // Build before provider resolution so compiler errors do not require
     // valid model credentials. The staged directory joins normal discovery.
+    //
+    // When no Cargo cdylib is found, `rpi dev-local` falls back to skills-only
+    // mode (--no-extensions + local_only): project skills/prompts still load.
     let dev_extension = if let Some(options) = &dev_options {
-        let extension = match crate::dev_extension::DevExtension::detect(&cwd, options) {
-            Ok(extension) => extension,
-            Err(error) => {
-                eprintln!("error: {error}");
-                return EXIT_USAGE;
+        match crate::dev_extension::DevExtension::detect(&cwd, options) {
+            Ok(extension) => {
+                if let Err(error) = extension.rebuild() {
+                    eprintln!("error: initial extension build failed: {error}");
+                    return EXIT_RUNTIME;
+                }
+                if let Err(error) = extension.apply_to_args(&mut parsed) {
+                    eprintln!("error: {error}");
+                    return EXIT_RUNTIME;
+                }
+                Some(extension)
             }
-        };
-        if let Err(error) = extension.rebuild() {
-            eprintln!("error: initial extension build failed: {error}");
-            return EXIT_RUNTIME;
+            Err(error) => {
+                // `rpi dev-local` without a Cargo cdylib: degrade to skills-only
+                if options.local_only {
+                    eprintln!("dev: {error}");
+                    eprintln!("dev: no Cargo cdylib found; running in skills-only mode");
+                    parsed.dev_local_only = true;
+                    parsed.no_extensions = true;
+                    parsed.extensions_dir.clear();
+                    parsed.extension.clear();
+                    None
+                } else {
+                    eprintln!("error: {error}");
+                    return EXIT_USAGE;
+                }
+            }
         }
-        if let Err(error) = extension.apply_to_args(&mut parsed) {
-            eprintln!("error: {error}");
-            return EXIT_RUNTIME;
-        }
-        Some(extension)
     } else {
         None
     };
