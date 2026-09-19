@@ -18,7 +18,7 @@ use crate::dynamic_border::DynamicBorder;
 use crate::loader::Loader;
 use crate::spacer::Spacer;
 use crate::theme::theme;
-use crate::utils::truncate_to_width;
+use crate::utils::{truncate_to_width, wrap_text_with_ansi};
 use crate::visual_truncate::truncate_to_visual_lines;
 
 /// Preview line limit when collapsed (matches the TS `PREVIEW_LINES`).
@@ -208,8 +208,14 @@ impl Component for BashExecutionComponent {
         // Command header: "$ {command}" in accent.
         let command = self.command.lock().unwrap().clone();
         let header_text = format!("$ {command}");
-        let header_line = format!("  {}", colors.bash_mode.fg(&bold(&header_text)));
-        lines.push(truncate_to_width(&header_line, width, "…"));
+        // Commands can be far wider than a terminal (particularly generated
+        // PowerShell/Bash one-liners). Keep every character visible on wrapped
+        // rows instead of eliding the tail as soon as the running spinner is
+        // displayed below the header.
+        let header_width = width.saturating_sub(2).max(1);
+        for part in wrap_text_with_ansi(&header_text, header_width) {
+            lines.push(format!("  {}", colors.bash_mode.fg(&bold(&part))));
+        }
 
         // Output preview (collapsed: last PREVIEW_LINES visual lines;
         // expanded: all wrapped lines). Built from the captured raw output,
@@ -312,6 +318,18 @@ mod tests {
         let rendered = strip_ansi(&c.render(120).join("\n"));
         assert!(rendered.contains("printf '\\n--- agent skills ---\\n' && find skills"));
         assert!(!rendered.contains("$ printf\n"));
+    }
+
+    #[test]
+    fn long_running_command_wraps_instead_of_truncating() {
+        let command = "printf 'this command must remain fully visible while it runs'";
+        let c = BashExecutionComponent::new(command);
+        let lines = c.render(20);
+        let rendered = strip_ansi(&lines.join("\n"));
+        let compact: String = rendered.chars().filter(|ch| !ch.is_whitespace()).collect();
+        let expected: String = command.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(compact.contains(&expected), "command was truncated: {rendered}");
+        assert!(lines.iter().all(|line| crate::utils::visible_width(line) <= 20));
     }
 
     #[test]

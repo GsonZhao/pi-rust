@@ -756,21 +756,32 @@ fn run_action(
     let host = Arc::clone(&bridge.host);
     let ui_dialog = bridge.ui_dialog.clone();
     let reload_cb = bridge.reload.clone();
-    bridge.runtime.spawn(async move {
-        let r = if action == RuntimeActionId::Reload {
-            if let Some(cb) = reload_cb {
-                cb().await;
-                Ok(serde_json::Value::Null)
+    if action == RuntimeActionId::UiDialog {
+        // UiDialog is intentionally synchronous at the plugin ABI boundary:
+        // `open` waits until the TUI answers. Never park that wait inside the
+        // Tokio worker that services the bridge. A SEARCH/extension tool that
+        // invokes `ui_request/open` from a single-thread runtime would
+        // otherwise block the executor before the TUI can deliver the answer.
+        std::thread::spawn(move || {
+            let _ = tx.send(ui_dialog.handle(args));
+        });
+    } else {
+        bridge.runtime.spawn(async move {
+            let r = if action == RuntimeActionId::Reload {
+                if let Some(cb) = reload_cb {
+                    cb().await;
+                    Ok(serde_json::Value::Null)
+                } else {
+                    host.reload(args).await
+                }
             } else {
-                host.reload(args).await
-            }
-        } else {
-            dispatch(&host, &ui_dialog, action, args).await
-        };
-        // If the plugin thread already moved on (dropped rx), discard — a send
-        // error is NOT a host fault.
-        let _ = tx.send(r);
-    });
+                dispatch(&host, &ui_dialog, action, args).await
+            };
+            // If the plugin thread already moved on (dropped rx), discard — a
+            // send error is NOT a host fault.
+            let _ = tx.send(r);
+        });
+    }
 
     let result = match rx.recv() {
         Ok(r) => r,

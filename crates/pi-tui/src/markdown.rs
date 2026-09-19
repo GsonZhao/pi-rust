@@ -144,16 +144,10 @@ impl Markdown {
                     code_fence_char = fence_char;
                     code_language = lang.to_ascii_lowercase();
                     mermaid_source.clear();
-                    // No decorative frame: a small language label is enough
-                    // chrome. For an unlabelled block, start directly with code.
-                    if !lang.is_empty() && code_language != "mermaid" {
-                        let panel_width = cwidth.saturating_sub(visible_width(&indent)).max(1);
-                        let header = colors.md_code_block_border.fg(&format!(" {lang}"));
-                        let header = apply_background_to_line(&header, panel_width, |text| {
-                            colors.md_code_block_bg.bg(text)
-                        });
-                        lines.push(format!("{pad}{indent}{header}"));
-                    }
+                    // Fence language names (for example `text`, `rust`, or
+                    // `bash`) are metadata, not code content. Keep ordinary
+                    // code blocks content-only; Mermaid renders its own
+                    // diagram label when the matching fence closes.
                 } else if fence_char == code_fence_char {
                     if code_language == "mermaid" {
                         let component = Mermaid::new(mermaid_source.join("\n"));
@@ -886,7 +880,7 @@ mod tests {
         let md = Markdown::new("```rust\nlet x = 1;\n```", 0, 0);
         let joined = md.render(80).join("\n");
         let plain = crate::ansi::strip_ansi(&joined);
-        assert!(plain.contains(" rust"), "missing language label: {plain}");
+        assert!(!plain.contains("rust"), "language label leaked: {plain}");
         assert!(plain.contains(" let x = 1;"), "missing code body: {plain}");
         assert!(
             !plain.contains(['╭', '╰', '│']),
@@ -900,6 +894,16 @@ mod tests {
             !plain.contains("```"),
             "literal fences should be hidden: {plain}"
         );
+    }
+
+    #[test]
+    fn code_fence_language_metadata_is_not_rendered() {
+        let md = Markdown::new("```text\nplain block\n```\n\n```bash\necho hello\n```", 0, 0);
+        let plain = crate::ansi::strip_ansi(&md.render(80).join("\n"));
+        assert!(plain.contains("plain block"));
+        assert!(plain.contains("echo hello"));
+        assert!(!plain.contains("text"), "text label leaked: {plain}");
+        assert!(!plain.contains("bash"), "bash label leaked: {plain}");
     }
 
     #[test]

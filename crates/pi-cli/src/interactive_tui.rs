@@ -2868,6 +2868,17 @@ fn assistant_text(msg: &AssistantMessage) -> String {
 
 /// The user message's text (Text content or the text blocks of a Blocks
 /// payload — images are skipped, consistent with the v1 text-only prompt path).
+fn tool_result_message_text(msg: &rpi_ai::types::ToolResultMessage) -> String {
+    msg.content
+        .iter()
+        .filter_map(|c| match c {
+            Content::Text(t) => Some(t.text.clone()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn user_message_text(msg: &rpi_ai::types::UserMessage) -> String {
     match &msg.content {
         rpi_ai::types::UserContent::Text(s) => s.clone(),
@@ -3811,6 +3822,23 @@ async fn render_session_history(
                     if let Some(text) = extension_usage_text(extension_session.as_ref(), &a.usage) {
                         add_note_message(chat, &text);
                     }
+                    if let Some(error) = assistant_error_text(a) {
+                        add_error_message(chat, &error);
+                    }
+                    rendered_any = true;
+                }
+                AgentMessage::ToolResult(result) => {
+                    // Tool results are persisted as separate message entries,
+                    // not as part of the assistant text. Restore them as
+                    // completed tool panels so resumed sessions show the
+                    // command output as well as the user's prompts.
+                    let comp = Arc::new(ToolExecutionComponent::new(
+                        &result.tool_name,
+                        "",
+                    ));
+                    comp.set_result(&tool_result_message_text(result), result.is_error);
+                    chat.add_child(comp);
+                    chat.add_child(Arc::new(Spacer::new(1)));
                     rendered_any = true;
                 }
                 AgentMessage::Custom(custom) => {
@@ -3834,7 +3862,6 @@ async fn render_session_history(
                     add_note_message(chat, &custom_message_fallback(&custom));
                     rendered_any = true;
                 }
-                _ => {}
             },
             Entry::Compaction(compaction) => {
                 add_note_message(
@@ -5196,10 +5223,11 @@ pub async fn interactive_tui(
                     tui.request_render(false);
                 }
             });
-            add_note_message(
-                &ctx_for_cb.chat,
-                &format!("Queued steering message: {text}"),
-            );
+            // A queued prompt is still the user's message. Render it through
+            // the same transcript path as an immediately sent prompt rather
+            // than as a system-note row, so its bubble/markdown presentation
+            // stays consistent while the agent is busy.
+            add_user_message(&ctx_for_cb.chat, text);
             ctx_for_cb.tui.request_render(false);
             return;
         }
@@ -5919,10 +5947,9 @@ pub async fn interactive_tui(
                         let _ = tx_for_key.send(TuiMessage::UserInput(prompt));
                     }
                 } else {
-                    add_note_message(
-                        &state_for_key.chat_container,
-                        &format!("Queued follow-up message: {prompt}"),
-                    );
+                    // Follow-ups are user prompts too; retain the normal
+                    // submitted-message rendering while they wait in queue.
+                    add_user_message(&state_for_key.chat_container, &prompt);
                     let message = AgentMessage::User(UserMessage::new(prompt, 0));
                     let lane = lane_for_key.clone();
                     let chat = state_for_key.chat_container.clone();
@@ -6789,7 +6816,13 @@ async fn handle_agent_event(
                             }
                             saw_bash_tool_call = true;
                             let mut bash = state.bash_components.lock().unwrap();
-                            if !bash.contains_key(&tc.id) {
+                            if let Some(existing) = bash.get(&tc.id) {
+                                // Tool-call arguments arrive incrementally.
+                                // Refresh the running panel from every full
+                                // assistant snapshot instead of leaving its
+                                // header on the first partial command.
+                                existing.set_command(command);
+                            } else {
                                 let comp = Arc::new(BashExecutionComponent::new(command));
                                 comp.set_expanded(*state.tool_outputs_expanded.lock().unwrap());
                                 chat.add_child(comp.clone());
@@ -6797,12 +6830,19 @@ async fn handle_agent_event(
                             }
                         } else {
                             let mut tools = state.tool_components.lock().unwrap();
-                            if !tools.contains_key(&tc.id) {
-                                let display_args = if is_ask_user_tool(&tc.name) {
-                                    ask_user_args_display(&tc.arguments)
-                                } else {
-                                    tc.arguments.to_string()
-                                };
+                            let display_args = if is_ask_user_tool(&tc.name) {
+                                ask_user_args_display(&tc.arguments)
+                            } else {
+                                tc.arguments.to_string()
+                            };
+                            if let Some(existing) = tools.get(&tc.id) {
+                                // Regular tool arguments stream incrementally
+                                // too, so refresh their live header as soon as
+                                // a more complete snapshot arrives.
+                                if !display_args.trim().is_empty() && display_args.trim() != "{}" {
+                                    existing.set_args(&display_args);
+                                }
+                            } else {
                                 let comp = Arc::new(ToolExecutionComponent::new(
                                     &tc.name,
                                     &display_args,
@@ -6982,6 +7022,11 @@ async fn handle_agent_event(
                 // glyph, cramming e.g. `ls -la`'s listing onto one line.
                 let chunk = partial_text;
                 if let Some(bash) = state.bash_components.lock().unwrap().get(&tool_call_id) {
+                    // Lifecycle updates can contain a more complete args object
+                    // than the snapshot that created this running panel.
+                    if let Some(command) = args.get("command").and_then(|v| v.as_str()) {
+                        bash.set_command(command);
+                    }
                     if has_partial_payload {
                         bash.append_output(&chunk);
                     }
@@ -6999,6 +7044,8 @@ async fn handle_agent_event(
                 if is_ask_user_tool(&tool_name) {
                     comp.set_display_title("ASK USER");
                     comp.set_args(&ask_user_args_display(&args));
+                } else if args != serde_json::Value::Null && args != serde_json::json!({}) {
+                    comp.set_args(&args.to_string());
                 }
                 // Raw multi-line text — read/ls-style tools must show their
                 // full content, not the single-line ⏎-folded summary.
@@ -7161,6 +7208,12 @@ fn finalize_bash(
         truncated,
         full_output_path,
     };
+    // Some tool backends attach the authoritative command to result details.
+    // Backfill it before completing so this is a fallback, never the first
+    // opportunity for the UI to show the whole command.
+    if let Some(command) = result.details.get("command").and_then(|v| v.as_str()) {
+        comp.set_command(command);
+    }
     let cancelled = false; // cancellation surfaces via Abort/AgentEnd, not a bash detail
     comp.set_complete(exit_code, cancelled, truncation);
 }

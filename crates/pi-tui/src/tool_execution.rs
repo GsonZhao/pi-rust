@@ -241,9 +241,13 @@ impl Component for ToolExecutionComponent {
                 colors.muted.fg(chevron),
             )
         };
-        let header_content = truncate_to_width(&format!(" {}", head_parts), width, "…");
-        let header_line = apply_background_to_line(&header_content, width, |s| bg.bg(s));
-        lines.push(header_line);
+        // Do not sacrifice a long tool name/path summary for the running
+        // indicator. Tool calls often carry generated paths or extension
+        // names; wrap the header into panel rows so it remains inspectable.
+        let header_width = width.saturating_sub(1).max(1);
+        for part in wrap_text_with_ansi(&format!(" {}", head_parts), header_width) {
+            lines.push(apply_background_to_line(&part, width, |s| bg.bg(s)));
+        }
 
         // Expanded: the full args JSON (indented, dim) above the result. The
         // compact summary already lives in the header, so this is the
@@ -255,9 +259,9 @@ impl Component for ToolExecutionComponent {
                     colors.muted.fg("args:"),
                     colors.dim.fg(&pretty_args(&args))
                 );
-                let args_line = truncate_to_width(&args_line, width, "…");
-                let args_line = apply_background_to_line(&args_line, width, |s| bg.bg(s));
-                lines.push(args_line);
+                for part in wrap_text_with_ansi(&args_line, width.max(1)) {
+                    lines.push(apply_background_to_line(&part, width, |s| bg.bg(s)));
+                }
             }
         }
 
@@ -828,6 +832,20 @@ mod tests {
             "result text missing: {joined}"
         );
         assert!(joined.contains('✗'), "error glyph missing: {joined}");
+    }
+
+    #[test]
+    fn long_tool_header_wraps_instead_of_truncating() {
+        let title = "A VERY LONG EXTENSION TOOL NAME";
+        let tool = ToolExecutionComponent::new("extension_tool", "{}");
+        tool.set_display_title(title);
+        tool.set_running();
+        let lines = tool.render(16);
+        let rendered = crate::ansi::strip_ansi(&lines.join("\n"));
+        let compact: String = rendered.chars().filter(|ch| !ch.is_whitespace()).collect();
+        let expected: String = title.chars().filter(|ch| !ch.is_whitespace()).collect();
+        assert!(compact.contains(&expected), "header was truncated: {rendered}");
+        assert!(lines.iter().all(|line| crate::utils::visible_width(line) <= 16));
     }
 
     #[test]
