@@ -44,7 +44,7 @@ use rpi_tui::{
     AssistantMessageOptions, AutocompleteManager, AutocompleteSuggestions, BashExecutionComponent,
     BashTruncation, CombinedAutocompleteProvider, Component, Container, DynamicBorder, Editor,
     EditorOptions, EditorStyle, FilePathAutocompleteProvider, Focusable, FollowMode,
-    FooterComponent, Image, ImageOptions, Input, Loader, ProcessTerminal, ScrollView,
+    FooterComponent, Image, ImageOptions, Input, Loader, Markdown, ProcessTerminal, ScrollView,
     ScrollViewOptions, SelectItem, SelectList, SlashCommand as SlashCommandEntry,
     SlashCommandAutocompleteProvider, Spacer, StackChild, StackEntry, StatusIndicator, Text,
     ThemeManager, ThemePreset, ToolExecutionComponent, TuiAltScreen, UserMessageComponent, VStack,
@@ -1026,6 +1026,23 @@ fn extension_dialog_hint(label: &str) -> Arc<Text> {
     Arc::new(Text::new(current_theme().colors.muted.fg(label), 1, 0))
 }
 
+/// Markdown-aware version of `extension_dialog_title` for extension dialogs
+/// that may contain markdown content (tables, lists, bold, etc).
+fn extension_dialog_title_md(title: &str, bold: bool) -> Arc<dyn Component> {
+    let text = if bold {
+        format!("**{}**", title)
+    } else {
+        title.to_string()
+    };
+    Arc::new(Markdown::new(text, 1, 0))
+}
+
+/// Markdown-aware version of `extension_dialog_hint` for extension dialogs
+/// that may contain markdown content.
+fn extension_dialog_hint_md(label: &str) -> Arc<dyn Component> {
+    Arc::new(Markdown::new(label, 1, 0))
+}
+
 /// Take and run the cancellation callback for the active extension dialog.
 /// Taking it before invoking the callback breaks the temporary Arc cycle: the
 /// callback owns the command context so it can process a follow-up result.
@@ -1840,6 +1857,7 @@ fn parse_ask_user_prompt(request: &rpi_extensions::UiDialogRequest) -> AskUserPr
 }
 
 /// Build the shared header frame for an ask-user prompt.
+/// Uses markdown-aware rendering for question and context content.
 fn ask_user_frame(
     prompt: &AskUserPrompt,
     body: Arc<dyn Component>,
@@ -1849,16 +1867,16 @@ fn ask_user_frame(
     frame.add_child(Arc::new(DynamicBorder::new()));
     frame.add_child(Arc::new(Spacer::new(1)));
     if let Some(header) = prompt.header.as_deref() {
-        frame.add_child(extension_dialog_title(header, true));
+        frame.add_child(extension_dialog_title_md(header, true));
     }
     if !prompt.question.trim().is_empty() {
-        frame.add_child(extension_dialog_title(
+        frame.add_child(extension_dialog_title_md(
             &prompt.question,
             prompt.header.is_none(),
         ));
     }
     if let Some(context) = prompt.context.as_deref() {
-        frame.add_child(extension_dialog_hint(context));
+        frame.add_child(extension_dialog_hint_md(context));
     }
     frame.add_child(Arc::new(Spacer::new(1)));
     frame.add_child(body);
