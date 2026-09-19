@@ -221,19 +221,16 @@ pub async fn run() -> i32 {
                 Some(extension)
             }
             Err(error) => {
-                // `rpi dev-local` without a Cargo cdylib: degrade to skills-only
+                // No Cargo cdylib found: degrade to skills-only mode
+                eprintln!("dev: {error}");
+                eprintln!("dev: no Cargo cdylib found; running in skills-only mode");
+                parsed.no_extensions = true;
+                parsed.extensions_dir.clear();
+                parsed.extension.clear();
                 if options.local_only {
-                    eprintln!("dev: {error}");
-                    eprintln!("dev: no Cargo cdylib found; running in skills-only mode");
                     parsed.dev_local_only = true;
-                    parsed.no_extensions = true;
-                    parsed.extensions_dir.clear();
-                    parsed.extension.clear();
-                    None
-                } else {
-                    eprintln!("error: {error}");
-                    return EXIT_USAGE;
                 }
+                None
             }
         }
     } else {
