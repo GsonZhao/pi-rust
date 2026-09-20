@@ -1166,7 +1166,8 @@ macro_rules! export_plugin_v2 {
             api: *const $crate::PluginApiVt,
             abi_version: u32,
         ) -> i32 {
-            $crate::register_entrypoint(api, abi_version, $body)
+            // SAFETY: host guarantees `api` is valid for this call.
+            unsafe { $crate::register_entrypoint(api, abi_version, $body) }
         }
     };
 }
@@ -1185,7 +1186,12 @@ macro_rules! export_plugin_v2 {
 /// ```
 /// The helper performs the version check (return nonzero on mismatch) and
 /// null-checks `api` before invoking the plugin body.
-pub fn register_entrypoint(
+/// # Safety
+///
+/// `api` must be a valid, properly aligned pointer to a `PluginApiVt` that
+/// remains valid for the duration of the `body` call. The host is responsible
+/// for ensuring this invariant.
+pub unsafe fn register_entrypoint(
     api: *const PluginApiVt,
     abi_version: u32,
     body: impl FnOnce(&PluginApiVt) -> i32,
@@ -1198,10 +1204,8 @@ pub fn register_entrypoint(
     if api.is_null() {
         return 2;
     }
-    // SAFETY: the host guarantees `api` is valid for the register call and the
-    // plugin does not retain the borrow past `body` (it copies the fn pointers
-    // it needs).
-    let api = unsafe { &*api };
+    // SAFETY: caller guarantees `api` is valid; we additionally check for null.
+    let api = &*api;
     body(api)
 }
 
@@ -1225,8 +1229,8 @@ mod tests {
         }
         // Reconstruct the boxed slice and drop it.
         unsafe {
-            let slice = core::slice::from_raw_parts(s.ptr as *const u8, s.len);
-            let _ = Box::from_raw(slice as *const [u8] as *mut [u8]);
+            let slice = core::slice::from_raw_parts_mut(s.ptr as *mut u8, s.len);
+            let _ = Box::from_raw(slice as *mut [u8]);
         }
         FREED.with(|freed| freed.set(freed.get() + 1));
     }
@@ -1527,25 +1531,25 @@ mod tests {
         // An ABI v1 plugin/host mixture is refused before the v2 vtable is read.
         // A null pointer makes the ordering observable: checking `api` first
         // would return 2, while the required version-first path returns 1.
-        let rc = register_entrypoint(core::ptr::null(), 1, |_| {
+        let rc = unsafe { register_entrypoint(core::ptr::null(), 1, |_| {
             panic!("body must not run on version mismatch");
-        });
+        }) };
         assert_eq!(rc, 1);
 
         // A future version is rejected by the same pre-dereference check.
-        let rc = register_entrypoint(&vt, RPI_PLUGIN_ABI_VERSION + 1, |_| {
+        let rc = unsafe { register_entrypoint(&vt, RPI_PLUGIN_ABI_VERSION + 1, |_| {
             panic!("body must not run on version mismatch");
-        });
+        }) };
         assert_ne!(rc, 0);
 
         // Right version → body runs, rc propagated.
-        let rc = register_entrypoint(&vt, RPI_PLUGIN_ABI_VERSION, |_| 0);
+        let rc = unsafe { register_entrypoint(&vt, RPI_PLUGIN_ABI_VERSION, |_| 0) };
         assert_eq!(rc, 0);
-        let rc = register_entrypoint(&vt, RPI_PLUGIN_ABI_VERSION, |_| 42);
+        let rc = unsafe { register_entrypoint(&vt, RPI_PLUGIN_ABI_VERSION, |_| 42) };
         assert_eq!(rc, 42);
 
         // Null api → refuse.
-        let rc = register_entrypoint(core::ptr::null(), RPI_PLUGIN_ABI_VERSION, |_| 0);
+        let rc = unsafe { register_entrypoint(core::ptr::null(), RPI_PLUGIN_ABI_VERSION, |_| 0) };
         assert_ne!(rc, 0);
         let _ = reset_freed();
     }
