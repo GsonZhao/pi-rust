@@ -564,6 +564,10 @@ fn split_csv(v: &str) -> Vec<String> {
 /// else interactive. Here `stdin_is_tty`/`stdout_is_tty` come from
 /// `std::io::IsTerminal`.
 pub fn resolve_mode(parsed: &Args, stdin_is_tty: bool, stdout_is_tty: bool) -> RunMode {
+    // Check for --server flag (unknown flag stored in unknown_flags map)
+    if parsed.unknown_flags.contains_key("server") {
+        return RunMode::Rpc;
+    }
     if parsed.mode == Mode::Rpc {
         return RunMode::Rpc;
     }

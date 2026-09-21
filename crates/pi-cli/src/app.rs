@@ -427,11 +427,13 @@ pub async fn run() -> i32 {
             .await
         }
         RunMode::Rpc => {
-            // `--mode rpc` is parsed (so it doesn't hard-error) but not
-            // implemented in v1 — the JSON-RPC session protocol the TS
-            // `runRpcMode` drives is deferred.
-            eprintln!("error: rpc mode is not implemented in v1 (use --mode text or --mode json)");
-            EXIT_USAGE
+            // Headless server mode: no TUI, just keep the process alive.
+            // Extensions (e.g. rpi-server) handle the actual RPC logic.
+            eprintln!("[rpi] running in headless/rpc mode (no TUI)");
+            // Wait forever (Ctrl+C to stop)
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(3600));
+            }
         }
     };
 
