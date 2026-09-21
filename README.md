@@ -261,6 +261,10 @@ require package discovery.
   available for native integrations unless `--no-extensions` is supplied.
 - **Sessions:** JSONL v4 durable backend + in-memory ephemeral; compaction + a
   split-turn two-LLM-call invariant.
+- **Remote mode:** `rpi --server` runs the agent headless over TCP, and
+  `rpi --connect <host:port> [--token <t>]` attaches a zero-local-resource TUI
+  client (token auth; the token may also come from `RPI_SERVER_TOKEN`). See
+  [`docs/remote-mode.md`](docs/remote-mode.md).
 
 ## Configuration
 

@@ -134,6 +134,10 @@ ANTHROPIC_AUTH_TOKEN=token
 --no-extensions         禁用扩展加载
 --enable-pi-packages    启用配置中的 Pi JS/TS package（会启动 Node）
 --extensions-dir <dir>  额外扫描 Rust 扩展目录
+--server [--port <n>] [--bind <ip>]
+                        无头服务端（启动时打印 token）
+--connect <host:port>   远程客户端 TUI（零本地资源）
+--token <token>         远程认证 token（也支持环境变量 RPI_SERVER_TOKEN）
 ```
 
 子命令：
@@ -149,6 +153,22 @@ rpi update                 # 更新 rpi CLI 自身
 rpi package update         # 只更新 Rust 原生扩展
 rpi pi-package update      # 只更新 Pi npm/Git package
 ```
+
+### 远程模式（`--server` / `--connect`）
+
+把 agent 跑在无头服务端，另一个进程用 TUI 远程驱动。客户端**无任何本地 agent 资源**。
+
+```bash
+rpi --server --port 9899          # 服务端：启动时打印 token
+rpi --connect 127.0.0.1:9899 --token <token>   # 客户端
+
+# 或通过环境变量传递 token
+export RPI_SERVER_TOKEN=<token>
+rpi --connect 127.0.0.1:9899
+```
+
+服务端默认开启 token 认证（`--no-token` 可关闭）。完整协议、可用命令与限制见
+[`remote-mode.md`](remote-mode.md)。
 
 ## 4. 内置工具
 
@@ -383,6 +403,7 @@ rpi-plugin-sdk → rpi-extensions → rpi-tui → rpi-cli
 - 源码仓库：<https://github.com/bigfish1913/pi-rust>
 - Rust API：<https://docs.rs/rpi-agent>、<https://docs.rs/rpi-plugin-sdk>
 - Pi 参考实现：<https://github.com/earendil-works/pi>
+- 远程模式（`--server` / `--connect` / `--token`）：<docs/remote-mode.md>
 - Package 与扩展作者指南：<https://rpi.laofu.online/extension-authoring.md>
 
 当在线文档和已安装版本不一致时，以对应版本的 Git tag 和仓库内文档为准。

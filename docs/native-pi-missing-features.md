@@ -17,7 +17,7 @@
 
 | 优先级 | 缺失范围 | 影响 |
 |---|---|---|
-| P0 | Provider/API 覆盖、OAuth、RPC、图片输入 | 大量原生配置无法运行，远程集成和多模态入口不可用 |
+| P0 | Provider/API 覆盖、OAuth、图片输入 | 大量原生配置无法运行，多模态入口不可用（RPC/远程模式已实现，见 §3） |
 | P1 | Harness/runtime、JSON 事件、AgentSession、导出、模型 registry | SDK/自动化客户端无法获得原生生命周期和恢复能力 |
 | P1 | TUI 编辑器/快捷键、Trust/resource gate、Settings | 交互工作流和项目安全策略不完整 |
 | P2 | JS/TS 扩展桥接、TUI 基础组件、telemetry | 扩展生态和低层 SDK 兼容性受限 |
@@ -49,11 +49,20 @@ Rust `rpi auth` 当前只真正支持 Anthropic API key 的 `login/check/logout`
 
 证据：`crates/pi-cli/src/auth.rs`；原生 `packages/ai/src/auth/`、`packages/ai/src/auth/oauth/`、`packages/coding-agent/src/cli/auth-command.ts`、`credential-print.ts`。
 
-### 3. RPC 模式、协议和远程 client/server 缺失
+### 3. RPC 模式、协议和远程 client/server —— 已实现
 
-`--mode rpc` 虽可解析，但 `crates/pi-cli/src/app.rs:337` 直接输出 `rpc mode is not implemented in v1` 并退出。Rust 没有原生对应的 JSONL RPC mode、RPC types/client，也没有 `packages/protocol`、`packages/client`、`packages/server` 的 transport-neutral 协议和服务端能力。
+> 状态：**已实现**。`--mode rpc` 的 JSONL 服务端、`rpi --server` 无头模式、
+> `rpi --connect` 远程 TUI，以及 `--token` 认证均已落地。详见
+> [`remote-mode.md`](remote-mode.md)。
 
-证据：Rust `crates/pi-cli/src/app.rs`、`crates/pi-cli/src/modes.rs`；原生 `packages/coding-agent/src/modes/rpc/`、`packages/protocol/`、`packages/client/`、`packages/server/`。
+rpi 现在自带一套 **Rust 原生**的远程协议与会话模型（`crates/pi-cli/src/remote/`）：
+协议类型服务端/客户端共用（`protocol.rs`），客户端有独立的
+`RemoteSession` + transcript 抽象（`session.rs`）与 `pi-tui` 渲染层（`tui.rs`）。
+设计上参考了原生 pi `packages/coding-agent/src/modes/rpc/` 与 `src/client/` 的分层，
+但**不依赖任何 pi 运行时组件**。
+
+证据：Rust `crates/pi-cli/src/modes.rs`、`crates/pi-cli/src/remote/{protocol,client,session,tui}.rs`；
+`rpi-package/packages/rpi-server/`。
 
 ### 4. 图片输入链路缺失
 

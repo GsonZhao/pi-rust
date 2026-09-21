@@ -175,6 +175,18 @@ entry as a focused PR rather than opening multiple issues.
 
 RustCC 已有项目介绍后，不再重复投放同一篇文章。后续按平台调整内容角度：
 
+### RustCC（远程模式专题，待发布）
+
+- 文章草稿：`docs/rustcc-post-remote-mode.md`
+- 标题：
+
+> rpi 远程模式：无头服务端 + 零本地资源的远程 TUI
+
+- 文章角度：
+
+> `rpi --server` 无头运行 + `rpi --connect` 零本地资源客户端 + `--token` / `RPI_SERVER_TOKEN` 认证。强调“客户端不复制 agent 实现”，并说明设计上参考了 pi 的 `modes/rpc` 与 `src/client` 分层、但完全是 Rust 自研、不依赖任何 pi 运行时组件。附两层线协议概览、远程 TUI 可用命令与限制。
+- 时序：与首篇项目介绍角度不同，但至少间隔 3–5 天发布，避免同站短期重复。
+
 ### OSCHINA
 
 标题：
