@@ -1,6 +1,6 @@
 # rpi 官网
 
-这是一个零依赖的静态官网。首页数据来自 `data/site.json`，Packages 目录数据来自 `data/packages.json`，Documentation 数据来自 `data/docs.json`；页面逻辑分别在 `app.js`、`packages.js` 和 `docs.js`，共享 `styles.css`。`i18n.js` 和 `data/locales.json` 提供全站中文/英文切换，语言选择会保存在浏览器中。
+这是一个零依赖的静态官网。首页数据来自 `data/site.json`，Packages 目录数据来自 `data/packages.json`，Documentation 数据来自 `data/docs.json`，Blog 数据来自 `data/blog.json`；页面逻辑分别在 `app.js`、`packages.js`、`docs.js` 和 `blog.js`，共享 `styles.css`。`i18n.js` 和 `data/locales.json` 提供全站中文/英文切换，语言选择会保存在浏览器中。
 
 在仓库根目录启动：
 
