@@ -938,6 +938,42 @@ pub struct ReloadContext {
     pub dev_extension: Option<Arc<crate::dev_extension::DevExtension>>,
 }
 
+/// Dispatch a no-payload lifecycle event (e.g. `SessionStart`, `SessionShutdown`,
+/// the rpi-specific `BeforeTuiStart`) to every extension handler subscribed to
+/// that tag, with **veto** + **timeout** semantics (P1).
+///
+/// Resolves the **current** extension session from the reload cell so a
+/// `/reload`-swapped session is honored. Each handler runs on a blocking thread
+/// with a per-event timeout ([`rpi_extensions::lifecycle_timeout_for`]); a
+/// handler returning [`rpi_plugin_sdk::EVENT_HANDLER_ABORT`] vetoes the phase
+/// and this returns `Some(reason)`. No-op (`None`) when no plugins loaded, no
+/// handler subscribes, or the registry is stale.
+///
+/// The caller decides what a veto means: a `BeforeTuiStart` veto aborts startup
+/// (never enter the TUI); `SessionStart`/`SessionShutdown` vetoes are advisory
+/// (the session is already up or already closing).
+pub async fn dispatch_session_event_async(
+    reload_context: &ReloadContext,
+    tag: rpi_plugin_sdk::EventTag,
+) -> Option<String> {
+    // Take the snapshot Arc + keepalive, drop the session lock, then dispatch —
+    // we must not hold the session cell's mutex across the await (a handler
+    // could re-enter a reload path that locks it). Holding the keepalive across
+    // the await keeps the cdylibs (owning the handler fn pointers) mapped even
+    // if a concurrent `/reload` swaps the session cell out.
+    let (snapshot, keepalive) = {
+        let session = reload_context.extension_session.lock().unwrap();
+        (session.snapshot_arc(), session.keepalive())
+    };
+    match snapshot {
+        Some(snapshot) => {
+            let _keepalive = keepalive;
+            rpi_extensions::dispatch_lifecycle_event(&snapshot, tag).await
+        }
+        None => None,
+    }
+}
+
 /// The outcome of a reload: a human-readable status line for the transcript
 /// (counts of what reloaded), and whether any load diagnostics appeared.
 pub struct ReloadOutcome {

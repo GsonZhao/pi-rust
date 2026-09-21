@@ -145,11 +145,13 @@ mod tests {
         let mut registry = crate::registry::ExtensionRegistry::new();
         let handler: rpi_plugin_sdk::EventHandlerFn = counting_provider_handler;
         registry.register_event_handler(
+            "test-plugin".to_string(),
             EventTag::BeforeProviderRequest,
             handler,
             std::ptr::null_mut(),
         );
         registry.register_event_handler(
+            "test-plugin".to_string(),
             EventTag::BeforeProviderHeaders,
             handler,
             std::ptr::null_mut(),

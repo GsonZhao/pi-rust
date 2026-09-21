@@ -62,9 +62,9 @@ use std::sync::{Arc, Mutex};
 
 use rpi_plugin_sdk::{
     EventHandlerFn, EventTag, FreeStringFn, LegacyPluginApiV1, LegacyRuntimeActionFn, PluginApiVt,
-    ProviderRequestFn, RenderFn, ResourcesDiscoverFn, RuntimeActionFn, StablePluginEvent,
-    StableToolSchema, StbString, StbStringRef, ToolCancelFn, ToolDestroyFn, ToolExecuteFn,
-    ToolPollFn,
+    PluginApiVt3Ext, ProviderRequestFn, RenderFn, ResourcesDiscoverFn, RuntimeActionFn,
+    StablePluginEvent, StableToolSchema, StbString, StbStringRef, ToolCancelFn, ToolDestroyFn,
+    ToolExecuteFn, ToolPollFn,
 };
 use thiserror::Error;
 
@@ -78,16 +78,22 @@ pub use loader::{
 };
 pub use provider::PluggableProvider;
 pub use provider_hooks::ExtensionProviderHooks;
+pub use event_log::{event_log_path, log_handler_invocation, EventLogger};
 pub use registry::{
-    assert_active, ExtensionRegistry, ExtensionTool, RegisteredFlag, RegisteredHandler,
-    RegisteredProvider, RegisteredRenderer, RegisteredRendererKind, RegistryEntry,
-    RegistrySnapshot, ResourcesDiscoverHandler,
+    assert_active, current_platform, platform_allows, ExtensionRegistry, ExtensionTool,
+    RegisteredFlag, RegisteredHandler, RegisteredProvider, RegisteredRenderer,
+    RegisteredRendererKind, RegistryEntry, RegistrySnapshot, ResourcesDiscoverHandler,
+    DEFAULT_PRIORITY,
 };
 pub use resources::{emit_resources_discover, DiscoveredResources};
 pub use tool::{PluginToolAdapter, PluginToolHandle};
-pub use translate::{ExtensionEmitter, TeeEmitter};
+pub use translate::{
+    dispatch_data_event, dispatch_empty_event, dispatch_lifecycle_event, ExtensionEmitter,
+    TeeEmitter,
+};
 
 mod actions;
+mod event_log;
 mod loader;
 mod provider;
 mod provider_hooks;
@@ -164,6 +170,11 @@ pub extern "C" fn host_free_string(s: StbString) {
 pub struct HostApi {
     registry: Mutex<Option<ExtensionRegistry>>,
     diagnostics: Arc<dyn PluginDiagnostics>,
+    /// Display name of the plugin currently registering (from the cdylib file
+    /// stem). Stamped onto every registration the plugin makes (e.g. event
+    /// handlers) so host-side diagnostics can name the owning extension. Not
+    /// part of the ABI — the plugin never sees it.
+    name: String,
     /// B5a: the plugin→host action bridge, carried in
     /// [`PluginApiVt::user_data`] so [`trampoline_runtime_action`] can recover
     /// the harness state from ANY thread a plugin calls from (post-register, no
@@ -175,13 +186,24 @@ pub struct HostApi {
 
 impl HostApi {
     /// Build a fresh host API bound to the given registry + diagnostics. With
-    /// no action bridge, `runtime_action` stays the stub returning `-1`.
-    pub fn new(registry: ExtensionRegistry, diagnostics: Arc<dyn PluginDiagnostics>) -> Arc<Self> {
+    /// no action bridge, `runtime_action` stays the stub returning `-1`. `name`
+    /// is the registering plugin's display name (from the cdylib file stem).
+    pub fn new(
+        name: impl Into<String>,
+        registry: ExtensionRegistry,
+        diagnostics: Arc<dyn PluginDiagnostics>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             registry: Mutex::new(Some(registry)),
             diagnostics,
+            name: name.into(),
             action_bridge: None,
         })
+    }
+
+    /// The registering plugin's display name.
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     /// B5a: build a host API that wires the real [`trampoline_runtime_action`]
@@ -190,8 +212,9 @@ impl HostApi {
     /// thread. `rpi-cli` keeps one master `Arc<ActionBridge>` per session; the
     /// `HostApi` here holds a clone only for the duration of `load_one` (it is
     /// dropped after `take_registry`, but the master arc in `rpi-cli` keeps the
-    /// pointer valid).
+    /// pointer valid). `name` is the registering plugin's display name.
     pub fn with_action_bridge(
+        name: impl Into<String>,
         registry: ExtensionRegistry,
         diagnostics: Arc<dyn PluginDiagnostics>,
         action_bridge: Arc<ActionBridge>,
@@ -199,6 +222,7 @@ impl HostApi {
         Arc::new(Self {
             registry: Mutex::new(Some(registry)),
             diagnostics,
+            name: name.into(),
             action_bridge: Some(action_bridge),
         })
     }
@@ -264,6 +288,18 @@ impl HostApi {
             runtime_action: runtime_action_fn,
             dispatch_event: Some(trampoline_dispatch_event),
             user_data: ud,
+        }
+    }
+
+    /// P2: build the ABI v3 **extension block** passed alongside the frozen v2
+    /// [`PluginApiVt`] to `rpi_plugin_register_v3`. Today it exposes only
+    /// `declare` (priority / platforms); the reserved slots are null. A plugin
+    /// that never calls `declare` keeps the host defaults (priority 100, all
+    /// platforms).
+    pub fn build_vtable_v3_ext(self: &Arc<Self>) -> PluginApiVt3Ext {
+        PluginApiVt3Ext {
+            declare: Some(trampoline_declare),
+            _reserved: [std::ptr::null_mut(); 3],
         }
     }
 
@@ -476,7 +512,9 @@ extern "C" fn trampoline_register_event_handler(
         return -1;
     }
     let ok = with_current_api(|api| {
-        match api.with_registry(|reg| reg.register_event_handler(tag, handler, user_data)) {
+        match api.with_registry(|reg| {
+            reg.register_event_handler(api.name().to_string(), tag, handler, user_data)
+        }) {
             Some(_) => true,
             None => false,
         }
@@ -485,6 +523,26 @@ extern "C" fn trampoline_register_event_handler(
         0
     } else {
         -1
+    }
+}
+
+/// P2: ABI v3 `declare` trampoline. Runs synchronously during a v3 plugin's
+/// `register` (thread-local `CURRENT_HOST_API` is set). The plugin hands a
+/// borrowed JSON payload (`{"priority":60,"platforms":["linux"]}`); we parse
+/// and apply it to this plugin's registry (retro-updating any handlers already
+/// registered, so declare order doesn't matter). Returns `0` on a parsed
+/// payload, `1` on malformed JSON, `-1` outside register.
+extern "C" fn trampoline_declare(json: StbStringRef) -> i32 {
+    if !current_api_present() {
+        return -1;
+    }
+    // SAFETY: the plugin guarantees `json` is valid UTF-8 for the call; we read
+    // it immediately (copy into the registry) and never retain the borrow.
+    let text = unsafe { json.as_str() };
+    match with_current_api(|api| api.with_registry(|reg| reg.apply_declaration_json(text))) {
+        Some(Some(true)) => 0,
+        Some(Some(false)) => 1,
+        _ => -1,
     }
 }
 

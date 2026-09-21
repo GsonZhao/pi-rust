@@ -6021,6 +6021,20 @@ pub async fn interactive_tui(
         }
     });
 
+    // ---- Session lifecycle (P1): SessionStart ----
+    // The TUI + key worker are up and the session is ready to accept input.
+    // Notify subscribed extensions now so they can initialize session-scoped
+    // state. A veto here is **advisory** (the session is already up) — warn and
+    // continue. No-op when no extension subscribes.
+    if let Some(reason) = crate::session::dispatch_session_event_async(
+        reload_context,
+        rpi_plugin_sdk::EventTag::SessionStart,
+    )
+    .await
+    {
+        tracing::warn!("[rpi] extension vetoed SessionStart (advisory): {reason}");
+    }
+
     // ---- Initial prompts (run before reading from the channel) ----
     let mut prompts: Vec<String> = Vec::new();
     if let Some(init) = initial {

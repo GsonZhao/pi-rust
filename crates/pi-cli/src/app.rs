@@ -41,6 +41,39 @@ pub const EXIT_USAGE: i32 = 2;
 /// The exit code for a runtime failure (model-resolution, harness-build, or
 /// run failure). Mirrors TS `process.exitCode` set from `runPrintMode`.
 pub const EXIT_RUNTIME: i32 = 1;
+/// The exit code when an extension **vetoes** startup at a lifecycle event
+/// (e.g. a `BeforeTuiStart` handler returns [`rpi_plugin_sdk::EVENT_HANDLER_ABORT`]).
+/// Distinct from [`EXIT_RUNTIME`] so scripts can tell "an extension refused to
+/// start" from "the run itself failed".
+pub const EXIT_VETOED: i32 = 3;
+
+/// Read a long-flag value from argv, supporting both `--flag <value>` and
+/// `--flag=value`, without disturbing the normal parser. Used for the early
+/// `--connect` interception.
+fn take_flag_value(argv: &[String], flag: &str) -> Option<String> {
+    let prefix = format!("{flag}=");
+    let mut iter = argv.iter();
+    while let Some(arg) = iter.next() {
+        if let Some(value) = arg.strip_prefix(&prefix) {
+            return Some(value.to_string());
+        }
+        if arg == flag {
+            return iter.next().cloned();
+        }
+    }
+    None
+}
+
+/// Resolve the `--connect` auth token: the `--token` flag wins, then the
+/// `RPI_SERVER_TOKEN` environment variable (ignoring empty/whitespace values).
+fn resolve_connect_token(argv: &[String]) -> Option<String> {
+    take_flag_value(argv, "--token").or_else(|| {
+        std::env::var("RPI_SERVER_TOKEN")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
 
 /// The v1 CLI entry point. Mirrors TS `export async function main(args)`.
 ///
@@ -54,6 +87,15 @@ pub async fn run() -> i32 {
 
     if argv.first().map(String::as_str) == Some("__rpi_dev_cleanup") {
         return crate::dev_extension::run_cleanup_helper(&argv[1..]);
+    }
+
+    // ---- `rpi --connect <addr>` — pure remote client ----
+    // Intercepted before any provider / harness / session / extension work so
+    // the client holds no local agent resources at all: it only connects to a
+    // running `rpi --server` and renders the remote transcript.
+    if let Some(addr) = take_flag_value(&argv, "--connect") {
+        let token = resolve_connect_token(&argv);
+        return crate::remote::tui::run(&addr, token.as_deref()).await;
     }
 
     // Native Pi resolves offline mode before dispatching top-level commands.
@@ -92,6 +134,9 @@ pub async fn run() -> i32 {
     // `main.ts`); dispatching it here avoids it being misparsed as a prompt.
     if argv.first().map(|s| s.as_str()) == Some("auth") {
         return crate::auth::run(&argv[1..]).await;
+    }
+    if argv.first().map(|s| s.as_str()) == Some("events") {
+        return crate::events::run(&argv[1..]).await;
     }
     if argv.first().map(|s| s.as_str()) == Some("package") {
         return crate::packages::run_cli(&argv[1..]);
@@ -269,7 +314,17 @@ pub async fn run() -> i32 {
     }
 
     // ---- stdin (TS readPipedStdin: non-TTY stdin becomes initial prompt text) ----
-    let stdin_text = read_piped_stdin();
+    // Do NOT drain stdin when the run is an RPC/server session: stdin is the
+    // JSONL command channel there (a spawned `rpi --mode rpc` child reads its
+    // commands from stdin), so consuming it up-front would leave the protocol
+    // loop nothing to read. `--mode rpc` and `--server` both select RunMode::Rpc.
+    let wants_rpc_channel = parsed.mode == crate::args::Mode::Rpc
+        || parsed.unknown_flags.contains_key("server");
+    let stdin_text = if wants_rpc_channel {
+        None
+    } else {
+        read_piped_stdin()
+    };
 
     // ---- @file attachments → text (TS processFileArguments, text branch only) ----
     let (file_text, file_images) = match process_file_args(&parsed.file_args, &cwd) {
@@ -427,12 +482,58 @@ pub async fn run() -> i32 {
             .await
         }
         RunMode::Rpc => {
-            // Headless server mode: no TUI, just keep the process alive.
-            // Extensions (e.g. rpi-server) handle the actual RPC logic.
-            eprintln!("[rpi] running in headless/rpc mode (no TUI)");
-            // Wait forever (Ctrl+C to stop)
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(3600));
+            // Headless lifecycle (P0): no TUI, but a session still starts/ends —
+            // extensions (e.g. rpi-server) auto-start on SessionStart and clean
+            // up on SessionShutdown, exactly as in interactive mode. This is why
+            // `rpi --server` works headless: the SessionStart hook fires and the
+            // extension brings up the TCP server.
+            let veto = crate::session::dispatch_session_event_async(
+                &reload_context,
+                rpi_plugin_sdk::EventTag::BeforeTuiStart,
+            )
+            .await;
+            if let Some(reason) = veto {
+                eprintln!("[rpi] startup vetoed by extension: {reason}");
+                EXIT_VETOED
+            } else {
+                if let Some(reason) = crate::session::dispatch_session_event_async(
+                    &reload_context,
+                    rpi_plugin_sdk::EventTag::SessionStart,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        "[rpi] extension vetoed SessionStart (headless, advisory): {reason}"
+                    );
+                }
+
+                let code = if parsed.unknown_flags.contains_key("server") {
+                    // Server mode: the rpi-server extension owns the TCP server;
+                    // the core just stays alive and tears the session down on
+                    // Ctrl+C (firing SessionShutdown so the extension stops it).
+                    eprintln!(
+                        "[rpi] running in headless server mode (no TUI); Ctrl+C to stop"
+                    );
+                    let _ = tokio::signal::ctrl_c().await;
+                    0
+                } else {
+                    // `--mode rpc`: JSONL command loop over stdio — the
+                    // server-side agent that rpi-server spawns and that
+                    // `rpi --connect` talks to.
+                    crate::modes::rpc(&harness, Some(event_rx), model_catalog).await
+                };
+
+                if let Some(reason) = crate::session::dispatch_session_event_async(
+                    &reload_context,
+                    rpi_plugin_sdk::EventTag::SessionShutdown,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        "[rpi] extension vetoed SessionShutdown (ignored, closing): {reason}"
+                    );
+                }
+                code
             }
         }
     };
@@ -712,6 +813,35 @@ fn print_build_error(e: &BuildError) {
 mod tests {
     use super::*;
     use crate::args::Args;
+
+    #[test]
+    fn take_flag_value_supports_both_spellings() {
+        let argv = vec![
+            "--connect".to_string(),
+            "127.0.0.1:9899".to_string(),
+            "--token".to_string(),
+            "abc".to_string(),
+        ];
+        assert_eq!(
+            take_flag_value(&argv, "--connect").as_deref(),
+            Some("127.0.0.1:9899")
+        );
+        assert_eq!(take_flag_value(&argv, "--token").as_deref(), Some("abc"));
+        assert_eq!(take_flag_value(&argv, "--missing"), None);
+
+        let inline = vec!["--connect=1.2.3.4:1".to_string()];
+        assert_eq!(
+            take_flag_value(&inline, "--connect").as_deref(),
+            Some("1.2.3.4:1")
+        );
+    }
+
+    #[test]
+    fn connect_token_prefers_the_flag_over_the_env_var() {
+        // The flag wins regardless of any RPI_SERVER_TOKEN in the environment.
+        let argv = vec!["--token".to_string(), "flag-token".to_string()];
+        assert_eq!(resolve_connect_token(&argv).as_deref(), Some("flag-token"));
+    }
 
     #[test]
     fn build_initial_combines_stdin_file_and_first_message() {

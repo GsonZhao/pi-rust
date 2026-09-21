@@ -471,9 +471,10 @@ pub type ToolDestroyFn = extern "C" fn(handle: StepHandle);
 // ---------------------------------------------------------------------------
 
 /// Discriminant for [`StablePluginEvent`], one variant per pi `on()` category
-/// (33 total). `#[repr(u32)]` pins the discriminant width.
+/// (33 total) plus one rpi-specific category (34 total). `#[repr(u32)]` pins
+/// the discriminant width.
 ///
-/// The 33 categories (verified against `extensions/types.ts:1203-1244`):
+/// The 33 Pi categories (verified against `extensions/types.ts:1203-1244`):
 /// project_trust, resources_discover, session_start, session_info_changed,
 /// session_before_switch, session_before_fork, session_before_compact,
 /// session_compact, session_shutdown, session_before_tree, session_tree,
@@ -483,6 +484,12 @@ pub type ToolDestroyFn = extern "C" fn(handle: StepHandle);
 /// message_end, tool_execution_start, tool_execution_update,
 /// tool_execution_end, model_select, thinking_level_select, tool_call,
 /// tool_result, user_bash, input.
+///
+/// `BeforeTuiStart` is **rpi-specific** (not a Pi category): dispatched once
+/// before the interactive TUI is initialized, so extensions can prepare
+/// (connect a server, load a resource) before the UI starts. Appended last so
+/// existing discriminants keep their values (ABI-safe for already-compiled
+/// plugins).
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventTag {
@@ -519,11 +526,15 @@ pub enum EventTag {
     ToolResult = 30,
     UserBash = 31,
     Input = 32,
+    /// rpi-specific: dispatched before the interactive TUI initializes (not a
+    /// Pi `on()` category). Appended last so existing discriminants are stable.
+    BeforeTuiStart = 33,
 }
 
-/// Number of `on()` event categories — `33`. A test asserts
-/// `EVENT_TAG_COUNT == 33` so a future edit that adds/removes a tag is caught.
-pub const EVENT_TAG_COUNT: usize = 33;
+/// Number of event categories — `34` (33 Pi `on()` categories + 1 rpi-specific
+/// [`EventTag::BeforeTuiStart`]). A test asserts `EVENT_TAG_COUNT == 34` so a
+/// future edit that adds/removes a tag is caught.
+pub const EVENT_TAG_COUNT: usize = 34;
 
 /// No-payload marker for events that carry none (e.g. `session_shutdown`).
 /// Carries a dummy byte so the empty-struct isn't flagged FFI-unsafe by
@@ -710,10 +721,34 @@ impl StablePluginEvent {
     }
 }
 
+/// Return codes an [`EventHandlerFn`] may return.
+///
+/// `0` means success; the host continues to the next handler. A **nonzero**
+/// return means the handler handled an error — the host logs it and (for the
+/// ordinary agent/observe fan-out) continues to other handlers (one handler's
+/// error does not abort the fan-out, mirroring pi's per-handler try/catch).
+///
+/// [`EVENT_HANDLER_ABORT`] is the **veto** code: the handler wants to stop the
+/// current lifecycle phase. It is honored only by the host's lifecycle
+/// dispatch (e.g. `before_tui_start` / `session_start` / `session_shutdown`);
+/// the ordinary observe fan-out treats it like any other nonzero (log +
+/// continue), because the agent loop must not be vetoed mid-run.
+pub const EVENT_HANDLER_CONTINUE: i32 = 0;
+/// The handler handled an error but the fan-out should continue (default
+/// nonzero semantics — equivalent to any other nonzero code).
+pub const EVENT_HANDLER_ERROR: i32 = 1;
+/// **Veto**: stop the current lifecycle phase. Honored only by the host's
+/// lifecycle dispatch; the observe fan-out logs + continues (see the module
+/// docs on [`EVENT_HANDLER_CONTINUE`]).
+pub const EVENT_HANDLER_ABORT: i32 = 2;
+
 /// Handler fn pointer registered via `register_event_handler(tag, handler)`.
 /// `user_data` is the plugin's opaque context. Return `0` on success; nonzero
 /// signals a handled error (the host logs it; dispatch continues to other
-/// handlers — one handler's error does not abort the fan-out).
+/// handlers — one handler's error does not abort the fan-out). The one
+/// exception: when the host dispatches a **lifecycle** event through its
+/// veto-aware path, returning [`EVENT_HANDLER_ABORT`] stops the fan-out and
+/// aborts that phase (see the constants above).
 pub type EventHandlerFn = extern "C" fn(event: StablePluginEvent, user_data: *mut c_void) -> i32;
 
 /// `resources_discover` handler signature (B5b). Unlike [`EventHandlerFn`]
@@ -1147,6 +1182,124 @@ pub type RpiPluginRegister = extern "C" fn(api: *const PluginApiVt, abi_version:
 pub type LegacyRpiPluginRegister =
     extern "C" fn(api: *const LegacyPluginApiV1, abi_version: u32) -> i32;
 
+// ---------------------------------------------------------------------------
+// ABI v3 — plugin declarations (extension block beside the frozen v2 vtable)
+// ---------------------------------------------------------------------------
+
+/// The ABI version the v3 entrypoint advertises.
+pub const RPI_PLUGIN_ABI_VERSION_V3: u32 = 3;
+
+/// The ABI v3 symbol the host looks up before [`REGISTER_SYMBOL_V2`].
+pub const REGISTER_SYMBOL_V3: &[u8] = b"rpi_plugin_register_v3\0";
+
+/// The ABI v3 **extension block**, passed to `rpi_plugin_register_v3` *in
+/// addition to* the frozen v2 [`PluginApiVt`]. Keeping v3 as a separate side
+/// struct means the v2 vtable layout never changes: a v2 plugin is unaffected,
+/// a v3 plugin reads both.
+///
+/// Every slot is nullable. A null slot means the host does not support that
+/// declaration yet — the plugin must null-check and degrade (skip the
+/// declaration; the host applies defaults: priority `100`, all platforms).
+#[repr(C)]
+pub struct PluginApiVt3Ext {
+    /// Declare this plugin's host-side preferences as a JSON object, e.g.
+    /// `{"priority":60,"platforms":["linux","macos"]}`.
+    ///
+    /// - `priority` (integer, default `100`): dispatch order for this plugin's
+    ///   handlers — **smaller runs first** (stable; registration order breaks
+    ///   ties). Suggested bands: `0..=49` infrastructure, `50..=99`
+    ///   connection, `100..=199` normal, `200+` post/cleanup.
+    /// - `platforms` (array of strings, default all): platforms this plugin
+    ///   supports; the host skips the plugin's handlers on any other platform.
+    ///   Recognised: `"linux"`, `"macos"`, `"windows"`, `"android"`.
+    ///
+    /// Called during `register`. Returns `0` on success, nonzero on a handled
+    /// error (host logs it and keeps the defaults).
+    pub declare: Option<extern "C" fn(json: StbStringRef) -> i32>,
+    /// Reserved for future v3 declarations. MUST be null-filled today; the host
+    /// ignores these slots. Zeroing them lets a future host start using them
+    /// without another ABI bump.
+    pub _reserved: [*mut c_void; 3],
+}
+unsafe impl Send for PluginApiVt3Ext {}
+unsafe impl Sync for PluginApiVt3Ext {}
+
+impl PluginApiVt3Ext {
+    /// A v3 ext block with every slot null (no declarations). Useful for tests
+    /// and hosts that support no declarations yet.
+    pub const fn empty() -> Self {
+        Self {
+            declare: None,
+            _reserved: [ptr::null_mut(); 3],
+        }
+    }
+}
+
+/// ABI v3 plugin entrypoint signature: `(api, ext, abi_version)`.
+pub type RpiPluginRegisterV3 =
+    extern "C" fn(api: *const PluginApiVt, ext: *const PluginApiVt3Ext, abi_version: u32) -> i32;
+
+/// Export an ABI v3 plugin entrypoint under `rpi_plugin_register_v3`.
+///
+/// The expression receives `(&PluginApiVt, &PluginApiVt3Ext)` and returns the
+/// plugin-defined registration status code. Use this when the plugin wants to
+/// declare a priority / supported platforms through [`PluginApiVt3Ext::declare`];
+/// otherwise prefer `export_plugin_v2!`.
+///
+/// ```ignore
+/// rpi_plugin_sdk::export_plugin_v3!(|api, ext| {
+///     if let Some(declare) = ext.declare {
+///         declare(rpi_plugin_sdk::StbStringRef::from_str(
+///             r#"{"priority":60,"platforms":["linux"]}"#,
+///         ));
+///     }
+///     // ... register tools and handlers through `api` ...
+///     0
+/// });
+/// ```
+#[macro_export]
+macro_rules! export_plugin_v3 {
+    ($body:expr) => {
+        #[no_mangle]
+        pub extern "C" fn rpi_plugin_register_v3(
+            api: *const $crate::PluginApiVt,
+            ext: *const $crate::PluginApiVt3Ext,
+            abi_version: u32,
+        ) -> i32 {
+            // SAFETY: host guarantees `api`/`ext` are valid for this call.
+            unsafe { $crate::register_entrypoint_v3(api, ext, abi_version, $body) }
+        }
+    };
+}
+
+/// v3 entrypoint helper: compares `abi_version` against
+/// [`RPI_PLUGIN_ABI_VERSION_V3`] before dereferencing `api`/`ext`.
+///
+/// # Safety
+///
+/// `api` and `ext` must be valid, properly aligned pointers that remain valid
+/// for the duration of `body`.
+pub unsafe fn register_entrypoint_v3(
+    api: *const PluginApiVt,
+    ext: *const PluginApiVt3Ext,
+    abi_version: u32,
+    body: impl FnOnce(&PluginApiVt, &PluginApiVt3Ext) -> i32,
+) -> i32 {
+    if abi_version != RPI_PLUGIN_ABI_VERSION_V3 {
+        return 1;
+    }
+    if api.is_null() {
+        return 2;
+    }
+    if ext.is_null() {
+        return 3;
+    }
+    // SAFETY: caller guarantees both pointers are valid; we checked null.
+    let api = &*api;
+    let ext = &*ext;
+    body(api, ext)
+}
+
 /// Export an ABI v2 plugin entrypoint under `rpi_plugin_register_v2`.
 ///
 /// The expression receives `&PluginApiVt` and returns the plugin-defined
@@ -1320,9 +1473,10 @@ mod tests {
     }
 
     #[test]
-    fn event_tag_count_is_33() {
+    fn event_tag_count_is_34() {
         // Enumerate every tag; a compile-time + runtime guarantee that the
-        // 33-category surface is intact.
+        // 34-category surface is intact (33 Pi on() categories + the
+        // rpi-specific BeforeTuiStart).
         let tags = [
             EventTag::ProjectTrust,
             EventTag::ResourcesDiscover,
@@ -1357,13 +1511,14 @@ mod tests {
             EventTag::ToolResult,
             EventTag::UserBash,
             EventTag::Input,
+            EventTag::BeforeTuiStart,
         ];
         assert_eq!(tags.len(), EVENT_TAG_COUNT);
-        assert_eq!(EVENT_TAG_COUNT, 33);
-        // Distinct discriminants 0..32.
+        assert_eq!(EVENT_TAG_COUNT, 34);
+        // Distinct discriminants 0..33.
         let mut discs: Vec<u32> = tags.iter().map(|t| *t as u32).collect();
         discs.sort();
-        assert_eq!(discs, (0..33).collect::<Vec<u32>>());
+        assert_eq!(discs, (0..34).collect::<Vec<u32>>());
     }
 
     #[test]
@@ -1551,6 +1706,61 @@ mod tests {
         // Null api → refuse.
         let rc = unsafe { register_entrypoint(core::ptr::null(), RPI_PLUGIN_ABI_VERSION, |_| 0) };
         assert_ne!(rc, 0);
+        let _ = reset_freed();
+    }
+
+    #[test]
+    fn v3_ext_is_pod_and_entrypoint_validates() {
+        // The v3 ext block is POD (fn pointer + reserved raw pointers, no Drop).
+        assert!(!core::mem::needs_drop::<PluginApiVt3Ext>());
+        assert_eq!(RPI_PLUGIN_ABI_VERSION_V3, 3);
+        assert_ne!(REGISTER_SYMBOL_V3, REGISTER_SYMBOL_V2);
+        let empty = PluginApiVt3Ext::empty();
+        assert!(empty.declare.is_none());
+        assert!(empty._reserved.iter().all(|p| p.is_null()));
+
+        let vt = PluginApiVt {
+            free_string: test_free,
+            register_tool: None,
+            register_command: None,
+            register_shortcut: None,
+            register_flag: None,
+            register_provider: None,
+            register_message_renderer: None,
+            register_markdown_transformer: None,
+            register_entry_renderer: None,
+            register_event_handler: None,
+            register_resources_discover: None,
+            runtime_action: noop_runtime_action,
+            dispatch_event: None,
+            user_data: core::ptr::null_mut(),
+        };
+        let ext = PluginApiVt3Ext::empty();
+
+        // Version mismatch → refused before the body runs (null api makes the
+        // ordering observable: version-first returns 1, not the null-api code).
+        let rc = unsafe {
+            register_entrypoint_v3(core::ptr::null(), &ext, 2, |_, _| {
+                panic!("body must not run on version mismatch");
+            })
+        };
+        assert_eq!(rc, 1);
+
+        // Null api / null ext → distinct refusals.
+        assert_eq!(
+            unsafe { register_entrypoint_v3(core::ptr::null(), &ext, 3, |_, _| 0) },
+            2
+        );
+        assert_eq!(
+            unsafe { register_entrypoint_v3(&vt, core::ptr::null(), 3, |_, _| 0) },
+            3
+        );
+
+        // Right version + non-null → body runs, rc propagated.
+        let rc = unsafe { register_entrypoint_v3(&vt, &ext, 3, |_, _| 0) };
+        assert_eq!(rc, 0);
+        let rc = unsafe { register_entrypoint_v3(&vt, &ext, 3, |_, _| 7) };
+        assert_eq!(rc, 7);
         let _ = reset_freed();
     }
 }

@@ -77,14 +77,30 @@ pub struct RegisteredFlag {
 }
 
 /// A registered `on(tag)` event handler. `user_data` is the plugin's opaque
-/// context, passed back unchanged on every dispatch.
+/// context, passed back unchanged on every dispatch. `plugin` is the display
+/// name of the owning extension (host-side only — stamped from the cdylib path
+/// at registration; not part of the ABI), used for lifecycle veto diagnostics
+/// ("extension `foo` aborted `before_tui_start`").
+///
+/// `priority`/`platforms` are the owning plugin's **declaration** (P2): the
+/// snapshot sorts handlers by `priority` (smaller first, stable), and dispatch
+/// skips a handler whose non-empty `platforms` excludes the host platform.
+/// Both default to `100` / empty (all platforms); a plugin sets them via the
+/// ABI v3 `declare` ext block.
 ///
 /// SAFETY contract: the plugin guarantees `handler` is safe to call from any
 /// thread (the host dispatches from the async emitter thread) and `user_data`
 /// is valid for the registry's lifetime. The host never frees `user_data`
 /// (plugin-owned).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct RegisteredHandler {
+    /// Display name of the owning extension (from the cdylib file stem).
+    pub plugin: String,
+    /// Dispatch order (smaller runs first). Default `100`.
+    pub priority: i32,
+    /// Platforms this handler's plugin supports (empty = all). Matched against
+    /// [`current_platform`].
+    pub platforms: Vec<String>,
     pub handler: EventHandlerFn,
     pub user_data: *mut std::ffi::c_void,
 }
@@ -181,6 +197,44 @@ pub enum RegistryEntry {
 }
 
 // ---------------------------------------------------------------------------
+// P2 — plugin declarations (priority + platforms)
+// ---------------------------------------------------------------------------
+
+/// Default dispatch priority for a plugin that declares none. Handlers run
+/// smallest-priority-first; ties break by registration order.
+pub const DEFAULT_PRIORITY: i32 = 100;
+
+/// The host platform, as matched against a plugin's declared `platforms`.
+/// Mirrors the lifescope `Platform` set.
+pub fn current_platform() -> &'static str {
+    if cfg!(target_os = "android") {
+        "android"
+    } else if cfg!(target_os = "linux") {
+        // Termux reports `target_os = "android"` above; a plain Linux is here.
+        "linux"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "windows") {
+        "windows"
+    } else {
+        "unknown"
+    }
+}
+
+/// Whether a handler with the given declared `platforms` should run on this
+/// host. Empty `platforms` = all platforms; a non-empty list requires the host
+/// platform to be present (`"all"` is accepted as a wildcard).
+pub fn platform_allows(platforms: &[String]) -> bool {
+    if platforms.is_empty() {
+        return true;
+    }
+    let here = current_platform();
+    platforms
+        .iter()
+        .any(|p| p.eq_ignore_ascii_case("all") || p.eq_ignore_ascii_case(here))
+}
+
+// ---------------------------------------------------------------------------
 // ExtensionRegistry — accumulated during register, then snapshotted
 // ---------------------------------------------------------------------------
 
@@ -209,6 +263,11 @@ pub struct ExtensionRegistry {
     /// Registered renderers (B5c), split by kind at registration. First-wins on
     /// `(kind, name)`. The host records these now; TUI consumption is B5e.
     renderers: Vec<RegisteredRenderer>,
+    /// P2: the registering plugin's declared dispatch priority. Stamped onto
+    /// every handler it registers; a later `declare` also retro-updates them.
+    priority: i32,
+    /// P2: the registering plugin's declared platforms (empty = all).
+    platforms: Vec<String>,
     /// Shared staleness flag. `true` while the session owning this registry is
     /// active; set `false` on swap/`/reload`. Tool/event dispatch checks it.
     active: Arc<AtomicBool>,
@@ -233,6 +292,8 @@ impl ExtensionRegistry {
             resources_discover: Vec::new(),
             providers: Vec::new(),
             renderers: Vec::new(),
+            priority: DEFAULT_PRIORITY,
+            platforms: Vec::new(),
             active: Arc::new(AtomicBool::new(true)),
         }
     }
@@ -284,18 +345,75 @@ impl ExtensionRegistry {
     }
 
     /// Subscribe a handler to `tag`. Multiple handlers per tag are kept
-    /// (fan-out on dispatch). Always inserts; returns `false`.
+    /// (fan-out on dispatch). Always inserts; returns `false`. `plugin` is the
+    /// owning extension's display name (host-side only, for diagnostics).
     pub fn register_event_handler(
         &mut self,
+        plugin: String,
         tag: EventTag,
         handler: EventHandlerFn,
         user_data: *mut std::ffi::c_void,
     ) -> bool {
         let idx = tag as usize;
         if idx < EVENT_TAG_COUNT {
-            self.handlers[idx].push(RegisteredHandler { handler, user_data });
+            // Stamp the registering plugin's current declaration (P2). A plugin
+            // typically declares BEFORE registering handlers; `apply_declaration`
+            // also retro-updates any handler registered before the declare call.
+            self.handlers[idx].push(RegisteredHandler {
+                plugin,
+                priority: self.priority,
+                platforms: self.platforms.clone(),
+                handler,
+                user_data,
+            });
         }
         false
+    }
+
+    /// Apply a plugin's declaration (P2) parsed from the ABI v3 `declare` JSON
+    /// (`{"priority":60,"platforms":["linux","macos"]}`). Unknown keys are
+    /// ignored; malformed values leave the corresponding field unchanged.
+    /// Retro-updates any handlers already registered (so declare order doesn't
+    /// matter). Returns the number of fields applied.
+    pub fn apply_declaration(&mut self, priority: Option<i32>, platforms: Option<Vec<String>>) -> usize {
+        let mut applied = 0;
+        if let Some(priority) = priority {
+            self.priority = priority;
+            for tag_handlers in self.handlers.iter_mut() {
+                for h in tag_handlers.iter_mut() {
+                    h.priority = priority;
+                }
+            }
+            applied += 1;
+        }
+        if let Some(platforms) = platforms {
+            self.platforms = platforms.clone();
+            for tag_handlers in self.handlers.iter_mut() {
+                for h in tag_handlers.iter_mut() {
+                    h.platforms = platforms.clone();
+                }
+            }
+            applied += 1;
+        }
+        applied
+    }
+
+    /// Parse a v3 `declare` JSON payload and apply it (P2). Recognised keys:
+    /// `priority` (integer) and `platforms` (array of strings). Returns `true`
+    /// if the payload parsed as JSON (even with no recognised keys), `false` on
+    /// a parse error.
+    pub fn apply_declaration_json(&mut self, json: &str) -> bool {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+            return false;
+        };
+        let priority = value.get("priority").and_then(|v| v.as_i64()).map(|v| v as i32);
+        let platforms = value.get("platforms").and_then(|v| v.as_array()).map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect::<Vec<String>>()
+        });
+        self.apply_declaration(priority, platforms);
+        true
     }
 
     /// Register a `resources_discover` handler (B5b). Multiple handlers are kept
@@ -348,6 +466,14 @@ impl ExtensionRegistry {
     /// shared (Arc) so a later `invalidate` on the registry also invalidates the
     /// snapshot — important for cross-session staleness.
     pub fn snapshot(&self) -> RegistrySnapshot {
+        // P2: dispatch order is priority-first (smaller first). `sort_by_key` is
+        // stable, so equal priorities keep registration order (the prior
+        // contract). Sorting per tag here means every snapshot — including the
+        // merged session snapshot built via `absorb` — is pre-ordered.
+        let mut handlers = self.handlers.clone();
+        for tag_handlers in handlers.iter_mut() {
+            tag_handlers.sort_by_key(|h| h.priority);
+        }
         RegistrySnapshot {
             tools: self
                 .tools
@@ -359,7 +485,7 @@ impl ExtensionRegistry {
                 .collect(),
             commands: self.commands.clone(),
             flags: self.flags.clone(),
-            handlers: self.handlers.clone(),
+            handlers,
             resources_discover: self.resources_discover.clone(),
             providers: self.providers.clone(),
             renderers: self.renderers.clone(),
@@ -375,6 +501,16 @@ impl ExtensionRegistry {
     /// Whether this registry is still active (not invalidated).
     pub fn is_active(&self) -> bool {
         self.active.load(Ordering::SeqCst)
+    }
+
+    /// P2: the plugin's declared dispatch priority (default [`DEFAULT_PRIORITY`]).
+    pub fn declared_priority(&self) -> i32 {
+        self.priority
+    }
+
+    /// P2: the plugin's declared platforms (empty = all).
+    pub fn declared_platforms(&self) -> &[String] {
+        &self.platforms
     }
 
     /// Absorb another registry's registrations into this one, first-wins on
@@ -585,5 +721,94 @@ mod tests {
         assert_eq!(flags[0].name, "server");
         assert_eq!(flags[0].description, "Start server");
         assert_eq!(flags[1].name, "port");
+    }
+
+    extern "C" fn noop_handler(
+        _ev: rpi_plugin_sdk::StablePluginEvent,
+        _ud: *mut std::ffi::c_void,
+    ) -> i32 {
+        0
+    }
+
+    fn handler_of<'a>(
+        snap: &'a RegistrySnapshot,
+        tag: EventTag,
+        i: usize,
+    ) -> &'a RegisteredHandler {
+        &snap.handlers_for(tag)[i]
+    }
+
+    /// Two plugins declaring different priorities: the merged snapshot orders
+    /// the lower-priority plugin's handler first (smaller runs first).
+    #[test]
+    fn priority_orders_handlers_after_merge() {
+        let tag = EventTag::SessionStart;
+
+        let mut late = ExtensionRegistry::new();
+        late.apply_declaration(Some(200), None);
+        late.register_event_handler("late".into(), tag, noop_handler, std::ptr::null_mut());
+
+        let mut early = ExtensionRegistry::new();
+        early.apply_declaration(Some(50), None);
+        early.register_event_handler("early".into(), tag, noop_handler, std::ptr::null_mut());
+
+        // Absorb in the "wrong" order — snapshot must still sort by priority.
+        let mut session = ExtensionRegistry::new();
+        session.absorb(late);
+        session.absorb(early);
+        let snap = session.snapshot();
+        assert_eq!(handler_of(&snap, tag, 0).plugin, "early");
+        assert_eq!(handler_of(&snap, tag, 1).plugin, "late");
+    }
+
+    /// Equal priorities keep registration order (stable sort).
+    #[test]
+    fn equal_priority_is_stable() {
+        let tag = EventTag::TurnEnd;
+        let mut reg = ExtensionRegistry::new();
+        reg.register_event_handler("a".into(), tag, noop_handler, std::ptr::null_mut());
+        reg.register_event_handler("b".into(), tag, noop_handler, std::ptr::null_mut());
+        let snap = reg.snapshot();
+        assert_eq!(handler_of(&snap, tag, 0).plugin, "a");
+        assert_eq!(handler_of(&snap, tag, 1).plugin, "b");
+    }
+
+    /// A declaration applied AFTER handlers exist retro-updates them (declare
+    /// order does not matter).
+    #[test]
+    fn declaration_retro_updates_existing_handlers() {
+        let tag = EventTag::SessionStart;
+        let mut reg = ExtensionRegistry::new();
+        reg.register_event_handler("p".into(), tag, noop_handler, std::ptr::null_mut());
+        assert_eq!(handler_of(&reg.snapshot(), tag, 0).priority, DEFAULT_PRIORITY);
+
+        assert!(reg.apply_declaration_json(r#"{"priority":7,"platforms":["linux"]}"#));
+        let snap = reg.snapshot();
+        assert_eq!(handler_of(&snap, tag, 0).priority, 7);
+        assert_eq!(handler_of(&snap, tag, 0).platforms, vec!["linux".to_string()]);
+    }
+
+    /// Malformed declaration JSON is rejected (returns `false`); recognised keys
+    /// apply.
+    #[test]
+    fn apply_declaration_json_parses_and_rejects() {
+        let mut reg = ExtensionRegistry::new();
+        assert!(!reg.apply_declaration_json("not json"));
+        assert!(reg.apply_declaration_json("{}"));
+        assert!(reg.apply_declaration_json(r#"{"priority":3}"#));
+        assert_eq!(reg.apply_declaration(Some(3), None), 1);
+    }
+
+    #[test]
+    fn platform_allows_matches_host_and_wildcard() {
+        assert!(platform_allows(&[]));
+        assert!(platform_allows(&["all".to_string()]));
+        assert!(platform_allows(&["ALL".to_string()]));
+        assert!(platform_allows(&[current_platform().to_string()]));
+        assert!(!platform_allows(&["nonexistent-os".to_string()]));
+        // Empty host subset is fine; a non-matching list is not.
+        assert!(!platform_allows(&[
+            "definitely-not-this-host".to_string()
+        ]));
     }
 }
