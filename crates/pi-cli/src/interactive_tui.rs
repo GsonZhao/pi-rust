@@ -6972,8 +6972,9 @@ fn extract_selected_text(
 }
 
 /// Best-effort clipboard write. Enabled only with the `clipboard` feature
-/// (`arboard`); otherwise returns `false` so the caller degrades to a hint.
-#[cfg(feature = "clipboard")]
+/// (`arboard`) on non-Android platforms; otherwise returns `false` so the 
+/// caller degrades to a hint.
+#[cfg(all(feature = "clipboard", not(target_os = "android")))]
 fn copy_to_clipboard(text: &str) -> bool {
     match arboard::Clipboard::new() {
         Ok(mut cb) => cb.set_text(text).is_ok(),
@@ -6981,7 +6982,7 @@ fn copy_to_clipboard(text: &str) -> bool {
     }
 }
 
-#[cfg(not(feature = "clipboard"))]
+#[cfg(any(not(feature = "clipboard"), target_os = "android"))]
 fn copy_to_clipboard(_text: &str) -> bool {
     false
 }
@@ -6989,7 +6990,7 @@ fn copy_to_clipboard(_text: &str) -> bool {
 /// Read a clipboard bitmap and normalize it to PNG for the provider-neutral
 /// `ImageContent` contract. The optional clipboard feature keeps headless
 /// builds free of platform clipboard dependencies.
-#[cfg(feature = "clipboard")]
+#[cfg(all(feature = "clipboard", not(target_os = "android")))]
 fn read_clipboard_image() -> Result<Option<rpi_ai::types::ImageContent>, String> {
     let mut clipboard = arboard::Clipboard::new().map_err(|e| e.to_string())?;
     let image = match clipboard.get_image() {
@@ -7030,7 +7031,7 @@ fn add_image_preview(chat: &Arc<Container>, image: &rpi_ai::types::ImageContent)
     }
 }
 
-#[cfg(not(feature = "clipboard"))]
+#[cfg(any(not(feature = "clipboard"), target_os = "android"))]
 fn read_clipboard_image() -> Result<Option<rpi_ai::types::ImageContent>, String> {
     Ok(None)
 }
