@@ -48,7 +48,7 @@ use rpi_harness::types::{
     DrivingMode, HarnessTool, HarnessToolExecution, RetryPolicy, ToolReplay,
 };
 use rpi_tools::{
-    create_bash_tool, create_edit_tool, create_read_tool, create_write_tool, ExecutionToolContext,
+    create_bash_tool, create_edit_tool, create_powershell_tool, create_read_tool, create_write_tool, ExecutionToolContext,
     MutationQueueRegistry, OsExecutionEnv,
 };
 
@@ -1788,6 +1788,19 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
         ("write", HarnessTool::new(create_write_tool(ctx))),
         ("docs", HarnessTool::new(create_docs_tool())),
     ];
+
+    // Add PowerShell tool on Windows
+    #[cfg(target_os = "windows")]
+    all.push(("powershell", HarnessTool::new(create_powershell_tool(ctx))));
+
+    // Apply default_tools from settings (if no CLI override)
+    if args.tools.is_none() {
+        if let Ok(settings) = crate::settings::load_settings() {
+            if let Some(default_tools) = &settings.default_tools {
+                all.retain(|(name, _)| default_tools.iter().any(|t| t == name));
+            }
+        }
+    }
 
     // `--no-builtin-tools` disables the built-in set but would keep
     // extension/custom tools — v1 has none, so it's equivalent to `--no-tools`
