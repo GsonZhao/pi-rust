@@ -4423,6 +4423,39 @@ fn double_escape_trigger(last: Option<std::time::Instant>, now: std::time::Insta
     })
 }
 
+/// How long to wait for queued console input before treating a bare Enter as a
+/// real submit. Pasted input is already in the queue, so this only needs to
+/// cover scheduler latency — small enough that a human Enter feels instant.
+const PASTE_PROBE: std::time::Duration = std::time::Duration::from_millis(4);
+
+/// Maximum gap between a pasted character and the next pasted key. A human
+/// cannot deliver two keypresses this fast, so anything tighter is paste.
+const PASTE_BURST_GAP: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Whether a bare Enter is pasted content (insert a newline) rather than a
+/// submit.
+///
+/// `crossterm` 0.27 only implements bracketed paste on Unix; on Windows the
+/// console event source never produces `Event::Paste`, so a pasted block
+/// arrives as plain key events with a bare Enter per line. Two timing signals
+/// separate a pasted Enter from a typed one:
+///
+/// - `more_queued`: the paste's remaining characters are already sitting in the
+///   console input queue, so a non-blocking poll finds them immediately.
+/// - `last_text_key_at`: the Enter lands within [`PASTE_BURST_GAP`] of the
+///   preceding pasted character, which also catches a paste that *ends* with a
+///   newline (nothing queued behind it, but it was not typed by hand).
+fn enter_is_paste_burst(
+    last_text_key_at: Option<std::time::Instant>,
+    now: std::time::Instant,
+    more_queued: bool,
+) -> bool {
+    if more_queued {
+        return true;
+    }
+    last_text_key_at.is_some_and(|previous| now.duration_since(previous) < PASTE_BURST_GAP)
+}
+
 fn transcript_page_size(viewport_height: usize) -> i32 {
     viewport_height
         .saturating_sub(PAGE_SCROLL_OVERLAP)
@@ -5462,6 +5495,9 @@ pub async fn interactive_tui(
 
     let key_handle = tokio::task::spawn_blocking(move || {
         let mut last_escape_time = None;
+        // Paste-burst tracking (see the bare-Enter guard below): the instant of
+        // the most recent key event that could have been pasted text.
+        let mut last_text_key_at: Option<std::time::Instant> = None;
         loop {
             if !*running_key.lock().unwrap() {
                 break;
@@ -6174,6 +6210,47 @@ pub async fn interactive_tui(
                 }
                 tui_for_key.request_render(false);
                 continue;
+            }
+
+            // ---- Paste-burst coalescing --------------------------------------
+            // `crossterm` 0.27 implements bracketed paste ONLY on Unix: its
+            // Windows console event source (`ReadConsoleInputW`) never emits
+            // `Event::Paste`, so `?2004h` buys nothing there and a pasted block
+            // arrives as ordinary key events with a bare Enter per line. The
+            // editor treats a bare Enter as "submit", so one paste became N
+            // messages. See [`enter_is_paste_burst`] for the discriminator.
+            if key.code == KeyCode::Enter && key.modifiers.is_empty() {
+                let more_queued = crossterm::event::poll(PASTE_PROBE).unwrap_or(false);
+                if enter_is_paste_burst(
+                    last_text_key_at,
+                    std::time::Instant::now(),
+                    more_queued,
+                ) {
+                    // Pasted newline: insert it and keep the remaining queued
+                    // events flowing through this same path.
+                    editor_for_key.insert("\n");
+                    last_text_key_at = Some(std::time::Instant::now());
+                    refresh_autocomplete(&state_for_key, &editor_for_key);
+                    tui_for_key.request_render_reusing_scroll_content();
+                    continue;
+                }
+                // A real submit ends the burst so a follow-up Enter is not
+                // mistaken for paste continuation.
+                last_text_key_at = None;
+            } else if matches!(
+                key.code,
+                KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Tab
+            ) && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                // Unmodified text keys extend the burst. Ctrl/Alt chords
+                // (Ctrl+C, Alt+Enter, …) are commands, not paste content.
+                last_text_key_at = Some(std::time::Instant::now());
+            } else {
+                // Arrows, Esc, Ctrl/Alt chords, PageUp/Down, … — not paste
+                // content; break the burst.
+                last_text_key_at = None;
             }
 
             // 6. Otherwise forward to the editor + refresh autocomplete.
@@ -10463,6 +10540,100 @@ mod tests {
         assert!(!double_escape_trigger(
             Some(now - std::time::Duration::from_millis(501)),
             now
+        ));
+    }
+
+    #[test]
+    fn pasted_multi_line_block_becomes_one_prompt_not_many() {
+        // End-to-end shape of the fix: replay the key stream a Windows paste
+        // produces ("l1\nl2\nl3" + a trailing Enter) through the same pieces
+        // the key loop uses — the burst discriminator for each Enter and the
+        // editor for the text — and assert that *no* submit fired while the
+        // block arrived, then exactly one submit on the user's own Enter.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let editor = rpi_tui::Editor::simple();
+        let submits = Arc::new(AtomicUsize::new(0));
+        let submits_for_cb = submits.clone();
+        editor.on_submit(Arc::new(move |_text: &str| {
+            submits_for_cb.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        // Every pasted key is delivered back-to-back, so `now` is unchanged and
+        // the console queue is never empty until the paste is drained.
+        let now = std::time::Instant::now();
+        let mut last_text_key_at: Option<std::time::Instant> = None;
+        let block = ["l1", "l2", "l3"];
+        for (index, line) in block.iter().enumerate() {
+            for ch in line.chars() {
+                editor.insert(&ch.to_string());
+                last_text_key_at = Some(now);
+            }
+            if index + 1 < block.len() {
+                // The pasted newline: more input is still queued behind it.
+                let more_queued = true;
+                assert!(
+                    enter_is_paste_burst(last_text_key_at, now, more_queued),
+                    "pasted newline {index} must not submit"
+                );
+                editor.insert("\n");
+                last_text_key_at = Some(now);
+            }
+        }
+        assert_eq!(editor.get_text(), "l1\nl2\nl3");
+        assert_eq!(submits.load(Ordering::SeqCst), 0, "paste must not submit");
+
+        // The user's own Enter: a real gap, nothing queued.
+        let typed_at = now + PASTE_BURST_GAP + std::time::Duration::from_millis(80);
+        assert!(!enter_is_paste_burst(last_text_key_at, typed_at, false));
+        editor.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(submits.load(Ordering::SeqCst), 1, "typed Enter submits once");
+    }
+
+    #[test]
+    fn pasted_win_crlf_text_has_no_stray_carriage_returns() {
+        // A Windows paste delivers CRLF; the editor must fold it to LF so the
+        // rendered block is clean and the cursor arithmetic stays sound.
+        let editor = rpi_tui::Editor::simple();
+        editor.insert("alpha\r\nbeta\r\n");
+        assert_eq!(editor.get_text(), "alpha\nbeta\n");
+        assert!(!editor.get_text().contains('\r'));
+    }
+
+    #[test]
+    fn pasted_enter_is_not_a_submit() {
+        let now = std::time::Instant::now();
+
+        // Queued input behind the Enter => paste, regardless of history.
+        assert!(enter_is_paste_burst(None, now, true));
+
+        // Enter immediately after pasted characters => paste (also covers a
+        // paste whose final line ends with a newline, where nothing is queued).
+        assert!(enter_is_paste_burst(
+            Some(now - std::time::Duration::from_millis(1)),
+            now,
+            false
+        ));
+        assert!(enter_is_paste_burst(
+            Some(now - (PASTE_BURST_GAP - std::time::Duration::from_millis(1))),
+            now,
+            false
+        ));
+
+        // A typed Enter: nothing queued and a real gap since the last key.
+        assert!(!enter_is_paste_burst(None, now, false));
+        assert!(!enter_is_paste_burst(
+            Some(now - PASTE_BURST_GAP),
+            now,
+            false
+        ));
+        assert!(!enter_is_paste_burst(
+            Some(now - std::time::Duration::from_millis(120)),
+            now,
+            false
         ));
     }
 
