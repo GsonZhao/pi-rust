@@ -45,10 +45,10 @@ use rpi_tui::{
     BashTruncation, CombinedAutocompleteProvider, Component, Container, DynamicBorder, Editor,
     EditorOptions, EditorStyle, FilePathAutocompleteProvider, Focusable, FollowMode,
     FooterComponent, Image, ImageOptions, Input, Loader, Markdown, ProcessTerminal, ScrollView,
-    ScrollViewOptions, SelectItem, SelectList, SlashCommand as SlashCommandEntry,
+    ScrollViewOptions, SearchBar, SelectItem, SelectList, SlashCommand as SlashCommandEntry,
     SlashCommandAutocompleteProvider, Spacer, StackChild, StackEntry, StatusIndicator, Text,
     ThemeManager, ThemePreset, ToolExecutionComponent, TuiAltScreen, UserMessageComponent, VStack,
-    TUI,
+    TUI, AltScreenSearch,
 };
 use rpi_tui::{bold as tui_bold, theme as current_theme};
 
@@ -4253,6 +4253,10 @@ struct TuiState {
     markdown_transformer: std::sync::Mutex<Option<MarkdownTransformer>>,
     /// Live extension registry used by message/entry renderer dispatch.
     extension_session: crate::session::ExtensionSessionCell,
+    /// Transcript search handler (Ctrl+Shift+F).
+    search: Arc<AltScreenSearch>,
+    /// Search bar component shown when search is active.
+    search_bar: Arc<SearchBar>,
 }
 
 /// How many submitted messages are kept for ↑ recall (mirrors the TS
@@ -5117,6 +5121,8 @@ pub async fn interactive_tui(
         scoped_edit: std::sync::Mutex::new(None),
         markdown_transformer: std::sync::Mutex::new(initial_transformer),
         extension_session: reload_context.extension_session.clone(),
+        search: Arc::new(AltScreenSearch::new()),
+        search_bar: Arc::new(SearchBar::new()),
     });
 
     // Capture the model catalog + cwd for the selector builders + the key loop
@@ -5145,6 +5151,7 @@ pub async fn interactive_tui(
                 .shrink(0)
                 .min_size(3),
         ),
+        StackChild::Entry(StackEntry::new(state.search_bar.clone())),
         StackChild::Entry(StackEntry::new(footer.clone())),
     ]));
 
@@ -5901,6 +5908,71 @@ pub async fn interactive_tui(
                         continue;
                     }
                     Ok(None) | Err(_) => {}
+                }
+            }
+
+            // 3. Ctrl+Shift+F: open transcript search
+            if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                && key.code == KeyCode::Char('F')
+            {
+                state_for_key.search.activate();
+                state_for_key.search_bar.set_visible(true);
+                state_for_key.search_bar.set_query("");
+                state_for_key.search_bar.set_match_info(0, 0);
+                tui_for_key.request_render(false);
+                continue;
+            }
+
+            // Handle search mode input
+            if state_for_key.search.is_active() {
+                let search_bar = state_for_key.search_bar.clone();
+                match key.code {
+                    KeyCode::Esc => {
+                        state_for_key.search.deactivate();
+                        search_bar.set_visible(false);
+                        tui_for_key.request_render(false);
+                        continue;
+                    }
+                    KeyCode::Enter => {
+                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            state_for_key.search.previous_match();
+                        } else {
+                            state_for_key.search.next_match();
+                        }
+                        // Update search bar with current match info
+                        let match_index = state_for_key.search.get_match_index();
+                        let match_count = state_for_key.search.get_match_count();
+                        search_bar.set_match_info(match_index, match_count);
+                        tui_for_key.request_render(false);
+                        continue;
+                    }
+                    KeyCode::Backspace => {
+                        state_for_key.search.backspace();
+                        // Re-search with updated query
+                        let lines = collect_transcript_lines(&state_for_key.chat_container);
+                        state_for_key.search.find_matches(&lines);
+                        // Update search bar
+                        let query = state_for_key.search.get_query();
+                        let match_count = state_for_key.search.get_match_count();
+                        search_bar.set_query(&query);
+                        search_bar.set_match_info(0, match_count);
+                        tui_for_key.request_render(false);
+                        continue;
+                    }
+                    KeyCode::Char(c) => {
+                        state_for_key.search.append_char(c);
+                        // Re-search with updated query
+                        let lines = collect_transcript_lines(&state_for_key.chat_container);
+                        state_for_key.search.find_matches(&lines);
+                        // Update search bar
+                        let query = state_for_key.search.get_query();
+                        let match_count = state_for_key.search.get_match_count();
+                        search_bar.set_query(&query);
+                        search_bar.set_match_info(0, match_count);
+                        tui_for_key.request_render(false);
+                        continue;
+                    }
+                    _ => continue,
                 }
             }
 
@@ -8656,6 +8728,12 @@ fn add_user_message(container: &Arc<Container>, text: &str) {
 }
 
 /// Add an error message to the chat container.
+/// Collect all rendered lines from the chat container for search.
+fn collect_transcript_lines(chat_container: &Arc<Container>) -> Vec<String> {
+    let width = 80; // Default width for search; actual width varies by terminal
+    chat_container.render(width)
+}
+
 fn add_error_message(container: &Arc<Container>, text: &str) {
     let c = current_theme().colors;
     let text = sanitize_error_message(text);
