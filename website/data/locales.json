@@ -4,6 +4,7 @@
       "nav.home": "首页",
       "nav.documentation": "文档",
       "nav.packages": "软件包",
+      "nav.blog": "博客",
       "nav.start": "开始使用",
       "nav.open": "打开导航",
       "nav.close": "关闭导航",
@@ -74,7 +75,10 @@
       "copy.codeSuccess": "代码已复制",
       "copy.commandSuccess": "命令已复制",
       "copy.failed": "复制失败，请手动选择文本",
-      "error.data": "数据加载失败，请通过本地开发服务器打开网站"
+      "error.data": "数据加载失败，请通过本地开发服务器打开网站",
+      "blog.title": "博客",
+      "blog.intro": "版本更新、技术分享与项目动态。追踪 rpi 的每一步演进。",
+      "blog.empty": "暂无文章，敬请期待。"
     }
   },
   "en": {
@@ -82,6 +86,7 @@
       "nav.home": "Home",
       "nav.documentation": "Documentation",
       "nav.packages": "Packages",
+      "nav.blog": "Blog",
       "nav.start": "Get started",
       "nav.open": "Open navigation",
       "nav.close": "Close navigation",
@@ -152,7 +157,10 @@
       "copy.codeSuccess": "Code copied",
       "copy.commandSuccess": "Command copied",
       "copy.failed": "Copy failed; select the text manually",
-      "error.data": "Data failed to load. Open the site through a local development server."
+      "error.data": "Data failed to load. Open the site through a local development server.",
+      "blog.title": "Blog",
+      "blog.intro": "Release notes, technical insights and project updates. Track every step of rpi's evolution.",
+      "blog.empty": "No posts yet. Stay tuned."
     },
     "site": {
       "hero": {
@@ -161,7 +169,7 @@
         "description": "rpi is a library-first Rust SDK. Build your own coding Agent with clear layers, replaceable model providers and a tool loop you can actually test."
       },
       "stats": [
-        { "value": "24", "label": "composable packages" },
+        { "value": "26", "label": "composable packages" },
         { "value": "2", "label": "built-in providers" },
         { "value": "4", "label": "Pi-compatible tools" },
         { "value": "0", "label": "network-dependent tests" }
@@ -213,7 +221,9 @@
       "rpi-websearch": "Keyless web reference search combining DuckDuckGo and Wikipedia with bounded titles, URLs, snippets and sources.",
       "rpi-webfetch": "Bounded public HTTP(S) page reader that blocks private DNS targets and returns fetch failures as tool results.",
       "rpi-firecrawl": "Firecrawl-backed web search and scrape tools for the rpi Agent.",
-      "rpi-extension-rpc": "Cross-platform JSONL extension RPC client and localhost server with bounded requests and timeouts."
+      "rpi-extension-rpc": "Cross-platform JSONL extension RPC client and localhost server with bounded requests and timeouts.",
+      "rpi-im-message": "Persistent Feishu/Lark messaging via WebSocket long connection with start, status, list, receive, send and stop actions.",
+      "rpi-server": "TCP JSONL server for rpi with streaming subscriptions and Transport trait abstraction, launchable via rpi --server."
     },
     "docs": {
       "title": "Documentation",

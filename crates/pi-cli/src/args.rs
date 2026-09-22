@@ -612,6 +612,12 @@ pub fn print_help() {
   --append-system-prompt <text>  Append text to the system prompt (repeatable)
   --thinking <level>             off, minimal, low, medium, high, xhigh, max
   --mode <mode>                  Output mode: text (default), json, or rpc
+  --server [--port <n>] [--bind <ip>]
+                                 Headless server: serve a remote-connectable agent (no TUI)
+  --connect <host:port>          Remote client: connect to a `--server` instance and run the TUI
+                                 (no local provider/tools/session; all agent work is remote)
+  --token <token>                Auth token for `--connect` (printed by `--server`; may also
+                                 be provided via the RPI_SERVER_TOKEN env var)
   --tui-mode <mode>              TUI buffer: regular or fullscreen (macOS default: regular)
   --list-models [search]         List available models (with optional fuzzy search)
   --offline                      Disable startup network operations (same as PI_OFFLINE=1)
@@ -645,6 +651,8 @@ pub fn print_help() {
   update                       Update the rpi CLI from crates.io
   auth login|check|logout        Manage persisted credentials in ~/.rpi/auth.json
                                 (see `rpi auth --help`)
+  events path|tail               Inspect the extension event journal (needs
+                                RPI_EVENT_LOG=1; see `rpi events --help`)
   package list|add|remove|update Update Rust-native packages and manage Pi package settings
                                 (see `rpi package --help`)
   install <crate>                Build and install a Rust cdylib extension

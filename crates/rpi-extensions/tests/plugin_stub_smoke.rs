@@ -104,10 +104,21 @@ impl PluginDiagnostics for RecordingDiag {
 
 #[tokio::test]
 async fn loads_real_cdylib_and_drives_echo_tool() {
-    let Some((stub_path, dir)) = locate_stub() else {
+    let Some((stub_src, _)) = locate_stub() else {
         eprintln!("plugin_stub cdylib not built — skipping (run `cargo build -p plugin-stub`)");
         return;
     };
+    // Isolate the scan: copy the stub into a fresh temp dir so `load_session`
+    // sees ONLY our cdylib. A shared `CARGO_TARGET_DIR` (e.g. under CI or a
+    // user's global cargo target) can contain unrelated cdylibs from other
+    // projects; the dir scan would diagnose those as load skips and trip the
+    // `warnings.is_empty()` assertion below. The copy is also the path used for
+    // the process-global hit-counter reads (`stub_*_hits`), so both `load_session`
+    // and the test must load the SAME file (same module → shared statics).
+    let scratch = tempfile::tempdir().expect("create temp dir for stub isolation");
+    let stub_path = scratch.path().join(cdylib_filename());
+    std::fs::copy(&stub_src, &stub_path).expect("copy stub cdylib into temp dir");
+    let dir = scratch.path().to_path_buf();
     eprintln!("smoke: loading {}", stub_path.display());
 
     let diag = Arc::new(RecordingDiag::default());

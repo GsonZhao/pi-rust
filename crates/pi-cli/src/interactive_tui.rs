@@ -45,10 +45,10 @@ use rpi_tui::{
     BashTruncation, CombinedAutocompleteProvider, Component, Container, DynamicBorder, Editor,
     EditorOptions, EditorStyle, FilePathAutocompleteProvider, Focusable, FollowMode,
     FooterComponent, Image, ImageOptions, Input, Loader, Markdown, ProcessTerminal, ScrollView,
-    ScrollViewOptions, SelectItem, SelectList, SlashCommand as SlashCommandEntry,
+    ScrollViewOptions, SearchBar, SelectItem, SelectList, SlashCommand as SlashCommandEntry,
     SlashCommandAutocompleteProvider, Spacer, StackChild, StackEntry, StatusIndicator, Text,
     ThemeManager, ThemePreset, ToolExecutionComponent, TuiAltScreen, UserMessageComponent, VStack,
-    TUI,
+    TUI, AltScreenSearch,
 };
 use rpi_tui::{bold as tui_bold, theme as current_theme};
 
@@ -543,6 +543,10 @@ struct CommandContext {
     /// the main loop via `TuiMessage::ReloadExtensions`, which awaits the shared
     /// `reload_extension_resources` routine on the async runtime).
     reload_context: Arc<crate::session::ReloadContext>,
+    /// The product-layer session (`AgentSession`). Commands that need durable
+    /// reads, export, or usage stats go through this instead of reaching into
+    /// the harness directly, so the product surface is one object.
+    session: Arc<crate::agent_session::AgentSession>,
 }
 
 /// One slash command.
@@ -631,6 +635,28 @@ impl CommandRegistry {
             }
         }
         out
+    }
+}
+
+/// Dispatch a ui_prompt_start event to extensions.
+fn dispatch_ui_prompt_event(state: &TuiState) {
+    use rpi_plugin_sdk::EventTag;
+    
+    if let Ok(session) = state.extension_session.lock() {
+        if let Some(snapshot) = session.snapshot_arc() {
+            rpi_extensions::dispatch_empty_event(&snapshot, EventTag::UiPromptStart);
+        }
+    }
+}
+
+/// Dispatch a ui_prompt_end event to extensions.
+fn dispatch_ui_prompt_event_end(state: &TuiState) {
+    use rpi_plugin_sdk::EventTag;
+    
+    if let Ok(session) = state.extension_session.lock() {
+        if let Some(snapshot) = session.snapshot_arc() {
+            rpi_extensions::dispatch_empty_event(&snapshot, EventTag::UiPromptEnd);
+        }
     }
 }
 
@@ -2420,10 +2446,21 @@ impl SlashCommand for ExportCommand {
         "/export"
     }
     fn description(&self) -> &'static str {
-        "Export session to a markdown file"
+        "Export session (supports: md, html, jsonl)"
     }
-    fn execute(&self, ctx: &CommandContext, _args: &str) {
-        let _ = ctx.tx.send(TuiMessage::ExportSession);
+    fn execute(&self, ctx: &CommandContext, args: &str) {
+        let format = args.trim().to_lowercase();
+        if format.is_empty() || format == "md" || format == "markdown" {
+            let _ = ctx.tx.send(TuiMessage::ExportSession);
+        } else if format == "html" {
+            let _ = ctx.tx.send(TuiMessage::ExportSessionWithFormat(crate::export::ExportFormat::Html));
+        } else if format == "jsonl" {
+            let _ = ctx.tx.send(TuiMessage::ExportSessionWithFormat(crate::export::ExportFormat::Jsonl));
+        } else {
+            // Invalid format, show error
+            add_error_message(&ctx.chat, &format!("Unknown export format: {}. Supported: md, html, jsonl", args.trim()));
+            ctx.tui.request_render(false);
+        }
     }
 }
 
@@ -2706,6 +2743,25 @@ impl SlashCommand for ContextCommand {
     }
     fn execute(&self, ctx: &CommandContext, _args: &str) {
         show_context_panel(&ctx.chat, &ctx.resources);
+        // Live session stats are async, so ask the main loop to append them.
+        let _ = ctx.tx.send(TuiMessage::ShowUsage);
+        ctx.tui.request_render(false);
+    }
+}
+
+/// `/usage` — token/cost/cache totals read through the product-layer
+/// `AgentSession`. This is the same numbers the footer shows, but expanded and
+/// with the cache-hit breakdown that the one-line footer cannot fit.
+struct UsageCommand;
+impl SlashCommand for UsageCommand {
+    fn name(&self) -> &'static str {
+        "/usage"
+    }
+    fn description(&self) -> &'static str {
+        "Show token, cost, and cache totals for this session"
+    }
+    fn execute(&self, ctx: &CommandContext, _args: &str) {
+        let _ = ctx.tx.send(TuiMessage::ShowUsage);
         ctx.tui.request_render(false);
     }
 }
@@ -2761,6 +2817,7 @@ fn build_builtin_registry() -> CommandRegistry {
     r.register(Arc::new(ArminCommand));
     r.register(Arc::new(EarendilCommand));
     r.register(Arc::new(ContextCommand));
+    r.register(Arc::new(UsageCommand));
     // Recognized but inert in v1 (one struct backs them all). The TS builtins
     // out of v1 scope; each carries a description so autocomplete surfaces its
     // existence even though running it reports "not supported".
@@ -2851,6 +2908,10 @@ enum TuiMessage {
     SwitchSession(String),
     /// Export the current session to a markdown file (from `/export`).
     ExportSession,
+    /// Export session with specific format
+    ExportSessionWithFormat(crate::export::ExportFormat),
+    /// Show live usage/context stats (from `/usage` and `/context`).
+    ShowUsage,
     /// Fork the current session into a new one and switch to it (from `/fork`).
     ForkSession,
     /// Rename the current session (from `/name <name>`).
@@ -3566,68 +3627,10 @@ async fn share_session(harness: &AgentHarness, chat: &Arc<Container>) {
     }
 }
 
-/// Export the current session to a markdown transcript file. Writes
-/// `<cwd>/<session-name-or-id>.md` with the user/assistant/tool-call history
-/// (mirrors the TS `/export` intent locally — no remote sharing in v1).
-/// Best-effort: failures surface as a chat note.
-/// Export the current session to a markdown transcript file. Writes
-/// `<cwd>/<session-name-or-id>.md` with the user/assistant/tool-call history
-/// (mirrors the TS `/export` intent locally — no remote sharing in v1).
-/// Best-effort: failures surface as a chat note.
-async fn export_session(harness: &AgentHarness, chat: &Arc<Container>, cwd: &std::path::Path) {
-    let tree = harness.session().view("main");
-    let entries = match tree
-        .find_entries(&EntryQuery {
-            entry_type: None,
-            custom_type: None,
-            // Keep exported entries in the same chronological order shown in
-            // the transcript; the storage default is newest-first.
-            order: Some(EntryOrder::OldestFirst),
-            limit: None,
-            cursor: None,
-        })
-        .await
-    {
-        Ok(e) => e,
-        Err(e) => {
-            add_error_message(chat, &format!("Could not read session: {e}"));
-            return;
-        }
-    };
-    let name = tree.get_name().await.ok().flatten().unwrap_or_default();
-    let id = tree
-        .get_leaf_id()
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "session".to_string());
-    let mut md = String::from("# Session\n\n");
-    for e in entries {
-        let Entry::Message(me) = e else { continue };
-        match &me.message {
-            AgentMessage::User(u) => {
-                md.push_str(&format!("## User\n\n{}\n\n", user_message_text(u)));
-            }
-            AgentMessage::Assistant(a) => {
-                let text = assistant_text(a);
-                if !text.is_empty() {
-                    md.push_str(&format!("## Assistant\n\n{}\n\n", text));
-                }
-            }
-            _ => {}
-        }
-    }
-    let file_name = if name.is_empty() {
-        format!("{id}.md")
-    } else {
-        format!("{name}.md")
-    };
-    let path = cwd.join(&file_name);
-    match std::fs::write(&path, md) {
-        Ok(_) => add_note_message(chat, &format!("Exported session to {}", path.display())),
-        Err(e) => add_error_message(chat, &format!("Could not write export: {e}")),
-    }
-}
+// Session export is driven through the product-layer `AgentSession`
+// (`crate::agent_session`), which owns format selection + default filenames —
+// the TUI loop calls `AgentSession::export*` directly, so there is no separate
+// helper here.
 
 /// Fork the current session into a new JSONL session and switch to it (TS
 /// `/fork` — a copy of the transcript in a fresh file; the fork is a new
@@ -4253,6 +4256,13 @@ struct TuiState {
     markdown_transformer: std::sync::Mutex<Option<MarkdownTransformer>>,
     /// Live extension registry used by message/entry renderer dispatch.
     extension_session: crate::session::ExtensionSessionCell,
+    /// Transcript search handler (Ctrl+Shift+F).
+    search: Arc<AltScreenSearch>,
+    /// Search bar component shown when search is active.
+    search_bar: Arc<SearchBar>,
+    /// Fullscreen selection tracking for auto-copy.
+    selection_start: std::sync::Mutex<Option<(u16, u16)>>,
+    selection_end: std::sync::Mutex<Option<(u16, u16)>>,
 }
 
 /// How many submitted messages are kept for ↑ recall (mirrors the TS
@@ -4411,6 +4421,39 @@ fn double_escape_trigger(last: Option<std::time::Instant>, now: std::time::Insta
     last.is_some_and(|previous| {
         now.duration_since(previous) <= std::time::Duration::from_millis(500)
     })
+}
+
+/// How long to wait for queued console input before treating a bare Enter as a
+/// real submit. Pasted input is already in the queue, so this only needs to
+/// cover scheduler latency — small enough that a human Enter feels instant.
+const PASTE_PROBE: std::time::Duration = std::time::Duration::from_millis(4);
+
+/// Maximum gap between a pasted character and the next pasted key. A human
+/// cannot deliver two keypresses this fast, so anything tighter is paste.
+const PASTE_BURST_GAP: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Whether a bare Enter is pasted content (insert a newline) rather than a
+/// submit.
+///
+/// `crossterm` 0.27 only implements bracketed paste on Unix; on Windows the
+/// console event source never produces `Event::Paste`, so a pasted block
+/// arrives as plain key events with a bare Enter per line. Two timing signals
+/// separate a pasted Enter from a typed one:
+///
+/// - `more_queued`: the paste's remaining characters are already sitting in the
+///   console input queue, so a non-blocking poll finds them immediately.
+/// - `last_text_key_at`: the Enter lands within [`PASTE_BURST_GAP`] of the
+///   preceding pasted character, which also catches a paste that *ends* with a
+///   newline (nothing queued behind it, but it was not typed by hand).
+fn enter_is_paste_burst(
+    last_text_key_at: Option<std::time::Instant>,
+    now: std::time::Instant,
+    more_queued: bool,
+) -> bool {
+    if more_queued {
+        return true;
+    }
+    last_text_key_at.is_some_and(|previous| now.duration_since(previous) < PASTE_BURST_GAP)
 }
 
 fn transcript_page_size(viewport_height: usize) -> i32 {
@@ -4814,11 +4857,24 @@ pub async fn interactive_tui(
         resolve_tui_startup_settings(&saved_settings, &project_settings, project_trusted);
     let editor_padding_x = tui_settings.editor_padding_x;
     let autocomplete_max_visible = tui_settings.autocomplete_max_visible;
-    let hide_thinking = tui_settings.hide_thinking;
+    let mut hide_thinking = tui_settings.hide_thinking;
     let show_terminal_progress = tui_settings.show_terminal_progress;
     let quiet_startup = tui_settings.quiet_startup;
     let update_checks_enabled =
         !args.offline && std::env::var_os("RPI_DISABLE_UPDATE_CHECK").is_none();
+
+    // Session display preferences (durable, latest-wins) override the
+    // settings-file defaults. These are per-session facts stored as custom
+    // entries (see `rpi_harness::session::values`), so resuming a session with
+    // `-c`/`-r` restores the thinking/tool-output display the user last chose
+    // there — independent of global settings. Absent keys leave the settings
+    // value untouched.
+    let session_values = rpi_harness::session::SessionValues::load(harness.session())
+        .await
+        .unwrap_or_default();
+    if let Some(persisted) = session_values.get_as::<bool>("display.hide_thinking") {
+        hide_thinking = persisted;
+    }
 
     // Resolve the active model once, up front. The full id feeds the TuiState
     // tracking field + the selectors/key loop (which run on a blocking thread
@@ -5083,13 +5139,16 @@ pub async fn interactive_tui(
     }
     let autocomplete_container = Arc::new(Container::new());
 
+    let tool_outputs_expanded = session_values
+        .get_as::<bool>("display.tool_outputs_expanded")
+        .unwrap_or(false);
     let state = Arc::new(TuiState {
         current_assistant: std::sync::Mutex::new(None),
         tool_components: std::sync::Mutex::new(HashMap::new()),
         bash_components: std::sync::Mutex::new(HashMap::new()),
         themes_enabled: !no_themes,
         hide_thinking: std::sync::Mutex::new(hide_thinking),
-        tool_outputs_expanded: std::sync::Mutex::new(false),
+        tool_outputs_expanded: std::sync::Mutex::new(tool_outputs_expanded),
         show_terminal_progress,
         status: std::sync::Mutex::new(RunStatus::Idle),
         js_preparation_cancel: std::sync::Mutex::new(None),
@@ -5117,6 +5176,10 @@ pub async fn interactive_tui(
         scoped_edit: std::sync::Mutex::new(None),
         markdown_transformer: std::sync::Mutex::new(initial_transformer),
         extension_session: reload_context.extension_session.clone(),
+        search: Arc::new(AltScreenSearch::new()),
+        search_bar: Arc::new(SearchBar::new()),
+        selection_start: std::sync::Mutex::new(None),
+        selection_end: std::sync::Mutex::new(None),
     });
 
     // Capture the model catalog + cwd for the selector builders + the key loop
@@ -5145,6 +5208,7 @@ pub async fn interactive_tui(
                 .shrink(0)
                 .min_size(3),
         ),
+        StackChild::Entry(StackEntry::new(state.search_bar.clone())),
         StackChild::Entry(StackEntry::new(footer.clone())),
     ]));
 
@@ -5174,6 +5238,22 @@ pub async fn interactive_tui(
     // One `CommandContext` is built and cloned for both the submit handler and
     // the key loop (Ctrl+L routes `/model` through the same registry); all
     // fields are `Arc`/cheap, so the clones are free.
+    //
+    // The product-layer `AgentSession` wraps a clone of the harness (the
+    // harness handle is cheap and shares the session/bus), so `/usage`,
+    // `/export`, and future product commands go through one surface.
+    let scoped_models = args
+        .model
+        .as_deref()
+        .map(crate::agent_session::ScopedModel::parse)
+        .into_iter()
+        .collect();
+    let agent_session = Arc::new(crate::agent_session::AgentSession::new(
+        harness.clone(),
+        model_catalog.clone(),
+        scoped_models,
+        cwd.clone(),
+    ));
     let ctx = CommandContext {
         chat: chat_container.clone(),
         tui: tui.clone(),
@@ -5188,6 +5268,7 @@ pub async fn interactive_tui(
         package_resources: package_resources.clone(),
         resources: resources_arc.clone(),
         reload_context: Arc::new(reload_context.clone()),
+        session: agent_session.clone(),
     };
 
     if let Some(js) = &reload_context.js_extension_session {
@@ -5414,6 +5495,9 @@ pub async fn interactive_tui(
 
     let key_handle = tokio::task::spawn_blocking(move || {
         let mut last_escape_time = None;
+        // Paste-burst tracking (see the bare-Enter guard below): the instant of
+        // the most recent key event that could have been pasted text.
+        let mut last_text_key_at: Option<std::time::Instant> = None;
         loop {
             if !*running_key.lock().unwrap() {
                 break;
@@ -5476,6 +5560,38 @@ pub async fn interactive_tui(
                         if scroll_for_key.scroll_by(delta) != delta {
                             tui_for_key.request_render_reusing_scroll_content();
                         }
+                    }
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                        // Start selection tracking
+                        *state_for_key.selection_start.lock().unwrap() = Some((m.column, m.row));
+                        *state_for_key.selection_end.lock().unwrap() = None;
+                    }
+                    MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                        // End selection and auto-copy if enabled
+                        if let Some(start) = *state_for_key.selection_start.lock().unwrap() {
+                            *state_for_key.selection_end.lock().unwrap() = Some((m.column, m.row));
+                            
+                            // Check if auto-copy is enabled
+                            let auto_copy = crate::settings::load_settings()
+                                .ok()
+                                .and_then(|s| s.fullscreen_copy_on_select)
+                                .unwrap_or(true);
+                            
+                            if auto_copy {
+                                // Try to extract selected text from chat container
+                                if let Some(selected_text) = extract_selected_text(
+                                    &state_for_key.chat_container,
+                                    start,
+                                    (m.column, m.row),
+                                ) {
+                                    if !selected_text.trim().is_empty() {
+                                        let _ = copy_to_clipboard(&selected_text);
+                                    }
+                                }
+                            }
+                        }
+                        *state_for_key.selection_start.lock().unwrap() = None;
+                        *state_for_key.selection_end.lock().unwrap() = None;
                     }
                     _ => {}
                 }
@@ -5797,7 +5913,17 @@ pub async fn interactive_tui(
                 &key,
                 rpi_tui::keybindings::keys::TOOLS_EXPAND,
             ) {
-                state_for_key.toggle_tool_outputs();
+                let expanded = state_for_key.toggle_tool_outputs();
+                // Persist per-session so a later `-c`/`-r` restores it.
+                let session = ctx_for_key.session.clone();
+                tokio::spawn(async move {
+                    let _ = session
+                        .set_value(
+                            "display.tool_outputs_expanded",
+                            serde_json::json!(expanded),
+                        )
+                        .await;
+                });
                 tui_for_key.request_render(false);
                 continue;
             }
@@ -5808,7 +5934,14 @@ pub async fn interactive_tui(
                 &key,
                 rpi_tui::keybindings::keys::THINKING_TOGGLE,
             ) {
-                state_for_key.toggle_thinking();
+                let hide = state_for_key.toggle_thinking();
+                // Persist per-session so a later `-c`/`-r` restores it.
+                let session = ctx_for_key.session.clone();
+                tokio::spawn(async move {
+                    let _ = session
+                        .set_value("display.hide_thinking", serde_json::json!(hide))
+                        .await;
+                });
                 tui_for_key.request_render(false);
                 continue;
             }
@@ -5901,6 +6034,71 @@ pub async fn interactive_tui(
                         continue;
                     }
                     Ok(None) | Err(_) => {}
+                }
+            }
+
+            // 3. Ctrl+Shift+F: open transcript search
+            if key.modifiers.contains(KeyModifiers::CONTROL | KeyModifiers::SHIFT)
+                && key.code == KeyCode::Char('F')
+            {
+                state_for_key.search.activate();
+                state_for_key.search_bar.set_visible(true);
+                state_for_key.search_bar.set_query("");
+                state_for_key.search_bar.set_match_info(0, 0);
+                tui_for_key.request_render(false);
+                continue;
+            }
+
+            // Handle search mode input
+            if state_for_key.search.is_active() {
+                let search_bar = state_for_key.search_bar.clone();
+                match key.code {
+                    KeyCode::Esc => {
+                        state_for_key.search.deactivate();
+                        search_bar.set_visible(false);
+                        tui_for_key.request_render(false);
+                        continue;
+                    }
+                    KeyCode::Enter => {
+                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            state_for_key.search.previous_match();
+                        } else {
+                            state_for_key.search.next_match();
+                        }
+                        // Update search bar with current match info
+                        let match_index = state_for_key.search.get_match_index();
+                        let match_count = state_for_key.search.get_match_count();
+                        search_bar.set_match_info(match_index, match_count);
+                        tui_for_key.request_render(false);
+                        continue;
+                    }
+                    KeyCode::Backspace => {
+                        state_for_key.search.backspace();
+                        // Re-search with updated query
+                        let lines = collect_transcript_lines(&state_for_key.chat_container);
+                        state_for_key.search.find_matches(&lines);
+                        // Update search bar
+                        let query = state_for_key.search.get_query();
+                        let match_count = state_for_key.search.get_match_count();
+                        search_bar.set_query(&query);
+                        search_bar.set_match_info(0, match_count);
+                        tui_for_key.request_render(false);
+                        continue;
+                    }
+                    KeyCode::Char(c) => {
+                        state_for_key.search.append_char(c);
+                        // Re-search with updated query
+                        let lines = collect_transcript_lines(&state_for_key.chat_container);
+                        state_for_key.search.find_matches(&lines);
+                        // Update search bar
+                        let query = state_for_key.search.get_query();
+                        let match_count = state_for_key.search.get_match_count();
+                        search_bar.set_query(&query);
+                        search_bar.set_match_info(0, match_count);
+                        tui_for_key.request_render(false);
+                        continue;
+                    }
+                    _ => continue,
                 }
             }
 
@@ -6014,12 +6212,67 @@ pub async fn interactive_tui(
                 continue;
             }
 
+            // ---- Paste-burst coalescing --------------------------------------
+            // `crossterm` 0.27 implements bracketed paste ONLY on Unix: its
+            // Windows console event source (`ReadConsoleInputW`) never emits
+            // `Event::Paste`, so `?2004h` buys nothing there and a pasted block
+            // arrives as ordinary key events with a bare Enter per line. The
+            // editor treats a bare Enter as "submit", so one paste became N
+            // messages. See [`enter_is_paste_burst`] for the discriminator.
+            if key.code == KeyCode::Enter && key.modifiers.is_empty() {
+                let more_queued = crossterm::event::poll(PASTE_PROBE).unwrap_or(false);
+                if enter_is_paste_burst(
+                    last_text_key_at,
+                    std::time::Instant::now(),
+                    more_queued,
+                ) {
+                    // Pasted newline: insert it and keep the remaining queued
+                    // events flowing through this same path.
+                    editor_for_key.insert("\n");
+                    last_text_key_at = Some(std::time::Instant::now());
+                    refresh_autocomplete(&state_for_key, &editor_for_key);
+                    tui_for_key.request_render_reusing_scroll_content();
+                    continue;
+                }
+                // A real submit ends the burst so a follow-up Enter is not
+                // mistaken for paste continuation.
+                last_text_key_at = None;
+            } else if matches!(
+                key.code,
+                KeyCode::Char(_) | KeyCode::Backspace | KeyCode::Tab
+            ) && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            {
+                // Unmodified text keys extend the burst. Ctrl/Alt chords
+                // (Ctrl+C, Alt+Enter, …) are commands, not paste content.
+                last_text_key_at = Some(std::time::Instant::now());
+            } else {
+                // Arrows, Esc, Ctrl/Alt chords, PageUp/Down, … — not paste
+                // content; break the burst.
+                last_text_key_at = None;
+            }
+
             // 6. Otherwise forward to the editor + refresh autocomplete.
             editor_for_key.handle_key(key);
             refresh_autocomplete(&state_for_key, &editor_for_key);
             tui_for_key.request_render_reusing_scroll_content();
         }
     });
+
+    // ---- Session lifecycle (P1): SessionStart ----
+    // The TUI + key worker are up and the session is ready to accept input.
+    // Notify subscribed extensions now so they can initialize session-scoped
+    // state. A veto here is **advisory** (the session is already up) — warn and
+    // continue. No-op when no extension subscribes.
+    if let Some(reason) = crate::session::dispatch_session_event_async(
+        reload_context,
+        rpi_plugin_sdk::EventTag::SessionStart,
+    )
+    .await
+    {
+        tracing::warn!("[rpi] extension vetoed SessionStart (advisory): {reason}");
+    }
 
     // ---- Initial prompts (run before reading from the channel) ----
     let mut prompts: Vec<String> = Vec::new();
@@ -6190,7 +6443,86 @@ pub async fn interactive_tui(
                 tui.request_render(false);
             }
             Some(TuiMessage::ExportSession) => {
-                export_session(&harness, &chat_container, &cwd).await;
+                let file_name = agent_session
+                    .default_export_file_name(crate::export::ExportFormat::Markdown)
+                    .await;
+                let path = cwd.join(&file_name);
+                match agent_session.export_to_markdown(&path).await {
+                    Ok(_) => add_note_message(
+                        &chat_container,
+                        &format!("Exported session to {}", path.display()),
+                    ),
+                    Err(e) => add_error_message(
+                        &chat_container,
+                        &format!("Could not write export: {e}"),
+                    ),
+                }
+                tui.request_render(false);
+            }
+            Some(TuiMessage::ExportSessionWithFormat(format)) => {
+                let file_name = agent_session.default_export_file_name(format.clone()).await;
+                let path = cwd.join(&file_name);
+                match agent_session.export(format, &path).await {
+                    Ok(_) => add_note_message(
+                        &chat_container,
+                        &format!("Exported session to {}", path.display()),
+                    ),
+                    Err(e) => add_error_message(
+                        &chat_container,
+                        &format!("Could not write export: {e}"),
+                    ),
+                }
+                tui.request_render(false);
+            }
+            Some(TuiMessage::ShowUsage) => {
+                let stats = agent_session.usage_stats().await.ok();
+                let total = agent_session.total_usage().await.ok();
+                let snapshot = agent_session.snapshot().await.ok();
+                match stats {
+                    Some(stats) => {
+                        let mut lines = vec![
+                            "## Usage".to_string(),
+                            String::new(),
+                            format!("- messages: {}", stats.message_count),
+                            format!("- total tokens: {}", stats.total_tokens),
+                            format!("- cached tokens: {}", stats.cached_tokens),
+                            format!("- uncached tokens: {}", stats.uncached_tokens),
+                            format!("- cost: ${:.4}", stats.cost_total),
+                        ];
+                        match stats.cache_hit_ratio() {
+                            Some(ratio) => lines
+                                .push(format!("- cache hit ratio: {:.1}%", ratio * 100.0)),
+                            None => lines.push("- cache hit ratio: n/a (no input yet)".to_string()),
+                        }
+                        if let Some(total) = total {
+                            lines.push(String::new());
+                            lines.push(format!(
+                                "- last cumulative input/output: {} / {}",
+                                total.input, total.output
+                            ));
+                        }
+                        if let Some(snapshot) = snapshot {
+                            lines.push(String::new());
+                            lines.push(format!("- lane: `{}`", snapshot.lane));
+                            lines.push(format!(
+                                "- leaf: `{}`",
+                                snapshot.leaf_id.clone().unwrap_or_else(|| "(empty)".into())
+                            ));
+                            if let Some(active) = &snapshot.active {
+                                lines.push(format!(
+                                    "- active operation: {} (`{}`)",
+                                    active.kind.as_str(),
+                                    active.run_id
+                                ));
+                            }
+                        }
+                        add_note_message(&chat_container, &lines.join("\n"));
+                    }
+                    None => add_error_message(
+                        &chat_container,
+                        "Could not read session usage stats.",
+                    ),
+                }
                 tui.request_render(false);
             }
             Some(TuiMessage::ForkSession) => {
@@ -6597,6 +6929,46 @@ fn copy_last_assistant(state: &Arc<TuiState>, chat: &Arc<Container>) {
             ),
         );
     }
+}
+
+/// Extract text from the chat container within the given screen coordinates.
+/// Returns None if the selection is invalid or empty.
+fn extract_selected_text(
+    chat_container: &Arc<Container>,
+    start: (u16, u16),
+    end: (u16, u16),
+) -> Option<String> {
+    use rpi_tui::Component;
+    
+    // Get the rendered lines from the chat container
+    let lines = chat_container.render(80); // Use a reasonable width
+    if lines.is_empty() {
+        return None;
+    }
+    
+    // Normalize coordinates (ensure start is before end)
+    let (start_row, end_row) = if start.1 <= end.1 {
+        (start.1 as usize, end.1 as usize)
+    } else {
+        (end.1 as usize, start.1 as usize)
+    };
+    
+    // Clamp to valid range
+    let start_row = start_row.min(lines.len().saturating_sub(1));
+    let end_row = end_row.min(lines.len().saturating_sub(1));
+    
+    if start_row > end_row {
+        return None;
+    }
+    
+    // Extract the selected lines
+    let selected_lines: Vec<String> = lines[start_row..=end_row].to_vec();
+    
+    if selected_lines.is_empty() {
+        return None;
+    }
+    
+    Some(selected_lines.join("\n"))
 }
 
 /// Best-effort clipboard write. Enabled only with the `clipboard` feature
@@ -7532,6 +7904,9 @@ fn open_selector_with_view<C: Component + 'static>(
     view: Arc<C>,
     kind: SelectorKind,
 ) {
+    // Dispatch ui_prompt_start event
+    dispatch_ui_prompt_event(state);
+    
     // Unfocus the editor so its cursor marker doesn't render behind the list.
     editor.set_focused(false);
     // A selector replaces the editor slot. Drop stale slash/@file
@@ -7554,6 +7929,9 @@ fn close_selector(
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
 ) {
+    // Dispatch ui_prompt_end event
+    dispatch_ui_prompt_event_end(state);
+    
     editor_container.clear();
     editor_container.add_child(editor.clone());
     state.autocomplete_container.clear();
@@ -8642,6 +9020,12 @@ fn add_user_message(container: &Arc<Container>, text: &str) {
 }
 
 /// Add an error message to the chat container.
+/// Collect all rendered lines from the chat container for search.
+fn collect_transcript_lines(chat_container: &Arc<Container>) -> Vec<String> {
+    let width = 80; // Default width for search; actual width varies by terminal
+    chat_container.render(width)
+}
+
 fn add_error_message(container: &Arc<Container>, text: &str) {
     let c = current_theme().colors;
     let text = sanitize_error_message(text);
@@ -9462,6 +9846,7 @@ mod tests {
             "/tools",
             "/images",
             "/thinking",
+            "/usage",
             "/armin",
             "/earendil",
         ] {
@@ -9524,6 +9909,10 @@ mod tests {
             extension_session: Arc::new(std::sync::Mutex::new(
                 rpi_extensions::ExtensionSession::none(),
             )),
+            search: Arc::new(AltScreenSearch::new()),
+            search_bar: Arc::new(SearchBar::new()),
+            selection_start: std::sync::Mutex::new(None),
+            selection_end: std::sync::Mutex::new(None),
         });
 
         // The drain handler takes `Arc<TuiAltScreen>`, which needs a real
@@ -9881,6 +10270,10 @@ mod tests {
             extension_session: Arc::new(std::sync::Mutex::new(
                 rpi_extensions::ExtensionSession::none(),
             )),
+            search: Arc::new(AltScreenSearch::new()),
+            search_bar: Arc::new(SearchBar::new()),
+            selection_start: std::sync::Mutex::new(None),
+            selection_end: std::sync::Mutex::new(None),
         });
         {
             let mut combined = CombinedAutocompleteProvider::new();
@@ -9949,6 +10342,10 @@ mod tests {
             extension_session: Arc::new(std::sync::Mutex::new(
                 rpi_extensions::ExtensionSession::none(),
             )),
+            search: Arc::new(AltScreenSearch::new()),
+            search_bar: Arc::new(SearchBar::new()),
+            selection_start: std::sync::Mutex::new(None),
+            selection_end: std::sync::Mutex::new(None),
         });
         let editor_container = Arc::new(Container::new());
         let editor = Arc::new(Editor::simple());
@@ -10020,6 +10417,10 @@ mod tests {
             extension_session: Arc::new(std::sync::Mutex::new(
                 rpi_extensions::ExtensionSession::none(),
             )),
+            search: Arc::new(AltScreenSearch::new()),
+            search_bar: Arc::new(SearchBar::new()),
+            selection_start: std::sync::Mutex::new(None),
+            selection_end: std::sync::Mutex::new(None),
         });
         let editor = Arc::new(Editor::simple());
 
@@ -10094,6 +10495,10 @@ mod tests {
             extension_session: Arc::new(std::sync::Mutex::new(
                 rpi_extensions::ExtensionSession::none(),
             )),
+            search: Arc::new(AltScreenSearch::new()),
+            search_bar: Arc::new(SearchBar::new()),
+            selection_start: std::sync::Mutex::new(None),
+            selection_end: std::sync::Mutex::new(None),
         });
         {
             let mut combined = CombinedAutocompleteProvider::new();
@@ -10135,6 +10540,100 @@ mod tests {
         assert!(!double_escape_trigger(
             Some(now - std::time::Duration::from_millis(501)),
             now
+        ));
+    }
+
+    #[test]
+    fn pasted_multi_line_block_becomes_one_prompt_not_many() {
+        // End-to-end shape of the fix: replay the key stream a Windows paste
+        // produces ("l1\nl2\nl3" + a trailing Enter) through the same pieces
+        // the key loop uses — the burst discriminator for each Enter and the
+        // editor for the text — and assert that *no* submit fired while the
+        // block arrived, then exactly one submit on the user's own Enter.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let editor = rpi_tui::Editor::simple();
+        let submits = Arc::new(AtomicUsize::new(0));
+        let submits_for_cb = submits.clone();
+        editor.on_submit(Arc::new(move |_text: &str| {
+            submits_for_cb.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        // Every pasted key is delivered back-to-back, so `now` is unchanged and
+        // the console queue is never empty until the paste is drained.
+        let now = std::time::Instant::now();
+        let mut last_text_key_at: Option<std::time::Instant> = None;
+        let block = ["l1", "l2", "l3"];
+        for (index, line) in block.iter().enumerate() {
+            for ch in line.chars() {
+                editor.insert(&ch.to_string());
+                last_text_key_at = Some(now);
+            }
+            if index + 1 < block.len() {
+                // The pasted newline: more input is still queued behind it.
+                let more_queued = true;
+                assert!(
+                    enter_is_paste_burst(last_text_key_at, now, more_queued),
+                    "pasted newline {index} must not submit"
+                );
+                editor.insert("\n");
+                last_text_key_at = Some(now);
+            }
+        }
+        assert_eq!(editor.get_text(), "l1\nl2\nl3");
+        assert_eq!(submits.load(Ordering::SeqCst), 0, "paste must not submit");
+
+        // The user's own Enter: a real gap, nothing queued.
+        let typed_at = now + PASTE_BURST_GAP + std::time::Duration::from_millis(80);
+        assert!(!enter_is_paste_burst(last_text_key_at, typed_at, false));
+        editor.handle_key(crossterm::event::KeyEvent::new(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        ));
+        assert_eq!(submits.load(Ordering::SeqCst), 1, "typed Enter submits once");
+    }
+
+    #[test]
+    fn pasted_win_crlf_text_has_no_stray_carriage_returns() {
+        // A Windows paste delivers CRLF; the editor must fold it to LF so the
+        // rendered block is clean and the cursor arithmetic stays sound.
+        let editor = rpi_tui::Editor::simple();
+        editor.insert("alpha\r\nbeta\r\n");
+        assert_eq!(editor.get_text(), "alpha\nbeta\n");
+        assert!(!editor.get_text().contains('\r'));
+    }
+
+    #[test]
+    fn pasted_enter_is_not_a_submit() {
+        let now = std::time::Instant::now();
+
+        // Queued input behind the Enter => paste, regardless of history.
+        assert!(enter_is_paste_burst(None, now, true));
+
+        // Enter immediately after pasted characters => paste (also covers a
+        // paste whose final line ends with a newline, where nothing is queued).
+        assert!(enter_is_paste_burst(
+            Some(now - std::time::Duration::from_millis(1)),
+            now,
+            false
+        ));
+        assert!(enter_is_paste_burst(
+            Some(now - (PASTE_BURST_GAP - std::time::Duration::from_millis(1))),
+            now,
+            false
+        ));
+
+        // A typed Enter: nothing queued and a real gap since the last key.
+        assert!(!enter_is_paste_burst(None, now, false));
+        assert!(!enter_is_paste_burst(
+            Some(now - PASTE_BURST_GAP),
+            now,
+            false
+        ));
+        assert!(!enter_is_paste_burst(
+            Some(now - std::time::Duration::from_millis(120)),
+            now,
+            false
         ));
     }
 

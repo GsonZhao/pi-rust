@@ -34,6 +34,9 @@ pub enum HarnessErrorTag {
     Io,
     Agent,
     Compaction,
+    /// The requested capability is recognized but not implemented in this
+    /// port. Carries the deferred feature name for diagnostics.
+    NotImplemented,
 }
 
 impl HarnessErrorTag {
@@ -56,6 +59,7 @@ impl HarnessErrorTag {
             HarnessErrorTag::Io => "Io",
             HarnessErrorTag::Agent => "Agent",
             HarnessErrorTag::Compaction => "Compaction",
+            HarnessErrorTag::NotImplemented => "NotImplemented",
         }
     }
 }
@@ -143,6 +147,10 @@ pub enum HarnessError {
     Agent { message: String },
     #[error("{message}")]
     Compaction { message: String },
+    /// The requested capability is recognized but not implemented yet. Keeps
+    /// the deferred surface explicit instead of returning a silent `Ok`.
+    #[error("{message}")]
+    NotImplemented { feature: String, message: String },
 }
 
 impl HarnessError {
@@ -167,6 +175,7 @@ impl HarnessError {
             HarnessError::Io { .. } => HarnessErrorTag::Io,
             HarnessError::Agent { .. } => HarnessErrorTag::Agent,
             HarnessError::Compaction { .. } => HarnessErrorTag::Compaction,
+            HarnessError::NotImplemented { .. } => HarnessErrorTag::NotImplemented,
         }
     }
 
@@ -261,6 +270,15 @@ impl HarnessError {
     pub fn io(message: impl Into<String>) -> Self {
         HarnessError::Io {
             message: message.into(),
+        }
+    }
+    /// A recognized-but-deferred capability. `feature` is the API name; the
+    /// message is generated so callers get a consistent diagnostic.
+    pub fn not_implemented(feature: impl Into<String>) -> Self {
+        let feature = feature.into();
+        HarnessError::NotImplemented {
+            message: format!("harness feature '{feature}' is not implemented"),
+            feature,
         }
     }
 }

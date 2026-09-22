@@ -10,6 +10,7 @@ use crate::providers::anthropic::cost::calculate_cost;
 use crate::providers::anthropic::json_parse::parse_streaming_json;
 use crate::providers::anthropic::retry::retry_provider_request;
 use crate::providers::anthropic::sse::SseEventStream;
+use crate::strict_schema::strict_tool_parameters;
 use crate::types::{
     Api, AssistantMessage, AssistantMessageEvent, ConstrainedSamplingConfig, Content, Context,
     DoneReason, ErrorReason, ImageContent, InputModality, Message, StopReason, ThinkingLevel, Tool,
@@ -1670,7 +1671,18 @@ fn build_request(model: &Model, ctx: &Context, opts: &SimpleStreamOptions) -> Va
                 })
             } else {
                 let mut tool = json!({"type":"function","name":t.name,"description":t.description,"parameters":t.parameters.as_value()});
-                if supports_strict_mode(model) { tool["strict"] = Value::Bool(true); }
+                // OpenAI rejects `strict: true` unless every object node carries
+                // `additionalProperties: false`, which `schemars` does not emit for
+                // the built-in tools. Transform first and only advertise strict
+                // when the transform succeeds, otherwise the request is a hard
+                // 400 (`'additionalProperties' is required to be supplied and to
+                // be false`).
+                if supports_strict_mode(model) {
+                    if let Some(strict_parameters) = strict_tool_parameters(t) {
+                        tool["parameters"] = strict_parameters;
+                        tool["strict"] = Value::Bool(true);
+                    }
+                }
                 tool
             }
         }).collect());
@@ -2279,6 +2291,107 @@ mod tests {
             "openai",
             "https://example.test/v1",
         )
+    }
+
+    fn strict_model() -> Model {
+        let mut model = model();
+        model.compat = Some(StreamingProtocolCompat::OpenaiResponses(
+            OpenaiResponsesCompat {
+                supports_strict_mode: Some(true),
+                ..Default::default()
+            },
+        ));
+        model
+    }
+
+    /// Regression: `strict: true` used to be advertised alongside the raw
+    /// `schemars` schema, which has no `additionalProperties: false`. OpenAI
+    /// rejected that with
+    ///
+    /// ```text
+    /// Invalid schema for function 'read': In context=(), 'additionalProperties'
+    /// is required to be supplied and to be false.
+    ///   "param": "tools[0].parameters"
+    /// ```
+    ///
+    /// which failed every request that carried the built-in tools.
+    #[test]
+    fn strict_mode_transforms_the_schema_before_advertising_strict() {
+        use crate::types::{ConstrainedSamplingConfig, ConstrainedStrictness};
+
+        // Mirrors the built-in `read` tool: schemars output, no
+        // `additionalProperties`, only `path` required.
+        let opting_in = Tool {
+            name: "read".into(),
+            description: "Read a file".into(),
+            parameters: Schema::new(json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "offset": {"type": ["integer", "null"]}
+                },
+                "required": ["path"]
+            })),
+            constrained_sampling: Some(ConstrainedSamplingConfig::JsonSchema {
+                strict: ConstrainedStrictness::Prefer,
+            }),
+        };
+        // Precondition: the untransformed schema is exactly what OpenAI rejects.
+        assert!(
+            opting_in
+                .parameters
+                .as_value()
+                .get("additionalProperties")
+                .is_none(),
+            "precondition: schemars does not emit additionalProperties"
+        );
+
+        // Mirrors `find` / `grep` / `ls` / `powershell`, which opt out.
+        let opting_out = Tool {
+            name: "ls".into(),
+            description: "List a directory".into(),
+            parameters: Schema::new(json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": []
+            })),
+            constrained_sampling: None,
+        };
+
+        let context = Context {
+            system_prompt: None,
+            messages: Vec::new(),
+            tools: vec![opting_in, opting_out],
+        };
+        let body = build_request(&strict_model(), &context, &SimpleStreamOptions::default());
+        let tools = body["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 2);
+
+        // Opted in: strict is advertised *and* the schema was transformed.
+        assert_eq!(tools[0]["name"], "read");
+        assert_eq!(tools[0]["strict"], true);
+        assert_eq!(tools[0]["parameters"]["additionalProperties"], false);
+        let mut required: Vec<&str> = tools[0]["parameters"]["required"]
+            .as_array()
+            .expect("required array")
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        required.sort_unstable();
+        assert_eq!(
+            required,
+            vec!["offset", "path"],
+            "strict mode requires every property to be listed"
+        );
+
+        // Opted out: no `strict` key, so the raw schema is sent unchanged.
+        assert_eq!(tools[1]["name"], "ls");
+        assert!(
+            tools[1].get("strict").is_none(),
+            "an opted-out tool must not advertise strict: {}",
+            tools[1]
+        );
+        assert!(tools[1]["parameters"].get("additionalProperties").is_none());
     }
 
     #[test]

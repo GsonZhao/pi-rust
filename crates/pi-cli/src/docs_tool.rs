@@ -30,27 +30,33 @@ struct DocPage {
 static DOCS: &[DocPage] = &[
     DocPage {
         topic: "authoring",
-        description: "创建 Pi JS/TS package 与 Rust cdylib 扩展的模板、开发流程、安全边界、测试和发布最佳实践",
+        description: "Rust cdylib 扩展开发最佳实践：ABI v3/v2 入口、工具生命周期、事件处理器、资源发现、rpi dev 开发与发布检查清单",
         content: include_str!("../embedded-docs/extension-authoring.md"),
         aliases: &["package-authoring", "extension-authoring", "create-package", "create-extension"],
     },
     DocPage {
         topic: "guide",
-        description: "完整使用手册：安装、模型、CLI、.rpi 资源、Pi package、扩展、SDK、排错和发布",
+        description: "完整使用手册：安装、模型、CLI、.rpi 资源、Rust 扩展、SDK、排错和发布",
         content: include_str!("../embedded-docs/user-guide.md"),
         aliases: &["manual", "user-guide", "cli", "quickstart"],
     },
     DocPage {
         topic: "overview",
-        description: "rpi installation, built-in tools, configuration, packages, and release basics",
+        description: "rpi installation, built-in tools, configuration, extensions, and release basics",
         content: include_str!("../embedded-docs/README.md"),
         aliases: &["readme", "getting-started", "start", "usage"],
     },
     DocPage {
-        topic: "extensions",
-        description: "Rust plugins, Pi JavaScript/TypeScript extensions, runtime capabilities, and UI compatibility",
-        content: include_str!("../embedded-docs/extension-backends.md"),
-        aliases: &["plugin", "plugins", "extension", "js", "typescript", "ts"],
+        topic: "agent",
+        description: "用 rpi SDK 创建自己的 Agent 项目的默认结构与规范：目录布局、内嵌 Agent、cdylib 适配、工具单一登记点、prompts/skills、配置与开发循环",
+        content: include_str!("../embedded-docs/agent-project.md"),
+        aliases: &[
+            "agent-project",
+            "project-layout",
+            "create-agent",
+            "scaffold",
+            "project-structure",
+        ],
     },
     DocPage {
         topic: "architecture",
@@ -59,10 +65,10 @@ static DOCS: &[DocPage] = &[
         aliases: &["design", "crates", "sdk"],
     },
     DocPage {
-        topic: "compatibility",
-        description: "known Pi parity decisions, resource precedence, and remaining compatibility notes",
-        content: include_str!("../embedded-docs/m6-cli-open-questions.md"),
-        aliases: &["pi", "parity", "migration"],
+        topic: "debugging",
+        description: "Rust cdylib 扩展编写（ABI v3/v2、工具生命周期、事件处理器）与 agent/扩展调试（事件日志、rpi dev-local、常见失败定位）",
+        content: include_str!("../embedded-docs/rust-debugging.md"),
+        aliases: &["rust", "rust-debug", "extension-debug", "troubleshoot", "debug"],
     },
 ];
 
@@ -86,7 +92,7 @@ impl DocsTool {
         Self {
             schema: Tool {
                 name: "docs".to_string(),
-                description: "Look up rpi usage documentation. Omit topic (or use topic=list) to list topics; pass a topic such as guide, authoring, extensions, architecture, or compatibility. Add query to find relevant sections. Use this before guessing rpi commands, creating packages/extensions, Pi compatibility, extension APIs, or .rpi configuration.".to_string(),
+                description: "Look up rpi usage documentation. Omit topic (or use topic=list) to list topics; pass a topic such as guide, authoring, agent, debugging, architecture, or overview. Add query to find relevant sections. Use this before guessing rpi commands, creating an agent project or extension, extension APIs, or .rpi configuration.".to_string(),
                 parameters: rpi_ai::types::Schema::new(
                     serde_json::to_value(params).unwrap_or_default(),
                 ),
@@ -172,7 +178,7 @@ fn format_catalog() -> String {
     for page in DOCS {
         out.push_str(&format!("- {}: {}\n", page.topic, page.description));
     }
-    out.push_str("\nUse docs with {\"topic\": \"extensions\"} or add {\"query\": \"install-pi\"} for a focused lookup.");
+    out.push_str("\nUse docs with {\"topic\": \"agent\"} or add {\"query\": \"AgentBuilder\"} for a focused lookup.");
     out
 }
 
@@ -248,32 +254,53 @@ mod tests {
         assert!(output.contains("overview"));
         assert!(output.contains("guide"));
         assert!(output.contains("authoring"));
-        assert!(output.contains("extensions"));
+        assert!(output.contains("- agent:"));
+        assert!(output.contains("debugging"));
+        assert!(!output.contains("- extensions:"));
+        assert!(!output.contains("- compatibility:"));
+    }
+
+    #[tokio::test]
+    async fn returns_rust_debugging_guide() {
+        let output = execute(serde_json::json!({"topic": "debugging", "query": "rpi dev"})).await;
+        assert!(output.contains("rpi dev"));
+        assert!(output.contains("cdylib"));
     }
 
     #[tokio::test]
     async fn returns_complete_user_guide() {
-        let output = execute(serde_json::json!({"topic": "guide", "query": "install-pi"})).await;
-        assert!(output.contains("rpi install-pi"));
-        assert!(output.contains("npm"));
+        let output = execute(serde_json::json!({"topic": "guide", "query": "cdylib"})).await;
+        assert!(output.contains("cdylib"));
+        assert!(output.contains("Rust"));
     }
 
     #[tokio::test]
     async fn returns_extension_authoring_practices() {
         let output = execute(serde_json::json!({"topic": "authoring", "query": "rpi dev"})).await;
         assert!(output.contains("rpi dev"));
-        assert!(output.contains("cdylib"));
+
+        // The cdylib build contract is a separate section from the `rpi dev`
+        // workflow text, so query for it directly rather than relying on both
+        // terms co-occurring in one excerpt window.
+        let cdylib = execute(serde_json::json!({"topic": "authoring", "query": "cdylib"})).await;
+        assert!(cdylib.contains("cdylib"));
     }
 
     #[tokio::test]
-    async fn returns_focused_search_results() {
+    async fn returns_agent_project_guide() {
         let output = execute(serde_json::json!({
-            "topic": "extensions",
-            "query": "Node"
+            "topic": "agent",
+            "query": "AgentBuilder"
         }))
         .await;
-        assert!(output.contains("Node"));
+        assert!(output.contains("AgentBuilder"));
         assert!(output.contains("Matches for"));
+    }
+
+    #[tokio::test]
+    async fn agent_aliases_resolve() {
+        let output = execute(serde_json::json!({"topic": "create-agent"})).await;
+        assert!(output.contains("rpi Agent 项目结构创建指南"));
     }
 
     #[tokio::test]

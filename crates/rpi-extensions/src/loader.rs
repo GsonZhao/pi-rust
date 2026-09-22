@@ -17,8 +17,9 @@ use libloading::Library;
 use thiserror::Error;
 
 use rpi_plugin_sdk::{
-    LegacyPluginApiV1, LegacyRpiPluginRegister, PluginApiVt, RpiPluginRegister,
-    LEGACY_PLUGIN_ABI_VERSION, RPI_PLUGIN_ABI_VERSION,
+    LegacyPluginApiV1, LegacyRpiPluginRegister, PluginApiVt, PluginApiVt3Ext, RpiPluginRegister,
+    RpiPluginRegisterV3, LEGACY_PLUGIN_ABI_VERSION, RPI_PLUGIN_ABI_VERSION,
+    RPI_PLUGIN_ABI_VERSION_V3,
 };
 
 use crate::registry::{ExtensionRegistry, RegistrySnapshot};
@@ -41,10 +42,11 @@ pub enum PluginLoadError {
         source: libloading::Error,
     },
     #[error(
-        "neither `rpi_plugin_register_v2` nor legacy `rpi_plugin_register` was found in {path} (v2: {v2_error}; v1: {legacy_error})"
+        "neither `rpi_plugin_register_v3`, `rpi_plugin_register_v2`, nor legacy `rpi_plugin_register` was found in {path} (v3: {v3_error}; v2: {v2_error}; v1: {legacy_error})"
     )]
     Symbol {
         path: PathBuf,
+        v3_error: String,
         v2_error: String,
         legacy_error: String,
     },
@@ -82,6 +84,8 @@ pub struct LoadedPlugin {
 
 #[derive(Clone, Copy)]
 enum RegisterEntrypoint {
+    /// ABI v3: newest — receives the frozen v2 vtable + the v3 ext block.
+    V3(RpiPluginRegisterV3),
     V2(RpiPluginRegister),
     V1(LegacyRpiPluginRegister),
 }
@@ -89,37 +93,62 @@ enum RegisterEntrypoint {
 impl RegisterEntrypoint {
     fn abi_version(self) -> u32 {
         match self {
+            Self::V3(_) => RPI_PLUGIN_ABI_VERSION_V3,
             Self::V2(_) => RPI_PLUGIN_ABI_VERSION,
             Self::V1(_) => LEGACY_PLUGIN_ABI_VERSION,
         }
     }
 }
 
-fn select_register<V, L, E>(
-    v2: Result<V, E>,
-    legacy: impl FnOnce() -> Result<L, E>,
-) -> Result<Result<V, L>, (E, E)> {
-    match v2 {
-        Ok(register) => Ok(Ok(register)),
-        Err(v2_error) => match legacy() {
-            Ok(register) => Ok(Err(register)),
-            Err(legacy_error) => Err((v2_error, legacy_error)),
+/// Prefer the newest ABI: v3, then v2, then legacy v1. Each lookup is lazy —
+/// once a higher symbol is found, lower ones are not consulted (mirrors the
+/// "never fall back after a successful lookup" contract). On total failure the
+/// three errors are returned for the `Symbol` diagnostic.
+fn select_register<E>(
+    v3: Result<RpiPluginRegisterV3, E>,
+    v2: impl FnOnce() -> Result<RpiPluginRegister, E>,
+    legacy: impl FnOnce() -> Result<LegacyRpiPluginRegister, E>,
+) -> Result<RegisterEntrypoint, (E, E, E)> {
+    match v3 {
+        Ok(register) => Ok(RegisterEntrypoint::V3(register)),
+        Err(v3_error) => match v2() {
+            Ok(register) => Ok(RegisterEntrypoint::V2(register)),
+            Err(v2_error) => match legacy() {
+                Ok(register) => Ok(RegisterEntrypoint::V1(register)),
+                Err(legacy_error) => Err((v3_error, v2_error, legacy_error)),
+            },
         },
     }
 }
 
 fn call_register(entrypoint: RegisterEntrypoint, host_api: &Arc<HostApi>) -> i32 {
+    // Leak the vtables. The SDK asks plugins to *copy* the function pointers
+    // they need during `register`, but real-world plugins retain the `api`
+    // pointer to call e.g. `runtime_action` later. The host already keeps the
+    // `user_data` (the `ActionBridge`) alive for the whole session, so keeping
+    // the table valid is consistent with that contract and prevents a
+    // use-after-free for plugins that hold the pointer. Bounded: one table per
+    // plugin load (a leak of a few dozen bytes per load/reload).
     match entrypoint {
+        RegisterEntrypoint::V3(register) => {
+            let vtable: &'static PluginApiVt = Box::leak(Box::new(host_api.build_vtable()));
+            let ext: &'static PluginApiVt3Ext =
+                Box::leak(Box::new(host_api.build_vtable_v3_ext()));
+            register(
+                vtable as *const PluginApiVt,
+                ext as *const PluginApiVt3Ext,
+                RPI_PLUGIN_ABI_VERSION_V3,
+            )
+        }
         RegisterEntrypoint::V2(register) => {
-            let vtable = host_api.build_vtable();
-            let vt_ref: &PluginApiVt = &vtable;
-            register(vt_ref as *const PluginApiVt, RPI_PLUGIN_ABI_VERSION)
+            let vtable: &'static PluginApiVt = Box::leak(Box::new(host_api.build_vtable()));
+            register(vtable as *const PluginApiVt, RPI_PLUGIN_ABI_VERSION)
         }
         RegisterEntrypoint::V1(register) => {
-            let vtable = host_api.build_legacy_vtable();
-            let vt_ref: &LegacyPluginApiV1 = &vtable;
+            let vtable: &'static LegacyPluginApiV1 =
+                Box::leak(Box::new(host_api.build_legacy_vtable()));
             register(
-                vt_ref as *const LegacyPluginApiV1,
+                vtable as *const LegacyPluginApiV1,
                 LEGACY_PLUGIN_ABI_VERSION,
             )
         }
@@ -158,13 +187,19 @@ pub fn load_one(
         source: e,
     })?;
 
-    // 2. Prefer ABI v2. The legacy lookup is lazy, so a plugin exporting both
-    // symbols is unambiguously v2 and the legacy path is not even consulted.
+    // 2. Prefer the newest ABI: v3, then v2, then legacy v1. Each lookup is lazy,
+    // so a plugin exporting v3 is unambiguously v3 and lower paths are not even
+    // consulted.
     let entrypoint = unsafe {
         select_register(
             library
-                .get::<RpiPluginRegister>(rpi_plugin_sdk::REGISTER_SYMBOL_V2)
+                .get::<RpiPluginRegisterV3>(rpi_plugin_sdk::REGISTER_SYMBOL_V3)
                 .map(|symbol| *symbol),
+            || {
+                library
+                    .get::<RpiPluginRegister>(rpi_plugin_sdk::REGISTER_SYMBOL_V2)
+                    .map(|symbol| *symbol)
+            },
             || {
                 library
                     .get::<LegacyRpiPluginRegister>(rpi_plugin_sdk::LEGACY_REGISTER_SYMBOL)
@@ -172,22 +207,32 @@ pub fn load_one(
             },
         )
     }
-    .map(|selected| match selected {
-        Ok(register) => RegisterEntrypoint::V2(register),
-        Err(register) => RegisterEntrypoint::V1(register),
-    })
-    .map_err(|(v2_error, legacy_error)| PluginLoadError::Symbol {
+    .map_err(|(v3_error, v2_error, legacy_error)| PluginLoadError::Symbol {
         path: path.clone(),
+        v3_error: v3_error.to_string(),
         v2_error: v2_error.to_string(),
         legacy_error: legacy_error.to_string(),
     })?;
     let abi_version = entrypoint.abi_version();
 
+    // Plugin display name (file stem) — stamped onto every registration the
+    // plugin makes so host diagnostics (e.g. lifecycle veto messages) can name
+    // the owning extension. Pure host-side; never crosses the ABI.
+    let plugin_name = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "<unknown-plugin>".to_string());
+
     // 3. Build a fresh registry + HostApi + vtable for this plugin.
     let registry = ExtensionRegistry::new();
     let host_api = match action_bridge {
-        Some(bridge) => HostApi::with_action_bridge(registry, Arc::clone(&diagnostics), bridge),
-        None => HostApi::new(registry, Arc::clone(&diagnostics)),
+        Some(bridge) => HostApi::with_action_bridge(
+            plugin_name.clone(),
+            registry,
+            Arc::clone(&diagnostics),
+            bridge,
+        ),
+        None => HostApi::new(plugin_name, registry, Arc::clone(&diagnostics)),
     };
     // 4. Set the thread-local current api so the register trampolines can reach
     //    the registry. Register is synchronous + single-threaded per plugin.
@@ -558,9 +603,26 @@ mod tests {
     static V2_CALLS: AtomicUsize = AtomicUsize::new(0);
     static V1_CALLS: AtomicUsize = AtomicUsize::new(0);
     static V1_LOOKUPS: AtomicUsize = AtomicUsize::new(0);
+    static V2_LOOKUPS: AtomicUsize = AtomicUsize::new(0);
     static V2_SEEN_VERSION: AtomicU32 = AtomicU32::new(0);
     static V1_SEEN_VERSION: AtomicU32 = AtomicU32::new(0);
     static V2_RETURN: AtomicI32 = AtomicI32::new(0);
+    static V3_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static V3_SEEN_VERSION: AtomicU32 = AtomicU32::new(0);
+    static V3_RETURN: AtomicI32 = AtomicI32::new(0);
+
+    extern "C" fn test_register_v3(
+        api: *const PluginApiVt,
+        ext: *const PluginApiVt3Ext,
+        abi_version: u32,
+    ) -> i32 {
+        if api.is_null() || ext.is_null() {
+            return -99;
+        }
+        V3_CALLS.fetch_add(1, Ordering::SeqCst);
+        V3_SEEN_VERSION.store(abi_version, Ordering::SeqCst);
+        V3_RETURN.load(Ordering::SeqCst)
+    }
 
     extern "C" fn test_register_v2(api: *const PluginApiVt, abi_version: u32) -> i32 {
         if api.is_null() {
@@ -594,7 +656,11 @@ mod tests {
     }
 
     fn test_host_api() -> Arc<HostApi> {
-        HostApi::new(ExtensionRegistry::new(), Arc::new(CapturingDiag::default()))
+        HostApi::new(
+            "test-plugin",
+            ExtensionRegistry::new(),
+            Arc::new(CapturingDiag::default()),
+        )
     }
 
     struct CdylibFixture {
@@ -846,67 +912,161 @@ pub extern "C" fn rpi_plugin_register(api: *const PluginApiVt, abi_version: u32)
         }
     }
 
+    // A minimal self-contained ABI v3 plugin: exports `rpi_plugin_register_v3`
+    // and calls the v3 `declare` slot to declare a priority + platforms. It does
+    // NOT import the workspace SDK, so it also proves the loader negotiates v3
+    // and delivers the ext block end-to-end.
+    const V3_PLUGIN_SOURCE: &str = r##"
+use std::ffi::c_void;
+
+#[repr(C)]
+struct StbStringRef {
+    ptr: *const u8,
+    len: usize,
+}
+
+#[repr(C)]
+struct PluginApiVt3Ext {
+    declare: Option<extern "C" fn(json: StbStringRef) -> i32>,
+    _reserved: [*mut c_void; 3],
+}
+
+// Opaque frozen v2 vtable: the fixture never reads it, only receives the ptr.
+#[repr(C)]
+struct PluginApiVt {
+    _opaque: [*mut c_void; 14],
+}
+
+#[no_mangle]
+pub extern "C" fn rpi_plugin_register_v3(
+    _api: *const PluginApiVt,
+    ext: *const PluginApiVt3Ext,
+    abi_version: u32,
+) -> i32 {
+    if abi_version != 3 {
+        return 1;
+    }
+    if ext.is_null() {
+        return 2;
+    }
+    let ext = unsafe { &*ext };
+    let Some(declare) = ext.declare else {
+        return 3;
+    };
+    let json = r#"{"priority":42,"platforms":["all"]}"#;
+    let rc = declare(StbStringRef {
+        ptr: json.as_ptr(),
+        len: json.len(),
+    });
+    if rc != 0 {
+        return 4;
+    }
+    0
+}
+"##;
+
     #[test]
-    fn entrypoint_selection_supports_v1_v2_and_never_falls_back_after_call() {
+    fn loads_v3_plugin_and_applies_declaration() {
+        let fixture = build_cdylib_fixture("abi_v3_declare", V3_PLUGIN_SOURCE);
+        let diagnostics = Arc::new(CapturingDiag::default());
+        let loaded = load_one(
+            &fixture.path,
+            Arc::clone(&diagnostics) as Arc<dyn PluginDiagnostics>,
+            None,
+        )
+        .expect("load v3 plugin");
+        assert_eq!(loaded.abi_version, 3);
+        // The v3 `declare` slot landed the priority + platforms on the plugin's
+        // registry (the loader negotiated v3, built the ext block, and the
+        // trampoline applied the JSON).
+        assert_eq!(loaded.registry.declared_priority(), 42);
+        assert_eq!(loaded.registry.declared_platforms(), ["all".to_string()]);
+    }
+
+    #[test]
+    fn entrypoint_selection_prefers_v3_then_v2_then_v1() {
         V2_CALLS.store(0, Ordering::SeqCst);
         V1_CALLS.store(0, Ordering::SeqCst);
         V1_LOOKUPS.store(0, Ordering::SeqCst);
+        V2_LOOKUPS.store(0, Ordering::SeqCst);
         V2_RETURN.store(0, Ordering::SeqCst);
+        V3_CALLS.store(0, Ordering::SeqCst);
+        V3_RETURN.store(0, Ordering::SeqCst);
 
-        let selected = select_register::<RpiPluginRegister, LegacyRpiPluginRegister, &str>(
-            Ok(test_register_v2),
+        // v3 present → selected; v2/v1 lookups are not consulted.
+        let entrypoint = select_register(
+            Ok::<RpiPluginRegisterV3, &str>(test_register_v3),
+            || {
+                V2_LOOKUPS.fetch_add(1, Ordering::SeqCst);
+                Ok(test_register_v2)
+            },
+            || {
+                V1_LOOKUPS.fetch_add(1, Ordering::SeqCst);
+                Ok(test_register_v1)
+            },
+        )
+        .expect("v3 selected");
+        assert!(matches!(entrypoint, RegisterEntrypoint::V3(_)));
+        assert_eq!(call_register(entrypoint, &test_host_api()), 0);
+        assert_eq!(V3_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(V2_LOOKUPS.load(Ordering::SeqCst), 0);
+        assert_eq!(V1_LOOKUPS.load(Ordering::SeqCst), 0);
+        assert_eq!(V3_SEEN_VERSION.load(Ordering::SeqCst), 3);
+
+        // v3 missing → v2 selected; v1 lookup is not consulted.
+        let entrypoint = select_register(
+            Err::<RpiPluginRegisterV3, &str>("v3 missing"),
+            || {
+                V2_LOOKUPS.fetch_add(1, Ordering::SeqCst);
+                Ok(test_register_v2)
+            },
             || {
                 V1_LOOKUPS.fetch_add(1, Ordering::SeqCst);
                 Ok(test_register_v1)
             },
         )
         .expect("v2 selected");
-        let entrypoint = match selected {
-            Ok(register) => RegisterEntrypoint::V2(register),
-            Err(register) => RegisterEntrypoint::V1(register),
-        };
+        assert!(matches!(entrypoint, RegisterEntrypoint::V2(_)));
         assert_eq!(call_register(entrypoint, &test_host_api()), 0);
         assert_eq!(V2_CALLS.load(Ordering::SeqCst), 1);
-        assert_eq!(V1_CALLS.load(Ordering::SeqCst), 0);
+        assert_eq!(V2_LOOKUPS.load(Ordering::SeqCst), 1);
         assert_eq!(V1_LOOKUPS.load(Ordering::SeqCst), 0);
         assert_eq!(V2_SEEN_VERSION.load(Ordering::SeqCst), 2);
 
-        let selected = select_register::<RpiPluginRegister, LegacyRpiPluginRegister, &str>(
-            Err("v2 missing"),
+        // v3+v2 missing → legacy v1.
+        let entrypoint = select_register(
+            Err::<RpiPluginRegisterV3, &str>("v3 missing"),
+            || Err::<RpiPluginRegister, &str>("v2 missing"),
             || {
                 V1_LOOKUPS.fetch_add(1, Ordering::SeqCst);
                 Ok(test_register_v1)
             },
         )
         .expect("legacy selected");
-        let entrypoint = match selected {
-            Ok(register) => RegisterEntrypoint::V2(register),
-            Err(register) => RegisterEntrypoint::V1(register),
-        };
+        assert!(matches!(entrypoint, RegisterEntrypoint::V1(_)));
         assert_eq!(call_register(entrypoint, &test_host_api()), 0);
         assert_eq!(V1_CALLS.load(Ordering::SeqCst), 1);
-        assert_eq!(V1_LOOKUPS.load(Ordering::SeqCst), 1);
         assert_eq!(V1_SEEN_VERSION.load(Ordering::SeqCst), 1);
 
-        // A selected v2 entrypoint that fails is still called once and is not
-        // followed by a legacy call.
-        V2_RETURN.store(73, Ordering::SeqCst);
-        let selected = select_register::<RpiPluginRegister, LegacyRpiPluginRegister, &str>(
-            Ok(test_register_v2),
+        // A selected v3 entrypoint that later fails is still called once and is
+        // not followed by a v2/v1 call.
+        V3_RETURN.store(73, Ordering::SeqCst);
+        let entrypoint = select_register(
+            Ok::<RpiPluginRegisterV3, &str>(test_register_v3),
+            || {
+                V2_LOOKUPS.fetch_add(1, Ordering::SeqCst);
+                Ok(test_register_v2)
+            },
             || {
                 V1_LOOKUPS.fetch_add(1, Ordering::SeqCst);
                 Ok(test_register_v1)
             },
         )
-        .expect("v2 selected even though its later call will fail");
-        let entrypoint = match selected {
-            Ok(register) => RegisterEntrypoint::V2(register),
-            Err(register) => RegisterEntrypoint::V1(register),
-        };
+        .expect("v3 selected even though its later call will fail");
         assert_eq!(call_register(entrypoint, &test_host_api()), 73);
-        assert_eq!(V2_CALLS.load(Ordering::SeqCst), 2);
+        assert_eq!(V3_CALLS.load(Ordering::SeqCst), 2);
+        assert_eq!(V2_CALLS.load(Ordering::SeqCst), 1);
         assert_eq!(V1_CALLS.load(Ordering::SeqCst), 1);
-        assert_eq!(V1_LOOKUPS.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

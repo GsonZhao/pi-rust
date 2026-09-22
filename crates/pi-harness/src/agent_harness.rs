@@ -66,11 +66,12 @@ use crate::session::context::{
     SessionContextBuildOptions,
 };
 use crate::session::session::Session;
+use crate::watcher::{watch_listener, HarnessWatcher};
 use crate::session::types::{
     BranchBounds, Entry, EntryOrder, EntryQuery, JsonValue, LaneRecord, OperationError,
     OperationFinishedRecord, OperationIntent, OperationOutcome, OperationStartedRecord,
-    ProvisionedEntry, ProvisionedKind, QueueKind, RecordBase, RecordQuery, SessionTree, UsageCause,
-    UsageRecord,
+    ProvisionedEntry, ProvisionedKind, QueueKind, RecordBase, RecordQuery, SessionStats,
+    SessionTree, UsageCause, UsageRecord,
 };
 use crate::skills::format_skill_invocation;
 use crate::system_prompt::compose_system_prompt;
@@ -206,6 +207,65 @@ pub struct CancelQueuedResult {
 }
 
 // ===========================================================================
+// Deferred-operation + inspection read models (TS `runtime/` surface). These
+// back the `AgentHarness` methods `drive`/`resume`/`inspectExecution`/
+// `getResult`/`snapshot`, which the coding-agent product layer consumes.
+// ===========================================================================
+
+/// Terminal/disposition state after driving a durable operation.
+#[derive(Debug, Clone)]
+pub enum DriveOutcome {
+    /// The operation ran to a terminal run outcome.
+    Completed(Box<RunResult>),
+    /// The operation parked again on a fresh deferred handle.
+    Suspended(DeferredHandle),
+    /// There was nothing pending to drive on this lane.
+    Idle,
+}
+
+/// Result of `drive(operationId)`. Mirrors the TS runtime drive result.
+#[derive(Debug, Clone)]
+pub struct DriveResult {
+    pub operation_id: String,
+    pub outcome: DriveOutcome,
+}
+
+/// The active-operation half of a [`LaneSnapshot`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveOperationSnapshot {
+    pub run_id: String,
+    pub lane: String,
+    pub kind: OperationKind,
+}
+
+/// A point-in-time read model of one lane. Mirrors the TS lane snapshot the
+/// runtime/TUI renders from: the leaf pointer, the session name, rolled-up
+/// stats, and (when a run is in flight) the active operation.
+#[derive(Debug, Clone, Default)]
+pub struct LaneSnapshot {
+    pub lane: String,
+    pub leaf_id: Option<String>,
+    pub name: Option<String>,
+    pub stats: Option<SessionStats>,
+    pub active: Option<ActiveOperationSnapshot>,
+    /// Labels keyed by target entry id (mirrors the TS `labels` fact map).
+    pub labels: std::collections::BTreeMap<String, String>,
+}
+
+/// A tool-execution record surfaced by `inspect_execution`. Unlike the live
+/// `ToolExecutionComponent` (a UI concern), this is the durable view: which
+/// entry persisted the call, and whether a result landed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolExecutionInfo {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    /// The entry id the tool call was persisted under, when known.
+    pub entry_id: Option<String>,
+    /// The entry id of the matching tool result, when one exists.
+    pub result_entry_id: Option<String>,
+}
+
+// ===========================================================================
 // AgentLane trait — the per-lane surface (TS AgentLane interface, lines 271-303)
 // ===========================================================================
 
@@ -267,6 +327,36 @@ pub trait AgentLane: Send + Sync {
     async fn set_active_tools(&self, names: Vec<String>) -> HarnessResult<()>;
 
     fn session_view(&self) -> Arc<dyn SessionTree>;
+
+    // -- durable-session read/write surface (TS `AgentLane` additions).
+    //    Non-generic so the trait stays dyn-compatible; `watch` lives on the
+    //    concrete `AgentHarness` because it is generic over the callback. ----
+
+    async fn get_tip_id(&self) -> HarnessResult<Option<String>>;
+    async fn find_entries(&self, query: &EntryQuery) -> HarnessResult<Vec<Entry>>;
+    async fn find_entry(&self, query: &EntryQuery) -> HarnessResult<Option<Entry>>;
+    async fn get_entry(&self, id: &str) -> HarnessResult<Option<Entry>>;
+    async fn append_message(&self, message: AgentMessage) -> HarnessResult<String>;
+    async fn append_custom_entry(
+        &self,
+        custom_type: &str,
+        data: Option<JsonValue>,
+    ) -> HarnessResult<String>;
+    async fn get_name(&self) -> HarnessResult<Option<String>>;
+    async fn set_name(&self, name: Option<&str>) -> HarnessResult<()>;
+    async fn get_label(&self, target_id: &str) -> HarnessResult<Option<String>>;
+    async fn set_label(&self, target_id: &str, label: Option<&str>) -> HarnessResult<()>;
+    async fn get_stats(&self) -> HarnessResult<SessionStats>;
+    async fn snapshot(&self) -> HarnessResult<LaneSnapshot>;
+    async fn inspect_execution(
+        &self,
+        tool_call_id: &str,
+    ) -> HarnessResult<Option<ToolExecutionInfo>>;
+    async fn get_result(&self, run_id: &str) -> HarnessResult<Option<RunResult>>;
+    async fn accept(&self, entry_id: &str) -> HarnessResult<bool>;
+    async fn request_abort(&self, run_id: &str) -> HarnessResult<bool>;
+    async fn drive(&self, operation_id: &str) -> HarnessResult<DriveResult>;
+    async fn resume(&self, suspended_id: &str) -> HarnessResult<RunResult>;
 }
 
 // ===========================================================================
@@ -499,6 +589,426 @@ impl AgentHarness {
             bus: self.bus.clone(),
             lane: name.to_string(),
         })
+    }
+
+    /// The harness's bound lane name ("main" for a top-level harness).
+    pub fn lane_name(&self) -> &str {
+        &self.lane
+    }
+
+    // -- durable-session read/write surface (TS `AgentHarness` getTipId /
+    //    findEntries / appendMessage / …). Each delegates to the lane-scoped
+    //    `SessionTree` view so non-main lanes behave identically. -----------
+
+    /// The lane-scoped session view backing the read/write surface below.
+    pub fn view(&self) -> Arc<dyn SessionTree> {
+        self.session.view(&self.lane)
+    }
+
+    /// `getTipId()` — the lane's current leaf entry id. Mirrors TS
+    /// `AgentHarness.getTipId`.
+    pub async fn get_tip_id(&self) -> HarnessResult<Option<String>> {
+        self.view()
+            .get_leaf_id()
+            .await
+            .map_err(session_to_harness_err)
+    }
+
+    /// `findEntries(query)` — query the lane's entries. Mirrors TS
+    /// `AgentHarness.findEntries`.
+    pub async fn find_entries(&self, query: &EntryQuery) -> HarnessResult<Vec<Entry>> {
+        self.view()
+            .find_entries(query)
+            .await
+            .map_err(session_to_harness_err)
+    }
+
+    /// `findEntry(query)` — first matching entry on the lane. Mirrors TS
+    /// `AgentHarness.findEntry`.
+    pub async fn find_entry(&self, query: &EntryQuery) -> HarnessResult<Option<Entry>> {
+        self.view()
+            .find_entry(query)
+            .await
+            .map_err(session_to_harness_err)
+    }
+
+    /// `findEntriesOnBranch(query, bounds)` — branch path of the lane.
+    pub async fn find_entries_on_branch(
+        &self,
+        query: &EntryQuery,
+        bounds: &BranchBounds,
+    ) -> HarnessResult<Vec<Entry>> {
+        self.view()
+            .find_entries_on_branch(query, bounds)
+            .await
+            .map_err(session_to_harness_err)
+    }
+
+    /// `getEntry(id)` — look up a single entry by id. Mirrors TS
+    /// `AgentHarness.getEntry`.
+    pub async fn get_entry(&self, id: &str) -> HarnessResult<Option<Entry>> {
+        self.view()
+            .get_entry(id)
+            .await
+            .map_err(session_to_harness_err)
+    }
+
+    /// `appendMessage(message)` — persist an out-of-band message entry on the
+    /// lane without running the agent. Mirrors TS `AgentHarness.appendMessage`.
+    pub async fn append_message(&self, message: AgentMessage) -> HarnessResult<String> {
+        self.view()
+            .append_message(message)
+            .await
+            .map_err(session_to_harness_err)
+    }
+
+    /// `appendCustomEntry(customType, data?)` — persist a custom entry on the
+    /// lane. Mirrors TS `AgentHarness.appendCustomEntry`.
+    pub async fn append_custom_entry(
+        &self,
+        custom_type: &str,
+        data: Option<JsonValue>,
+    ) -> HarnessResult<String> {
+        self.view()
+            .append_custom_entry(custom_type, data)
+            .await
+            .map_err(session_to_harness_err)
+    }
+
+    /// `getName()` — the session name. Mirrors TS `AgentHarness.getName`.
+    pub async fn get_name(&self) -> HarnessResult<Option<String>> {
+        self.view().get_name().await.map_err(session_to_harness_err)
+    }
+
+    /// `setName(name)` — set/clear the session name. Mirrors TS
+    /// `AgentHarness.setName`.
+    pub async fn set_name(&self, name: Option<&str>) -> HarnessResult<()> {
+        self.view()
+            .set_name(name)
+            .await
+            .map_err(session_to_harness_err)
+    }
+
+    /// `getLabel(targetId)` — the label attached to an entry, when set.
+    pub async fn get_label(&self, target_id: &str) -> HarnessResult<Option<String>> {
+        self.view()
+            .get_label(target_id)
+            .await
+            .map_err(session_to_harness_err)
+    }
+
+    /// `setLabel(targetId, label)` — attach/clear an entry label.
+    pub async fn set_label(&self, target_id: &str, label: Option<&str>) -> HarnessResult<()> {
+        self.view()
+            .set_label(target_id, label)
+            .await
+            .map_err(session_to_harness_err)
+    }
+
+    /// `getStats()` — rolled-up token/cost/message counters.
+    pub async fn get_stats(&self) -> HarnessResult<SessionStats> {
+        self.view().get_stats().await.map_err(session_to_harness_err)
+    }
+
+    /// `snapshot()` — the lane read model (leaf, name, stats, active op).
+    /// Mirrors the TS runtime lane snapshot. `labels` folds in every labelled
+    /// entry the lane can see.
+    pub async fn snapshot(&self) -> HarnessResult<LaneSnapshot> {
+        let view = self.view();
+        let leaf_id = view.get_leaf_id().await.map_err(session_to_harness_err)?;
+        let stats = view.get_stats().await.ok();
+        let name = view.get_name().await.ok().flatten();
+        let active = self.active_operation_snapshot();
+        let labels = self.lane_labels(&view).await;
+        Ok(LaneSnapshot {
+            lane: self.lane.clone(),
+            leaf_id,
+            name,
+            stats,
+            active,
+            labels,
+        })
+    }
+
+    /// `watchSession()` — watch this lane's event stream. Mirrors TS
+    /// `AgentHarness.watchSession`: the listener receives every event on the
+    /// harness bus. The returned [`HarnessWatcher`] unsubscribes on drop.
+    pub fn watch_session<F>(&self, callback: F) -> HarnessWatcher
+    where
+        F: Fn(&HarnessEvent) + Send + Sync + 'static,
+    {
+        let mut handle = self.bus.watch(|| ());
+        handle.start(watch_listener(callback));
+        HarnessWatcher::new(handle)
+    }
+
+    /// `watch()` — harness-level alias of [`Self::watch_session`]. Mirrors the
+    /// TS `AgentHarness.watch` entry point.
+    pub fn watch<F>(&self, callback: F) -> HarnessWatcher
+    where
+        F: Fn(&HarnessEvent) + Send + Sync + 'static,
+    {
+        self.watch_session(callback)
+    }
+
+    /// `inspectExecution(toolCallId)` — locate the persisted tool-call entry
+    /// (and its matching result, when present) for a tool call id. Mirrors the
+    /// TS runtime `inspectExecution` read model.
+    pub async fn inspect_execution(
+        &self,
+        tool_call_id: &str,
+    ) -> HarnessResult<Option<ToolExecutionInfo>> {
+        for entry in self.all_lane_entries().await? {
+            let Entry::Message(me) = &entry else {
+                continue;
+            };
+            match &me.message {
+                AgentMessage::Assistant(a) => {
+                    for block in &a.content {
+                        if let Content::ToolCall(tc) = block {
+                            if tc.id == tool_call_id {
+                                return Ok(Some(ToolExecutionInfo {
+                                    tool_call_id: tc.id.clone(),
+                                    tool_name: tc.name.clone(),
+                                    entry_id: Some(entry.id().to_string()),
+                                    result_entry_id: None,
+                                }));
+                            }
+                        }
+                    }
+                }
+                AgentMessage::ToolResult(tr) => {
+                    if tr.tool_call_id == tool_call_id {
+                        return Ok(Some(ToolExecutionInfo {
+                            tool_call_id: tr.tool_call_id.clone(),
+                            tool_name: tr.tool_name.clone(),
+                            entry_id: None,
+                            result_entry_id: Some(entry.id().to_string()),
+                        }));
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(None)
+    }
+
+    /// `getResult(runId)` — the terminal result of a completed run, read back
+    /// from the durable `operation_finished` record. Mirrors TS
+    /// `AgentHarness.getResult`.
+    pub async fn get_result(&self, run_id: &str) -> HarnessResult<Option<RunResult>> {
+        let records = self
+            .session
+            .find_records(&RecordQuery {
+                run_id: Some(run_id.to_string()),
+                ..Default::default()
+            })
+            .await
+            .map_err(session_to_harness_err)?;
+        for record in records {
+            let LaneRecord::OperationFinished(fin) = &record else {
+                continue;
+            };
+            let leaf_id = self
+                .view()
+                .get_leaf_id()
+                .await
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let final_message = self.last_assistant_message().await.unwrap_or_else(|| {
+                rpi_ai::types::AssistantMessage::empty(
+                    rpi_ai::Api::AnthropicMessages,
+                    "",
+                    "",
+                    0,
+                )
+            });
+            let outcome = match fin.outcome {
+                OperationOutcome::Completed => HarnessRunOutcome::Completed {
+                    final_entry_id: leaf_id.clone(),
+                    leaf_id,
+                    final_message,
+                },
+                OperationOutcome::Aborted => HarnessRunOutcome::Aborted {
+                    final_entry_id: leaf_id.clone(),
+                    leaf_id,
+                    final_message,
+                },
+                OperationOutcome::Failed => HarnessRunOutcome::Failed {
+                    leaf_id: leaf_id.clone(),
+                    error: fin.error.clone().unwrap_or_else(|| OperationError {
+                        code: "failed".into(),
+                        message: "run failed".into(),
+                    }),
+                    final_entry_id: Some(leaf_id),
+                    final_message: Some(final_message),
+                },
+                // `Declined` is a no-op outcome — it never produced a result.
+                OperationOutcome::Declined => continue,
+            };
+            return Ok(Some(RunResult {
+                run_id: run_id.to_string(),
+                outcome,
+            }));
+        }
+        Ok(None)
+    }
+
+    /// `accept(entryId)` — commit a pending/steering entry as a durable lane
+    /// message. Returns `true` when the entry existed and was accepted.
+    /// Mirrors the TS runtime accept step.
+    pub async fn accept(&self, entry_id: &str) -> HarnessResult<bool> {
+        let Some(entry) = self.get_entry(entry_id).await? else {
+            return Ok(false);
+        };
+        let Entry::Message(me) = entry else {
+            return Ok(false);
+        };
+        self.append_message(me.message).await?;
+        Ok(true)
+    }
+
+    /// `requestAbort(runId)` — abort the named run when it is the active one.
+    /// Returns `true` when the abort was delivered. Mirrors the TS runtime
+    /// `requestAbort`.
+    pub async fn request_abort(&self, run_id: &str) -> HarnessResult<bool> {
+        let matches_active = {
+            let inner = self.inner.lock().unwrap();
+            inner
+                .active_run
+                .as_ref()
+                .map(|a| a.run_id == run_id)
+                .unwrap_or(false)
+        };
+        if !matches_active {
+            return Ok(false);
+        }
+        AgentLane::abort(self).await?;
+        Ok(true)
+    }
+
+    /// `drive(operationId)` — drive a parked deferred operation to its next
+    /// disposition. When no suspended operation matches, reports
+    /// [`DriveOutcome::Idle`]. Mirrors the TS runtime `drive` step.
+    pub async fn drive(&self, operation_id: &str) -> HarnessResult<DriveResult> {
+        let Some(deferred) = self.find_deferred_handle(operation_id).await? else {
+            return Ok(DriveResult {
+                operation_id: operation_id.to_string(),
+                outcome: DriveOutcome::Idle,
+            });
+        };
+        let result = self.resume_deferred(deferred).await?;
+        Ok(DriveResult {
+            operation_id: operation_id.to_string(),
+            outcome: match result.outcome {
+                HarnessRunOutcome::Suspended { deferred, .. } => {
+                    DriveOutcome::Suspended(deferred)
+                }
+                _ => DriveOutcome::Completed(Box::new(result)),
+            },
+        })
+    }
+
+    /// `resume(suspendedId)` — resume a parked deferred operation.
+    /// `suspended_id` is either the deferred handle id or the entry id of the
+    /// suspended assistant message. Mirrors the TS `resume` operation.
+    pub async fn resume(&self, suspended_id: &str) -> HarnessResult<RunResult> {
+        let Some(deferred) = self.find_deferred_handle(suspended_id).await? else {
+            return Err(HarnessError::NothingToResume {
+                lane: self.lane.clone(),
+                message: format!("no suspended operation matches '{suspended_id}'"),
+            });
+        };
+        self.resume_deferred(deferred).await
+    }
+
+    // -- internal helpers for the surface above ------------------------------
+
+    fn active_operation_snapshot(&self) -> Option<ActiveOperationSnapshot> {
+        let inner = self.inner.lock().unwrap();
+        inner.active_run.as_ref().map(|a| ActiveOperationSnapshot {
+            run_id: a.run_id.clone(),
+            lane: a.lane.clone(),
+            kind: a.kind,
+        })
+    }
+
+    /// Every entry visible to the lane's view (session-wide, oldest first).
+    async fn all_lane_entries(&self) -> HarnessResult<Vec<Entry>> {
+        self.view()
+            .find_entries(&EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            })
+            .await
+            .map_err(session_to_harness_err)
+    }
+
+    async fn lane_labels(
+        &self,
+        view: &Arc<dyn SessionTree>,
+    ) -> std::collections::BTreeMap<String, String> {
+        let mut labels = std::collections::BTreeMap::new();
+        if let Ok(entries) = view
+            .find_entries(&EntryQuery {
+                order: Some(EntryOrder::OldestFirst),
+                ..Default::default()
+            })
+            .await
+        {
+            for entry in entries {
+                if let Ok(Some(label)) = view.get_label(entry.id()).await {
+                    labels.insert(entry.id().to_string(), label);
+                }
+            }
+        }
+        labels
+    }
+
+    async fn last_assistant_message(&self) -> Option<rpi_ai::types::AssistantMessage> {
+        let entries = self.all_lane_entries().await.ok()?;
+        let mut last = None;
+        for entry in entries {
+            if let Entry::Message(me) = entry {
+                if let AgentMessage::Assistant(a) = me.message {
+                    last = Some(*a);
+                }
+            }
+        }
+        last
+    }
+
+    /// Find a parked deferred handle by deferred-id or by the entry id of the
+    /// suspended assistant message that carries it.
+    async fn find_deferred_handle(
+        &self,
+        suspended_id: &str,
+    ) -> HarnessResult<Option<DeferredHandle>> {
+        for entry in self.all_lane_entries().await? {
+            let Entry::Message(me) = &entry else {
+                continue;
+            };
+            let AgentMessage::Assistant(a) = &me.message else {
+                continue;
+            };
+            let Some(deferred) = &a.deferred else {
+                continue;
+            };
+            if deferred.id == suspended_id || entry.id() == suspended_id {
+                return Ok(Some(deferred.clone()));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Drive a reconstructed deferred handle to a terminal outcome. Kept
+    /// separate so `drive`/`resume` share one path. The provider-side
+    /// long-poll continuation is not yet ported, so this reports
+    /// `NotImplemented` rather than silently pretending the run finished.
+    async fn resume_deferred(&self, deferred: DeferredHandle) -> HarnessResult<RunResult> {
+        let _ = deferred;
+        Err(HarnessError::not_implemented("resume_deferred"))
     }
 
     // -- harness-level config accessors (TS `AgentHarness` class surface, not
@@ -2181,6 +2691,85 @@ impl AgentLane for AgentHarness {
     fn session_view(&self) -> Arc<dyn SessionTree> {
         self.session.view(&self.lane)
     }
+
+    async fn get_tip_id(&self) -> HarnessResult<Option<String>> {
+        AgentHarness::get_tip_id(self).await
+    }
+
+    async fn find_entries(&self, query: &EntryQuery) -> HarnessResult<Vec<Entry>> {
+        AgentHarness::find_entries(self, query).await
+    }
+
+    async fn find_entry(&self, query: &EntryQuery) -> HarnessResult<Option<Entry>> {
+        AgentHarness::find_entry(self, query).await
+    }
+
+    async fn get_entry(&self, id: &str) -> HarnessResult<Option<Entry>> {
+        AgentHarness::get_entry(self, id).await
+    }
+
+    async fn append_message(&self, message: AgentMessage) -> HarnessResult<String> {
+        AgentHarness::append_message(self, message).await
+    }
+
+    async fn append_custom_entry(
+        &self,
+        custom_type: &str,
+        data: Option<JsonValue>,
+    ) -> HarnessResult<String> {
+        AgentHarness::append_custom_entry(self, custom_type, data).await
+    }
+
+    async fn get_name(&self) -> HarnessResult<Option<String>> {
+        AgentHarness::get_name(self).await
+    }
+
+    async fn set_name(&self, name: Option<&str>) -> HarnessResult<()> {
+        AgentHarness::set_name(self, name).await
+    }
+
+    async fn get_label(&self, target_id: &str) -> HarnessResult<Option<String>> {
+        AgentHarness::get_label(self, target_id).await
+    }
+
+    async fn set_label(&self, target_id: &str, label: Option<&str>) -> HarnessResult<()> {
+        AgentHarness::set_label(self, target_id, label).await
+    }
+
+    async fn get_stats(&self) -> HarnessResult<SessionStats> {
+        AgentHarness::get_stats(self).await
+    }
+
+    async fn snapshot(&self) -> HarnessResult<LaneSnapshot> {
+        AgentHarness::snapshot(self).await
+    }
+
+    async fn inspect_execution(
+        &self,
+        tool_call_id: &str,
+    ) -> HarnessResult<Option<ToolExecutionInfo>> {
+        AgentHarness::inspect_execution(self, tool_call_id).await
+    }
+
+    async fn get_result(&self, run_id: &str) -> HarnessResult<Option<RunResult>> {
+        AgentHarness::get_result(self, run_id).await
+    }
+
+    async fn accept(&self, entry_id: &str) -> HarnessResult<bool> {
+        AgentHarness::accept(self, entry_id).await
+    }
+
+    async fn request_abort(&self, run_id: &str) -> HarnessResult<bool> {
+        AgentHarness::request_abort(self, run_id).await
+    }
+
+    async fn drive(&self, operation_id: &str) -> HarnessResult<DriveResult> {
+        AgentHarness::drive(self, operation_id).await
+    }
+
+    async fn resume(&self, suspended_id: &str) -> HarnessResult<RunResult> {
+        AgentHarness::resume(self, suspended_id).await
+    }
 }
 
 // ===========================================================================
@@ -2417,6 +3006,112 @@ impl AgentLane for LaneHandle {
 
     fn session_view(&self) -> Arc<dyn SessionTree> {
         Arc::clone(&self.view)
+    }
+
+    async fn get_tip_id(&self) -> HarnessResult<Option<String>> {
+        self.view
+            .get_leaf_id()
+            .await
+            .map_err(session_to_harness_err)
+    }
+
+    async fn find_entries(&self, query: &EntryQuery) -> HarnessResult<Vec<Entry>> {
+        self.view
+            .find_entries(query)
+            .await
+            .map_err(session_to_harness_err)
+    }
+
+    async fn find_entry(&self, query: &EntryQuery) -> HarnessResult<Option<Entry>> {
+        self.view
+            .find_entry(query)
+            .await
+            .map_err(session_to_harness_err)
+    }
+
+    async fn get_entry(&self, id: &str) -> HarnessResult<Option<Entry>> {
+        self.view
+            .get_entry(id)
+            .await
+            .map_err(session_to_harness_err)
+    }
+
+    async fn append_message(&self, message: AgentMessage) -> HarnessResult<String> {
+        self.view
+            .append_message(message)
+            .await
+            .map_err(session_to_harness_err)
+    }
+
+    async fn append_custom_entry(
+        &self,
+        custom_type: &str,
+        data: Option<JsonValue>,
+    ) -> HarnessResult<String> {
+        self.view
+            .append_custom_entry(custom_type, data)
+            .await
+            .map_err(session_to_harness_err)
+    }
+
+    async fn get_name(&self) -> HarnessResult<Option<String>> {
+        self.view.get_name().await.map_err(session_to_harness_err)
+    }
+
+    async fn set_name(&self, name: Option<&str>) -> HarnessResult<()> {
+        self.view
+            .set_name(name)
+            .await
+            .map_err(session_to_harness_err)
+    }
+
+    async fn get_label(&self, target_id: &str) -> HarnessResult<Option<String>> {
+        self.view
+            .get_label(target_id)
+            .await
+            .map_err(session_to_harness_err)
+    }
+
+    async fn set_label(&self, target_id: &str, label: Option<&str>) -> HarnessResult<()> {
+        self.view
+            .set_label(target_id, label)
+            .await
+            .map_err(session_to_harness_err)
+    }
+
+    async fn get_stats(&self) -> HarnessResult<SessionStats> {
+        self.view.get_stats().await.map_err(session_to_harness_err)
+    }
+
+    async fn snapshot(&self) -> HarnessResult<LaneSnapshot> {
+        self.runner().snapshot().await
+    }
+
+    async fn inspect_execution(
+        &self,
+        tool_call_id: &str,
+    ) -> HarnessResult<Option<ToolExecutionInfo>> {
+        self.runner().inspect_execution(tool_call_id).await
+    }
+
+    async fn get_result(&self, run_id: &str) -> HarnessResult<Option<RunResult>> {
+        self.runner().get_result(run_id).await
+    }
+
+    async fn accept(&self, entry_id: &str) -> HarnessResult<bool> {
+        self.runner().accept(entry_id).await
+    }
+
+    async fn request_abort(&self, run_id: &str) -> HarnessResult<bool> {
+        self.runner().request_abort(run_id).await
+    }
+
+    async fn drive(&self, operation_id: &str) -> HarnessResult<DriveResult> {
+        self.runner().drive(operation_id).await
+    }
+
+    async fn resume(&self, suspended_id: &str) -> HarnessResult<RunResult> {
+        self.runner().resume(suspended_id).await
     }
 }
 

@@ -48,7 +48,7 @@ use rpi_harness::types::{
     DrivingMode, HarnessTool, HarnessToolExecution, RetryPolicy, ToolReplay,
 };
 use rpi_tools::{
-    create_bash_tool, create_edit_tool, create_read_tool, create_write_tool, ExecutionToolContext,
+    create_bash_tool, create_edit_tool, create_powershell_tool, create_read_tool, create_write_tool, ExecutionToolContext,
     MutationQueueRegistry, OsExecutionEnv,
 };
 
@@ -788,6 +788,49 @@ pub async fn build(
         Err(e) => return Err(BuildError::HarnessCreate(e.to_string())),
     };
 
+    // ---- Durable operation recovery (runtime layer) ----
+    // A previous process can die between `operation_started` and
+    // `operation_finished`, leaving the lane with an orphaned operation. Sweep
+    // every lane, surface what was found, and emit `run_start`/`run_end`
+    // (aborted) pairs so a TUI that already attached sees the settle. This is
+    // read-only: nothing is mutated here, so a failed sweep cannot corrupt the
+    // log. A clean session (the common case) reports no findings.
+    {
+        let runtime = rpi_harness::runtime::SessionRuntime::new(harness.session().clone());
+        match rpi_harness::runtime::recover_all_lanes(&runtime).await {
+            Ok(reports) => {
+                for (lane, report) in reports {
+                    if report.is_clean() {
+                        continue;
+                    }
+                    if report.is_corrupt() {
+                        eprintln!(
+                            "warning: session lane '{lane}' is corrupt ({} open operations); \
+                             refusing to auto-repair — inspect the session file",
+                            report.open_operations.len()
+                        );
+                        continue;
+                    }
+                    for decision in runtime.reconcile(&report) {
+                        if let rpi_harness::runtime::RecoveryDecision::Abort { run_id } = decision {
+                            if args.verbose {
+                                eprintln!(
+                                    "recovered interrupted run {run_id} on lane '{lane}' (aborted)"
+                                );
+                            }
+                        }
+                    }
+                    runtime.emit_recovery_events(harness.events(), &report);
+                }
+            }
+            Err(e) => {
+                if args.verbose {
+                    eprintln!("warning: session recovery sweep failed: {e}");
+                }
+            }
+        }
+    }
+
     // ---- B5d: assemble the ReloadContext the TUI holds ----
     // Every field is cheap to clone (Arc / Vec / args Clone). The cells own the
     // live session + bridge so `/reload` can swap them; the harness itself is
@@ -936,6 +979,42 @@ pub struct ReloadContext {
     /// swapping plugin sessions; its watcher signals `mailbox` after a
     /// successful background build.
     pub dev_extension: Option<Arc<crate::dev_extension::DevExtension>>,
+}
+
+/// Dispatch a no-payload lifecycle event (e.g. `SessionStart`, `SessionShutdown`,
+/// the rpi-specific `BeforeTuiStart`) to every extension handler subscribed to
+/// that tag, with **veto** + **timeout** semantics (P1).
+///
+/// Resolves the **current** extension session from the reload cell so a
+/// `/reload`-swapped session is honored. Each handler runs on a blocking thread
+/// with a per-event timeout ([`rpi_extensions::lifecycle_timeout_for`]); a
+/// handler returning [`rpi_plugin_sdk::EVENT_HANDLER_ABORT`] vetoes the phase
+/// and this returns `Some(reason)`. No-op (`None`) when no plugins loaded, no
+/// handler subscribes, or the registry is stale.
+///
+/// The caller decides what a veto means: a `BeforeTuiStart` veto aborts startup
+/// (never enter the TUI); `SessionStart`/`SessionShutdown` vetoes are advisory
+/// (the session is already up or already closing).
+pub async fn dispatch_session_event_async(
+    reload_context: &ReloadContext,
+    tag: rpi_plugin_sdk::EventTag,
+) -> Option<String> {
+    // Take the snapshot Arc + keepalive, drop the session lock, then dispatch —
+    // we must not hold the session cell's mutex across the await (a handler
+    // could re-enter a reload path that locks it). Holding the keepalive across
+    // the await keeps the cdylibs (owning the handler fn pointers) mapped even
+    // if a concurrent `/reload` swaps the session cell out.
+    let (snapshot, keepalive) = {
+        let session = reload_context.extension_session.lock().unwrap();
+        (session.snapshot_arc(), session.keepalive())
+    };
+    match snapshot {
+        Some(snapshot) => {
+            let _keepalive = keepalive;
+            rpi_extensions::dispatch_lifecycle_event(&snapshot, tag).await
+        }
+        None => None,
+    }
 }
 
 /// The outcome of a reload: a human-readable status line for the transcript
@@ -1753,6 +1832,19 @@ fn build_tools(ctx: &ExecutionToolContext, args: &Args) -> Vec<HarnessTool> {
         ("docs", HarnessTool::new(create_docs_tool())),
     ];
 
+    // Add PowerShell tool on Windows
+    #[cfg(target_os = "windows")]
+    all.push(("powershell", HarnessTool::new(create_powershell_tool(ctx))));
+
+    // Apply default_tools from settings (if no CLI override)
+    if args.tools.is_none() {
+        if let Ok(settings) = crate::settings::load_settings() {
+            if let Some(default_tools) = &settings.default_tools {
+                all.retain(|(name, _)| default_tools.iter().any(|t| t == name));
+            }
+        }
+    }
+
     // `--no-builtin-tools` disables the built-in set but would keep
     // extension/custom tools — v1 has none, so it's equivalent to `--no-tools`
     // here. We honor it by clearing the built-ins.
@@ -2178,7 +2270,17 @@ mod tests {
             .map(|tool| tool.tool.schema().name.clone())
             .collect();
 
-        assert_eq!(names, vec!["read", "bash", "edit", "write", "docs"]);
+        // `docs` is a default capability; the legacy rpi-only lookup tools stay
+        // unregistered. Asserted by membership (not exact equality) because
+        // `powershell` is Windows-only and `settings.json#defaultTools` may
+        // narrow the set in a developer's environment.
+        assert!(names.contains(&"docs".to_string()));
+        for legacy in ["grep", "find", "ls"] {
+            assert!(
+                !names.contains(&legacy.to_string()),
+                "legacy tool {legacy} should not be registered by default"
+            );
+        }
     }
 
     #[test]

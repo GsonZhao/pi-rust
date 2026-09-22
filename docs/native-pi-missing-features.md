@@ -1,8 +1,27 @@
 # pi-rust 相对原生 Pi 的功能缺失审计
 
-审计日期：2026-09-12  
-当前 Rust：`a072f31570ee3477b45c14f8304c1abf21b1fcb4`  
+审计日期：2026-09-12（**功能状态更新：见下方「实现进展」**）
+当前 Rust：`a072f31570ee3477b45c14f8304c1abf21b1fcb4`
 原生 Pi：`earendil-works/pi@71dca871bc80b6bc97be37f0ca3189399d651fff`
+
+## 实现进展（本轮已落地）
+
+下表记录本轮把审计项从「缺失」推进到「已实现」的部分。标记为已实现的项目仍保留原文，
+以便对照当时判定依据；新增的入口在「落地位置」列。
+
+| 审计项 | 状态 | 落地位置 |
+|---|---|---|
+| §4 图片输入链路 | 已实现 | `pi-cli/src/app.rs` (`process_file_args`/`image_content_from_path`)、`interactive_tui.rs` 的 `Event::Paste` 图片拖入/粘贴路径 |
+| §6 AgentHarness/AgentLane operation API | 已实现 | `pi-harness/src/agent_harness.rs`：`get_tip_id`/`find_entries`/`find_entry`/`get_entry`/`append_message`/`append_custom_entry`/`get_name`/`set_name`/`get_label`/`set_label`/`get_stats`/`snapshot`/`inspect_execution`/`get_result`/`accept`/`request_abort`/`drive`/`resume`（`AgentLane` trait + `AgentHarness`/`LaneHandle` 双实现），`watch`/`watch_session` + `HarnessWatcher`（`pi-harness/src/watcher.rs`） |
+| §7 Durable operation runtime / value store | 已实现（provider 长轮询续跑除外） | `pi-harness/src/runtime.rs`（`SessionRuntime`：`admit`/`recover_lane`/`reconcile`/`checkpoint`/`recover_all_lanes`，`LaneRecovery`+`RecoveryFinding`+`RecoveryDecision`）；`pi-harness/src/session/values.rs`（`SessionValues`/`SessionValueWriter`）。CLI 启动时对每条 lane 跑恢复扫描（`pi-cli/src/session.rs`）。
+| §8 产品层 AgentSession | 已实现 | `pi-cli/src/agent_session.rs`（prompt/continue/steer/queue、model/thinking、scoped models、compact/retry、usage/context stats、HTML/JSONL/Markdown 导出、fork、value 持久化）。TUI `/usage`、`/export md\|html\|jsonl` 与 Ctrl+T/Ctrl+O 会话级偏好都走这一层。
+| §9 JSON 细粒度事件流 | 已实现 | `pi-cli/src/remote/protocol.rs`（`RemoteEvent::from_agent_event`，覆盖 agent/turn/message/delta/tool/retry）；`pi-cli/src/modes.rs` 的 json/rpc 模式逐条输出。
+| §10 导出格式与 CLI export | 已实现 | `pi-cli/src/export.rs`（`ExportFormat` + `export_session`/`export_file`，Markdown/HTML/JSONL）；`--export <in> [out]` 与 `/export <fmt>`。
+| §11 已识别但未生效的 CLI 功能 | 已实现 | `--offline`、`--approve`/`--no-approve`、`--tui-mode`、`--no-themes`、`--theme`、`--list-models [search]`、`--export` 均已接入行为（`pi-cli/src/app.rs`、`session.rs`、`interactive_tui.rs`）。
+| §12 交互快捷键与编辑器工作流 | 已实现 | `interactive_tui.rs` 键循环：Ctrl+G 外部编辑器、Ctrl+O 输出展开、Ctrl+T thinking 折叠、Ctrl+M 模型循环、Shift+Tab thinking 档位循环；`pi-tui/src/keybindings.rs` 可配置键位。
+| §15 TUI 基础组件 | 已实现 | `pi-tui/src/`：`ArminComponent`、`BorderedLoader`、`MouseRegion` 等价事件处理、`Editor` 全量接口。
+
+仍待实现（保留在原文，未在本轮落地）：§1 provider 覆盖、§2 OAuth、§5 ModelRegistry 运行时、§13 `/llama`、§14 trust gate 细节、§16 JS bridge 剩余接口、§18 telemetry schema。§7 的 provider 端 deferred 长轮询续跑（`resume_deferred`）当前显式返回 `NotImplemented`，不静默假装完成。
 
 ## 判定标准
 
@@ -17,10 +36,12 @@
 
 | 优先级 | 缺失范围 | 影响 |
 |---|---|---|
-| P0 | Provider/API 覆盖、OAuth、RPC、图片输入 | 大量原生配置无法运行，远程集成和多模态入口不可用 |
-| P1 | Harness/runtime、JSON 事件、AgentSession、导出、模型 registry | SDK/自动化客户端无法获得原生生命周期和恢复能力 |
-| P1 | TUI 编辑器/快捷键、Trust/resource gate、Settings | 交互工作流和项目安全策略不完整 |
-| P2 | JS/TS 扩展桥接、TUI 基础组件、telemetry | 扩展生态和低层 SDK 兼容性受限 |
+| P0 | Provider/API 覆盖、OAuth | 大量原生配置无法运行（图片输入 §4 与 RPC/远程 §3 已实现） |
+| P1 | 模型 registry（§5） | 运行时 catalog 变更与统一 provider 解析仍缺失 |
+| P1 | Trust/resource gate 细节（§14）、Settings 未消费字段（§15） | 项目安全策略与部分配置面不完整 |
+| P2 | JS/TS 扩展桥接剩余接口（§16）、telemetry schema（§18） | 扩展生态和低层 SDK 兼容性受限 |
+
+已从本表移除（本轮实现）：§6 AgentHarness/AgentLane API、§7 durable runtime/value store、§8 AgentSession、§9 JSON 细粒度事件、§10 导出格式、§11 CLI 功能开关、§12 交互快捷键、§17 TUI 基础组件。
 
 ## P0：模型、认证和传输
 
@@ -49,13 +70,22 @@ Rust `rpi auth` 当前只真正支持 Anthropic API key 的 `login/check/logout`
 
 证据：`crates/pi-cli/src/auth.rs`；原生 `packages/ai/src/auth/`、`packages/ai/src/auth/oauth/`、`packages/coding-agent/src/cli/auth-command.ts`、`credential-print.ts`。
 
-### 3. RPC 模式、协议和远程 client/server 缺失
+### 3. RPC 模式、协议和远程 client/server —— 已实现
 
-`--mode rpc` 虽可解析，但 `crates/pi-cli/src/app.rs:337` 直接输出 `rpc mode is not implemented in v1` 并退出。Rust 没有原生对应的 JSONL RPC mode、RPC types/client，也没有 `packages/protocol`、`packages/client`、`packages/server` 的 transport-neutral 协议和服务端能力。
+> 状态：**已实现**。`--mode rpc` 的 JSONL 服务端、`rpi --server` 无头模式、
+> `rpi --connect` 远程 TUI，以及 `--token` 认证均已落地。详见
+> [`remote-mode.md`](remote-mode.md)。
 
-证据：Rust `crates/pi-cli/src/app.rs`、`crates/pi-cli/src/modes.rs`；原生 `packages/coding-agent/src/modes/rpc/`、`packages/protocol/`、`packages/client/`、`packages/server/`。
+rpi 现在自带一套 **Rust 原生**的远程协议与会话模型（`crates/pi-cli/src/remote/`）：
+协议类型服务端/客户端共用（`protocol.rs`），客户端有独立的
+`RemoteSession` + transcript 抽象（`session.rs`）与 `pi-tui` 渲染层（`tui.rs`）。
+设计上参考了原生 pi `packages/coding-agent/src/modes/rpc/` 与 `src/client/` 的分层，
+但**不依赖任何 pi 运行时组件**。
 
-### 4. 图片输入链路缺失
+证据：Rust `crates/pi-cli/src/modes.rs`、`crates/pi-cli/src/remote/{protocol,client,session,tui}.rs`；
+`rpi-package/packages/rpi-server/`。
+
+### 4. 图片输入链路缺失 —— 已实现（见「实现进展」）
 
 Rust `process_file_args` 对图片直接报 `image attachments are not supported in v1`（`crates/pi-cli/src/app.rs:416`），随后只把文本文件作为字符串传入，`prompt_text` 的 image 参数没有从 CLI 附件转发。缺失内容包括：
 
@@ -80,7 +110,7 @@ Rust 主要在启动时读取 provider/model 配置并建立快照。缺失的�
 
 证据：Rust `crates/pi-cli/src/provider.rs`、`crates/pi-cli/src/session.rs`；原生 `packages/coding-agent/src/core/model-registry.ts`、`model-runtime.ts`、`model-resolver.ts`。
 
-### 6. 最新 AgentHarness/AgentLane operation API 缺失
+### 6. 最新 AgentHarness/AgentLane operation API 缺失 —— 已实现（见「实现进展」）
 
 当前 `crates/pi-harness/src/agent_harness.rs` 仍以旧的 prompt/queue/compact/navigation 接口为主，没有原生最新 lane/runtime 暴露的完整 operation surface，包括：
 
@@ -94,23 +124,23 @@ Rust 能识别 `Suspended`，但 CLI 明确输出“resume is not supported in v
 
 证据：Rust `crates/pi-harness/src/agent_harness.rs`、`crates/pi-cli/src/modes.rs:101`、`interactive_tui.rs:4067`；原生 `packages/agent/src/harness/agent-harness.ts`、`packages/agent/src/harness/runtime/`。
 
-### 7. Durable operation runtime/recovery/value store 缺失
+### 7. Durable operation runtime/recovery/value store 缺失 —— 已实现（provider 端长轮询续跑除外，见「实现进展」）
 
 Rust 有 JSONL、内存和 SQLite session 存储，但没有原生新增的 durable operation 分层：admission/drive/recovery/reconcile/checkpoint、deferred polling/resume、operation state/value store、pending assistant/tool frame 持久化、lane snapshots 和 recovery events。原生 `packages/agent/src/harness/runtime/` 及 `packages/coding-agent/src/core/session/{commit,fork,fork-policy,values}.ts` 均有对应实现，Rust session 目录没有 `values` 和 operation runtime 层。
 
-### 8. coding-agent 产品层 AgentSession 缺失
+### 8. coding-agent 产品层 AgentSession 缺失 —— 已实现（见「实现进展」）
 
 Rust CLI 直接操作 `AgentHarness`，没有原生 `AgentSession` 这一层统一承载：prompt/continue、queue、model/thinking mutation、scoped models、compaction/retry、bash、HTML/JSONL export、session switching、tree/fork、extension binding、usage/context stats、reload、auto compaction/retry。缺失会让依赖 coding-agent 产品 API 的调用方无法直接迁移。
 
 证据：原生 `packages/coding-agent/src/core/agent-session.ts`；Rust `crates/pi-cli/src/interactive_tui.rs`、`crates/pi-cli/src/session.rs`。
 
-### 9. JSON 输出没有原生细粒度事件流
+### 9. JSON 输出没有原生细粒度事件流 —— 已实现（见「实现进展」）
 
 Rust `--mode json` 的事件投影只有 `run_start`、`run_end` 和最终 `result`（`crates/pi-cli/src/modes.rs:222-235`）。原生 JSON mode 还会输出 agent/turn 生命周期、message start/update/end、文本和 thinking delta、tool execution start/update/end、compaction/retry/session 事件。当前 harness 虽有内部 event bus，但没有把这些细粒度事件投影到 CLI JSON 合同。
 
 证据：Rust `crates/pi-cli/src/modes.rs`、`crates/pi-harness/src/events.rs`；原生 `packages/coding-agent/src/modes/json-event.ts`。
 
-### 10. 原生导出格式和 CLI export 缺失
+### 10. 原生导出格式和 CLI export 缺失 —— 已实现（见「实现进展」）
 
 Rust `/export` 只生成当前目录下的 Markdown（`crates/pi-cli/src/interactive_tui.rs:2115` 附近），`--export <file>` 目前只是识别后忽略。缺失内容包括：
 
@@ -122,7 +152,7 @@ Rust `/export` 只生成当前目录下的 Markdown（`crates/pi-cli/src/interac
 
 ## P1：CLI、TUI、资源和设置
 
-### 11. 已识别但未生效的 CLI 功能
+### 11. 已识别但未生效的 CLI 功能 —— 已实现（见「实现进展」）
 
 当前 parser 对以下原生参数只接受/警告，没有实现其原生行为：
 
@@ -136,7 +166,7 @@ Rust `/export` 只生成当前目录下的 Markdown（`crates/pi-cli/src/interac
 
 证据：Rust `crates/pi-cli/src/args.rs:339-390`、`app.rs`；原生 `packages/coding-agent/src/cli/args.ts`。
 
-### 12. 交互快捷键和编辑器工作流缺失
+### 12. 交互快捷键和编辑器工作流缺失 —— 已实现（见「实现进展」）
 
 当前 TUI 已有输入、模型切换、工具展开等基础操作，但仍缺少原生提供的独立功能：
 
@@ -171,7 +201,7 @@ Rust 代码明确说明项目资源当前无条件加载，`trust.json` 只做�
 
 证据：Rust `crates/pi-cli/src/resource_dirs.rs:20-29,106-107,212`、`session.rs:402`、`config.rs:364-366`；原生 `packages/coding-agent/src/core/resource-loader.ts`、`project-trust.ts`、`trust-manager.ts`。
 
-### 15. Settings 可控功能面明显缺失
+### 15. Settings 可控功能面明显缺失 —— TUI/编辑器侧已实现（见「实现进展」）；其余 settings 字段仍未被消费
 
 Rust `crates/pi-cli/src/settings.rs:19` 只真正建模并使用 provider/model/thinking/theme、scopedModels、packages 和 resource dirs；未知字段虽会保留，但不会产生行为。原生 settings 中以下功能因此不可用：retry、compaction、branch summary、steering/follow-up mode、transport（SSE/WebSocket/auto）、hide thinking、external editor、shell path/prefix、quiet startup、project trust、terminal image/progress/hyperlink/trueColor、image resize/block、enabled models/default tools、doubleEscapeAction、tree filters、thinking budgets、UI padding/autocomplete、markdown/mermaid/warning/http timeout 等。
 
@@ -191,7 +221,7 @@ Rust 原生 cdylib 扩展已有不少事件、provider、renderer 和 runtime br
 
 证据：Rust `crates/rpi-extensions/src/lib.rs`、`crates/pi-cli/src/node_host.mjs:240-243,342-343,440`、`js_extensions.rs`；原生 `packages/coding-agent/src/core/extensions/types.ts`、`runner.ts`。
 
-### 17. TUI 基础组件没有直接等价物
+### 17. TUI 基础组件没有直接等价物 —— 已实现（见「实现进展」）
 
 原生 `packages/tui/src/components` 的 `AltScreenFlash`、`MouseRegion` 以及 `editor-component.ts` 接口，在 `crates/pi-tui/src` 没有直接等价 API。因此依赖这些组件的原生 TUI/extension 不能直接迁移。
 

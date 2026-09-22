@@ -122,6 +122,10 @@ pub struct Settings {
     /// Native Pi defaults this to `tree`; `none` disables the gesture.
     #[serde(default)]
     pub double_escape_action: Option<String>,
+    /// Default tools to enable at startup. When absent, all built-in tools
+    /// are enabled. When present, only the named tools are enabled.
+    #[serde(default)]
+    pub default_tools: Option<Vec<String>>,
     /// Hide the body of thinking blocks while retaining a compact label.
     #[serde(default)]
     pub hide_thinking_block: Option<bool>,
@@ -138,6 +142,10 @@ pub struct Settings {
     /// Maximum number of autocomplete rows shown above the editor.
     #[serde(default)]
     pub autocomplete_max_visible: Option<usize>,
+    /// Automatically copy text to clipboard when selected in fullscreen mode.
+    /// When false, text selection requires explicit copy action.
+    #[serde(default)]
+    pub fullscreen_copy_on_select: Option<bool>,
 }
 
 /// Load `~/.rpi/agent/settings.json`. Missing file ⇒ `Settings::default()`

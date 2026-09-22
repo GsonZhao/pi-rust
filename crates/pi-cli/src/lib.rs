@@ -42,12 +42,14 @@
 //! [`cli/args.ts`]: ../../.reference/pi/packages/coding-agent/src/cli/args.ts
 //! [`modes/print-mode.ts`]: ../../.reference/pi/packages/coding-agent/src/modes/print-mode.ts
 
+pub mod agent_session;
 pub mod app;
 pub mod args;
 pub mod auth;
 pub mod config;
 pub mod dev_extension;
 pub mod docs_tool;
+pub mod events;
 pub mod export;
 pub mod extension_api;
 pub mod extensions_actions;
@@ -61,6 +63,7 @@ pub mod node_transport;
 pub mod npm;
 pub mod packages;
 pub mod provider;
+pub mod remote;
 pub mod resource_dirs;
 pub mod resume_picker;
 pub mod session;

@@ -24,6 +24,7 @@ use rpi_harness::agent_harness::{AgentHarness, AgentLane, HarnessRunOutcome};
 use rpi_harness::events::{HarnessEvent, RunEndOutcome};
 
 use crate::args::Args;
+use crate::remote::protocol::RemoteResponse;
 
 /// Extract the concatenated text content from an assistant message. Mirrors the
 /// TS print-mode loop (`for content of assistantMsg.content if type===text`).
@@ -264,128 +265,236 @@ fn emit_agent_event(event: &AgentEvent) {
     println!("{}", agent_event_json(event));
 }
 
-/// Stable JSON projection for the fine-grained agent lifecycle stream.
-/// Complex payloads use their serde representation instead of being dropped,
-/// while convenience fields keep the stream easy to consume incrementally.
-fn agent_event_json(event: &AgentEvent) -> serde_json::Value {
-    use rpi_ai::types::AssistantMessageEvent;
-    match event {
-        AgentEvent::AgentStart => serde_json::json!({"type":"agent_start"}),
-        AgentEvent::AgentEnd { messages } => serde_json::json!({
-            "type":"agent_end", "messageCount": messages.len(),
-            "messages": serde_json::to_value(messages).unwrap_or(serde_json::Value::Null)
-        }),
-        AgentEvent::RetryScheduled {
-            attempt,
-            max_retries,
-            delay_ms,
-            error,
-        } => serde_json::json!({
-            "type":"retry_scheduled", "attempt":attempt,
-            "maxRetries":max_retries, "delayMs":delay_ms, "error":error
-        }),
-        AgentEvent::TurnStart => serde_json::json!({"type":"turn_start"}),
-        AgentEvent::TurnEnd {
-            message,
-            tool_results,
-        } => serde_json::json!({
-            "type":"turn_end", "message": serde_json::to_value(message).ok(),
-            "toolResultCount": tool_results.len(),
-            "toolResults": serde_json::to_value(tool_results).unwrap_or(serde_json::Value::Null)
-        }),
-        AgentEvent::MessageStart { message } => serde_json::json!({
-            "type":"message_start", "message": serde_json::to_value(message).ok()
-        }),
-        AgentEvent::MessageEnd { message } => serde_json::json!({
-            "type":"message_end", "message": serde_json::to_value(message).ok()
-        }),
-        AgentEvent::MessageUpdate {
-            message,
-            assistant_message_event,
-        } => {
-            let mut value = serde_json::json!({
-                "type":"message_update",
-                "message": serde_json::to_value(message).unwrap_or(serde_json::Value::Null),
-                "assistantMessageEvent": serde_json::to_value(assistant_message_event)
-                    .unwrap_or(serde_json::Value::Null),
-                "eventType": assistant_message_event.type_tag(),
-            });
-            let object = value.as_object_mut().expect("json object");
-            match assistant_message_event {
-                AssistantMessageEvent::TextDelta {
-                    content_index,
-                    delta,
-                    ..
+/// `rpc` mode: a headless JSONL command loop (the server-side agent).
+///
+/// Reads one JSON command per line from stdin (`{id?, type, ...}`), drives the
+/// `main` lane, and writes one JSON object per line to stdout:
+/// - fine-grained `AgentEvent`s via [`agent_event_json`] (each carries `type`),
+/// - a `{"type":"response","id":<id>,"status":"ok"|"error",...}` per command.
+///
+/// Commands: `prompt` (streams the run), `abort`, `get_state`, `set_model`,
+/// `set_thinking_level`, `set_active_tools`, `ping`, `stop`. `stop` (or stdin
+/// EOF) ends the loop. This is the process `rpi-server` spawns and that
+/// `rpi --connect` talks to. Mirrors TS `runRpcMode` / `modes/rpc`.
+pub async fn rpc(
+    harness: &AgentHarness,
+    mut agent_events: Option<tokio::sync::broadcast::Receiver<AgentEvent>>,
+    model_catalog: Vec<rpi_ai::Model>,
+) -> i32 {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    use tokio::sync::Mutex as AsyncMutex;
+
+    let lane: Arc<dyn AgentLane> = harness.lane("main");
+    let stdout = Arc::new(AsyncMutex::new(tokio::io::stdout()));
+
+    // Stream fine-grained AgentEvents as JSONL until the receiver closes.
+    if let Some(mut rx) = agent_events.take() {
+        let out = Arc::clone(&stdout);
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => write_line(&out, &agent_event_json(&event)).await,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
-                | AssistantMessageEvent::ThinkingDelta {
-                    content_index,
-                    delta,
-                    ..
-                }
-                | AssistantMessageEvent::ToolCallDelta {
-                    content_index,
-                    delta,
-                    ..
-                } => {
-                    object.insert("contentIndex".into(), (*content_index).into());
-                    object.insert("delta".into(), delta.clone().into());
-                }
-                _ => {}
             }
-            value
+        });
+    }
+
+    // Readiness marker: a host/client can wait for the first line.
+    write_line(&stdout, &serde_json::json!({"type": "ready"})).await;
+
+    let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    loop {
+        let line = match lines.next_line().await {
+            Ok(Some(line)) => line,
+            Ok(None) => break, // EOF
+            Err(error) => {
+                eprintln!("[rpi] rpc stdin error: {error}");
+                break;
+            }
+        };
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
         }
-        AgentEvent::ToolExecutionStart {
-            tool_call_id,
-            tool_name,
-            args,
-        } => serde_json::json!({
-            "type":"tool_execution_start", "toolCallId":tool_call_id,
-            "toolName":tool_name, "args":args
-        }),
-        AgentEvent::ToolExecutionUpdate {
-            tool_call_id,
-            tool_name,
-            args,
-            partial_result,
-        } => serde_json::json!({
-            "type":"tool_execution_update", "toolCallId":tool_call_id, "toolName":tool_name,
-            "args": args,
-            "partialResult": tool_result_json(partial_result)
-        }),
-        AgentEvent::ToolExecutionEnd {
-            tool_call_id,
-            tool_name,
-            result,
-            is_error,
-        } => serde_json::json!({
-            "type":"tool_execution_end", "toolCallId":tool_call_id,
-            "toolName":tool_name, "isError":is_error,
-            "result": tool_result_json(result)
-        }),
+        let msg: serde_json::Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(error) => {
+                write_line(
+                    &stdout,
+                    &RemoteResponse::error(
+                        serde_json::Value::Null,
+                        format!("invalid json: {error}"),
+                    )
+                    .to_json(),
+                )
+                .await;
+                continue;
+            }
+        };
+        let id = msg.get("id").cloned().unwrap_or(serde_json::Value::Null);
+        let kind = msg
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        if kind == "stop" {
+            write_line(
+                &stdout,
+                &RemoteResponse::ok(id.clone(), serde_json::json!({"stopped": true})).to_json(),
+            )
+            .await;
+            break;
+        }
+
+        let result = match kind.as_str() {
+            "prompt" => rpc_prompt(&lane, &msg).await,
+            "abort" => lane
+                .abort()
+                .await
+                .map(|_| serde_json::json!({"aborted": true}))
+                .map_err(|e| e.to_string()),
+            "get_state" => Ok(rpc_get_state(&lane, harness).await),
+            "set_model" => rpc_set_model(&lane, &model_catalog, &msg).await,
+            "set_thinking_level" => rpc_set_thinking_level(&lane, &msg).await,
+            "set_active_tools" => rpc_set_active_tools(&lane, &msg).await,
+            "ping" => Ok(serde_json::json!({"pong": true})),
+            other => Err(format!("unknown command type: {other}")),
+        };
+
+        let response = match result {
+            Ok(value) => RemoteResponse::ok(id.clone(), value),
+            Err(error) => RemoteResponse::error(id.clone(), error),
+        };
+        write_line(&stdout, &response.to_json()).await;
+    }
+
+    let _ = stdout.lock().await.flush().await;
+    0
+}
+
+async fn write_line(out: &Arc<tokio::sync::Mutex<tokio::io::Stdout>>, value: &serde_json::Value) {
+    use tokio::io::AsyncWriteExt;
+    let mut guard = out.lock().await;
+    let _ = guard.write_all(value.to_string().as_bytes()).await;
+    let _ = guard.write_all(b"\n").await;
+    let _ = guard.flush().await;
+}
+
+fn rpc_outcome_str(outcome: &HarnessRunOutcome) -> (&'static str, Option<String>) {
+    match outcome {
+        HarnessRunOutcome::Completed { final_message, .. } => {
+            ("completed", Some(assistant_text(final_message)))
+        }
+        HarnessRunOutcome::Aborted { final_message, .. } => {
+            ("aborted", Some(assistant_text(final_message)))
+        }
+        HarnessRunOutcome::Failed { final_message, .. } => {
+            ("failed", final_message.as_ref().map(assistant_text))
+        }
+        HarnessRunOutcome::Suspended { .. } => ("suspended", None),
     }
 }
 
-fn tool_result_json(result: &rpi_agent::types::AgentToolResult) -> serde_json::Value {
-    let content: Vec<serde_json::Value> = result
-        .content
-        .iter()
-        .map(|item| match item {
-            rpi_agent::types::TextContentOrImage::Text(text) => serde_json::json!({
-                "type": "text",
-                "text": text.text,
-            }),
-            rpi_agent::types::TextContentOrImage::Image(image) => {
-                serde_json::to_value(image).unwrap_or(serde_json::Value::Null)
-            }
-        })
-        .collect();
+async fn rpc_prompt(
+    lane: &Arc<dyn AgentLane>,
+    msg: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let content = msg
+        .get("content")
+        .or_else(|| msg.get("prompt"))
+        .and_then(|v| v.as_str())
+        .ok_or("prompt requires a string `content`")?
+        .to_string();
+    let result = lane
+        .prompt_text(&content, Vec::new())
+        .await
+        .map_err(|e| e.to_string())?;
+    let (outcome, final_text) = rpc_outcome_str(&result.outcome);
+    Ok(serde_json::json!({"outcome": outcome, "finalText": final_text}))
+}
+
+async fn rpc_get_state(lane: &Arc<dyn AgentLane>, harness: &AgentHarness) -> serde_json::Value {
+    let model = lane.get_model().await.ok().map(|m| m.id);
+    let thinking = lane
+        .get_thinking_level()
+        .await
+        .ok()
+        .map(|t| serde_json::to_value(t).unwrap_or(serde_json::Value::Null));
+    let active_tools = lane.get_active_tools().await.unwrap_or_default();
+    let leaf_id = lane.get_leaf_id().await.ok().flatten();
     serde_json::json!({
-        "content": content,
-        "details": result.details,
-        "usage": result.usage.as_ref().and_then(|usage| serde_json::to_value(usage).ok()),
-        "addedToolNames": result.added_tool_names,
-        "terminate": result.terminate,
+        "model": model,
+        "thinkingLevel": thinking,
+        "activeTools": active_tools,
+        "leafId": leaf_id,
+        "sessionId": harness.session().storage().metadata().id,
     })
+}
+
+async fn rpc_set_model(
+    lane: &Arc<dyn AgentLane>,
+    catalog: &[rpi_ai::Model],
+    msg: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let id = msg
+        .get("model")
+        .and_then(|v| v.as_str())
+        .ok_or("set_model requires `model`")?;
+    let model = catalog
+        .iter()
+        .find(|m| m.id.eq_ignore_ascii_case(id))
+        .cloned()
+        .ok_or_else(|| format!("unknown model: {id}"))?;
+    lane.set_model(model).await.map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({"model": id}))
+}
+
+async fn rpc_set_thinking_level(
+    lane: &Arc<dyn AgentLane>,
+    msg: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let value = msg
+        .get("level")
+        .or_else(|| msg.get("thinkingLevel"))
+        .ok_or("set_thinking_level requires `level`")?;
+    let level: rpi_ai::types::ThinkingLevel = serde_json::from_value(value.clone()).map_err(|_| {
+        "invalid thinking level (off|minimal|low|medium|high|xhigh|max)".to_string()
+    })?;
+    lane.set_thinking_level(level)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({"thinkingLevel": level}))
+}
+
+async fn rpc_set_active_tools(
+    lane: &Arc<dyn AgentLane>,
+    msg: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let tools = msg
+        .get("tools")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect::<Vec<_>>()
+        })
+        .ok_or("set_active_tools requires a `tools` array")?;
+    lane.set_active_tools(tools.clone())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({"activeTools": tools}))
+}
+
+/// Stable JSON projection for the fine-grained agent lifecycle stream.
+///
+/// Delegates to the shared [`crate::remote::protocol::RemoteEvent`] so the
+/// server and the `--connect` client agree on the wire shape by construction.
+fn agent_event_json(event: &AgentEvent) -> serde_json::Value {
+    serde_json::to_value(crate::remote::protocol::RemoteEvent::from_agent_event(event))
+        .unwrap_or(serde_json::Value::Null)
 }
 
 /// Emit a single harness event as a JSON line on stdout. Mirrors the TS
@@ -437,11 +546,27 @@ pub async fn interactive(
     no_themes: bool,
     reload_context: &crate::session::ReloadContext,
 ) -> i32 {
+    // ---- Session lifecycle (P1): BeforeTuiStart ----
+    // `BeforeTuiStart`: extensions may prepare (connect a server, load a
+    // resource) before the interactive UI initializes. Runs with a per-event
+    // timeout; a handler returning `EVENT_HANDLER_ABORT` **vetoes** startup —
+    // we print the reason and exit without entering the TUI. No-op when no
+    // extension subscribes.
+    if let Some(reason) = crate::session::dispatch_session_event_async(
+        reload_context,
+        rpi_plugin_sdk::EventTag::BeforeTuiStart,
+    )
+    .await
+    {
+        eprintln!("[rpi] startup vetoed by extension: {reason}");
+        return crate::app::EXIT_VETOED;
+    }
+
     // Check if TUI is supported
     let force_tui = std::env::var("RPI_FORCE_TUI")
         .map(|v| v == "1")
         .unwrap_or(false);
-    if force_tui || crate::interactive_tui::is_tui_supported() {
+    let code = if force_tui || crate::interactive_tui::is_tui_supported() {
         // Use TUI-based interactive mode
         crate::interactive_tui::interactive_tui(
             harness,
@@ -459,7 +584,23 @@ pub async fn interactive(
     } else {
         // Fall back to simple REPL
         interactive_repl(harness, args, initial, extra_messages, initial_images).await
+    };
+
+    // `SessionShutdown`: the interactive session closed (TUI/REPL returned) —
+    // extensions release resources, disconnect, persist state. Fired after the
+    // UI returns so it always runs (even on early-return paths inside the TUI).
+    // A veto here is **advisory** (the session is already closing) — warn and
+    // continue.
+    if let Some(reason) = crate::session::dispatch_session_event_async(
+        reload_context,
+        rpi_plugin_sdk::EventTag::SessionShutdown,
+    )
+    .await
+    {
+        tracing::warn!("[rpi] extension vetoed SessionShutdown (ignored, session closing): {reason}");
     }
+
+    code
 }
 
 /// Simple REPL-based interactive mode (fallback for non-TTY environments).

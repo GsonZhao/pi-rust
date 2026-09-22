@@ -560,9 +560,16 @@ impl Editor {
 
     /// Insert without an undo snapshot (caller pushed one — yank/replace
     /// paths). Notifies change observers.
+    ///
+    /// Line endings are normalized: `\r\n` and a lone `\r` are treated as one
+    /// newline. Pasted Windows text (and the `Event::Paste` payload on Unix,
+    /// which preserves CRLF) would otherwise insert literal carriage returns
+    /// into the line buffer — they render as garbage and break `cursor_col`
+    /// arithmetic on the next edit.
     fn insert_no_undo(&self, text: &str) {
+        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
         if let Ok(mut state) = self.state.lock() {
-            for ch in text.chars() {
+            for ch in normalized.chars() {
                 if ch == '\n' {
                     // Split line at cursor
                     let row = state.cursor_row;
@@ -1626,5 +1633,31 @@ l12",
         let text2 = editor.get_text();
         let mgr2 = AutocompleteManager::new();
         let _ = mgr2.get_suggestions(&text2, 9); // overshoot past end
+    }
+
+    #[test]
+    fn insert_normalizes_crlf_and_lone_cr_to_newlines() {
+        // Pasted Windows text (and the Unix `Event::Paste` payload, which keeps
+        // CRLF) used to insert literal `\r` bytes into the line buffer: they
+        // render as garbage and desync `cursor_col` from the string length.
+        let editor = Editor::simple();
+        editor.insert("line1\r\nline2\rline3");
+        assert_eq!(editor.get_text(), "line1\nline2\nline3");
+
+        // The buffer is 3 lines and the cursor sits at the end of the last.
+        let (row, col) = editor.cursor_position();
+        assert_eq!((row, col), (2, "line3".len()));
+
+        // Editing after a normalized paste stays sound (no mid-char split).
+        editor.insert("!");
+        assert_eq!(editor.get_text(), "line1\nline2\nline3!");
+    }
+
+    #[test]
+    fn insert_of_a_lone_crlf_makes_exactly_one_newline() {
+        let editor = Editor::simple();
+        editor.insert("a\r\nb");
+        assert_eq!(editor.get_text().matches('\n').count(), 1);
+        assert_eq!(editor.get_text(), "a\nb");
     }
 }

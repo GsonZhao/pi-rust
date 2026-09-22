@@ -170,7 +170,8 @@ impl FilePathAutocompleteProvider {
         // Check for @file reference
         let token = &input[start..cursor];
         if token.starts_with('@') {
-            return Some((token[1..].to_string(), start));
+            // Return start AFTER the @ so the @ is preserved in text[..start]
+            return Some((token[1..].to_string(), start + 1));
         } else if token.starts_with('"') {
             // Quoted path
             return Some((token[1..].to_string(), start + 1));

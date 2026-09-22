@@ -237,16 +237,51 @@ pub fn dispatch_to_handlers(snapshot: &RegistrySnapshot, event: &StablePluginEve
         return;
     }
     for h in handlers {
+        // P2: skip a handler whose plugin declared platforms excluding this host.
+        if !crate::registry::platform_allows(&h.platforms) {
+            crate::event_log::log_handler_invocation(
+                event.tag,
+                &h.plugin,
+                "PlatformSkip",
+                0,
+                Some(format!("host={}", crate::registry::current_platform())),
+            );
+            continue;
+        }
         // SAFETY: the plugin warrants `handler` + `user_data` are safe to
         // call from this thread. catch_unwind so a panic cannot cross FFI.
+        let started = std::time::Instant::now();
         let outcome = catch_unwind(AssertUnwindSafe(|| (h.handler)(*event, h.user_data)));
+        let duration_ms = started.elapsed().as_millis() as u64;
         match outcome {
             Ok(rc) if rc != 0 => {
                 tracing::warn!(tag = ?event.tag, rc, "extension event handler returned nonzero");
+                crate::event_log::log_handler_invocation(
+                    event.tag,
+                    &h.plugin,
+                    "Error",
+                    duration_ms,
+                    Some(format!("rc={rc}")),
+                );
             }
-            Ok(_) => {}
+            Ok(_) => {
+                crate::event_log::log_handler_invocation(
+                    event.tag,
+                    &h.plugin,
+                    "Continue",
+                    duration_ms,
+                    None,
+                );
+            }
             Err(_) => {
                 tracing::error!(tag = ?event.tag, "extension event handler panicked — skipped");
+                crate::event_log::log_handler_invocation(
+                    event.tag,
+                    &h.plugin,
+                    "Panic",
+                    duration_ms,
+                    None,
+                );
             }
         }
     }
@@ -266,6 +301,164 @@ pub fn dispatch_data_event(snapshot: &RegistrySnapshot, tag: EventTag, data: &st
     let event = StablePluginEvent::data(tag, StbString::from_string(data.to_string()));
     dispatch_to_handlers(snapshot, &event);
     true
+}
+
+/// Build + dispatch a **no-payload** event (e.g. `session_start`, `session_shutdown`,
+/// the rpi-specific `before_tui_start`) to the tag's handlers. Returns whether any
+/// handler was invoked. Mirrors [`dispatch_data_event`] for events whose payload
+/// is `EventEmpty`; a handler that subscribes to a no-payload tag receives the
+/// event with an empty payload.
+pub fn dispatch_empty_event(snapshot: &RegistrySnapshot, tag: EventTag) -> bool {
+    let handlers = snapshot.handlers_for(tag);
+    if handlers.is_empty() {
+        return false;
+    }
+    let event = StablePluginEvent::empty(tag);
+    dispatch_to_handlers(snapshot, &event);
+    true
+}
+
+/// Per-lifecycle-event handler timeout budget (mirrors lifescope §6.1):
+/// startup 5s, session shutdown 15s, everything else 10s. A handler that
+/// exceeds its budget is logged + skipped (it keeps running on its blocking
+/// thread, but no longer gates startup/shutdown).
+pub fn lifecycle_timeout_for(tag: EventTag) -> std::time::Duration {
+    use rpi_plugin_sdk::EventTag as T;
+    match tag {
+        T::BeforeTuiStart => std::time::Duration::from_secs(5),
+        T::SessionShutdown => std::time::Duration::from_secs(15),
+        _ => std::time::Duration::from_secs(10),
+    }
+}
+
+/// Invoke one no-payload lifecycle handler, catching unwinds at the FFI boundary.
+///
+/// Takes [`RegisteredHandler`](crate::registry::RegisteredHandler) **by value**
+/// so the caller's `spawn_blocking` closure captures the whole struct (which has
+/// `unsafe impl Send`) rather than its disjoint fields: `user_data` is a raw
+/// `*mut c_void` and is NOT `Send` on its own (Rust 2021 disjoint closure
+/// capture would otherwise move the raw pointer directly into the closure env
+/// and fail the `Send` bound).
+fn call_lifecycle_handler(
+    h: crate::registry::RegisteredHandler,
+    tag: EventTag,
+) -> std::thread::Result<i32> {
+    let event = StablePluginEvent::empty(tag);
+    // SAFETY: the plugin warrants `h.handler` + `h.user_data` are safe to call
+    // from any thread; catch_unwind so a panic cannot cross FFI.
+    catch_unwind(AssertUnwindSafe(|| (h.handler)(event, h.user_data)))
+}
+
+/// Veto-aware, timeout-bounded dispatch for a **no-payload lifecycle event**
+/// (`BeforeTuiStart` / `SessionStart` / `SessionShutdown`).
+///
+/// Unlike [`dispatch_empty_event`] (fire-and-forget observe fan-out), this:
+///
+/// 1. Runs each handler on a blocking thread with a per-event timeout
+///    ([`lifecycle_timeout_for`]) — a hung handler is logged + skipped, it
+///    does not stall startup or shutdown.
+/// 2. Honors the SDK's [`EVENT_HANDLER_ABORT`] veto code: the first handler to
+///    return it stops the fan-out and this returns `Some(reason)`.
+///
+/// Returns `None` when no handler vetoed (continue the lifecycle); `Some` when
+/// a handler aborted. A stale registry (swapped-out session) returns `None`.
+/// The **caller** decides what a veto means for the phase — e.g. a
+/// `BeforeTuiStart` veto aborts startup before the TUI initializes.
+pub async fn dispatch_lifecycle_event(
+    snapshot: &RegistrySnapshot,
+    tag: EventTag,
+) -> Option<String> {
+    // Staleness guard: a stale registry (swapped-out session) does nothing.
+    if !crate::registry::assert_active(snapshot.active_flag()) {
+        return None;
+    }
+    let handlers = snapshot.handlers_for(tag).to_vec();
+    if handlers.is_empty() {
+        return None;
+    }
+    // Lifecycle tags are no-payload: the event is `EventEmpty`. We build it
+    // inside the helper (via `spawn_blocking`) so the closure env only carries
+    // Send values.
+    let timeout = lifecycle_timeout_for(tag);
+    for h in handlers {
+        // P2: skip a handler whose plugin declared platforms excluding this host.
+        if !crate::registry::platform_allows(&h.platforms) {
+            crate::event_log::log_handler_invocation(
+                tag,
+                &h.plugin,
+                "PlatformSkip",
+                0,
+                Some(format!("host={}", crate::registry::current_platform())),
+            );
+            continue;
+        }
+        // Capture the owning extension's display name for the veto message
+        // before the handler is moved into the blocking closure.
+        let plugin_name = h.plugin.clone();
+        let h_task = h;
+        let tag_task = tag;
+        let started = std::time::Instant::now();
+        let outcome = tokio::time::timeout(
+            timeout,
+            tokio::task::spawn_blocking(move || call_lifecycle_handler(h_task, tag_task)),
+        )
+        .await;
+        let duration_ms = started.elapsed().as_millis() as u64;
+        match outcome {
+            Ok(Ok(Ok(rc))) if rc == rpi_plugin_sdk::EVENT_HANDLER_ABORT => {
+                tracing::warn!(
+                    tag = ?tag,
+                    plugin = %plugin_name,
+                    "extension handler vetoed lifecycle event"
+                );
+                crate::event_log::log_handler_invocation(tag, &plugin_name, "Abort", duration_ms, None);
+                return Some(format!("extension `{plugin_name}` vetoed {tag:?}"));
+            }
+            Ok(Ok(Ok(rc))) => {
+                let result = if rc == 0 { "Continue" } else { "Error" };
+                crate::event_log::log_handler_invocation(
+                    tag,
+                    &plugin_name,
+                    result,
+                    duration_ms,
+                    if rc == 0 { None } else { Some(format!("rc={rc}")) },
+                );
+            }
+            Ok(Ok(Err(_))) => {
+                tracing::error!(tag = ?tag, "extension handler panicked — skipped");
+                crate::event_log::log_handler_invocation(tag, &plugin_name, "Panic", duration_ms, None);
+            }
+            Ok(Err(join_err)) => {
+                tracing::error!(
+                    tag = ?tag,
+                    error = %join_err,
+                    "extension handler task join failed — skipped"
+                );
+                crate::event_log::log_handler_invocation(
+                    tag,
+                    &plugin_name,
+                    "JoinFailed",
+                    duration_ms,
+                    Some(join_err.to_string()),
+                );
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    tag = ?tag,
+                    timeout_ms = timeout.as_millis(),
+                    "extension handler timed out — skipped (still running on its blocking thread)"
+                );
+                crate::event_log::log_handler_invocation(
+                    tag,
+                    &plugin_name,
+                    "Timeout",
+                    duration_ms,
+                    Some(format!("budget_ms={}", timeout.as_millis())),
+                );
+            }
+        }
+    }
+    None
 }
 
 impl AgentEmitter for ExtensionEmitter {
@@ -389,7 +582,10 @@ fn free_dispatched_event(event: &StablePluginEvent) {
         | T::ModelSelect
         | T::ThinkingLevelSelect
         | T::UserBash
-        | T::Input => {
+        | T::Input
+        | T::BeforeTuiStart
+        | T::UiPromptStart
+        | T::UiPromptEnd => {
             // no payload today.
         }
         // The B4 provider-hook observer events carry a generic data payload
@@ -544,7 +740,12 @@ mod tests {
         let _guard = HANDLER_TEST_LOCK.lock().unwrap();
         HANDLER_HITS.store(0, Ordering::SeqCst);
         let mut reg = crate::registry::ExtensionRegistry::new();
-        reg.register_event_handler(EventTag::MessageEnd, counting_handler, std::ptr::null_mut());
+        reg.register_event_handler(
+            "test-plugin".to_string(),
+            EventTag::MessageEnd,
+            counting_handler,
+            std::ptr::null_mut(),
+        );
         let snap = Arc::new(reg.snapshot());
         let emitter = ExtensionEmitter::new(snap, crate::loader::PluginKeepalive::empty());
 
@@ -606,7 +807,12 @@ mod tests {
         let (collector_b, events_b) = CollectorEmitter::new();
         HANDLER_HITS.store(0, Ordering::SeqCst);
         let mut reg = crate::registry::ExtensionRegistry::new();
-        reg.register_event_handler(EventTag::MessageEnd, counting_handler, std::ptr::null_mut());
+        reg.register_event_handler(
+            "test-plugin".to_string(),
+            EventTag::MessageEnd,
+            counting_handler,
+            std::ptr::null_mut(),
+        );
         let snap = Arc::new(reg.snapshot());
         let ext = ExtensionEmitter::new(snap, crate::loader::PluginKeepalive::empty());
 
@@ -650,5 +856,183 @@ mod tests {
             1,
             "plugin handler fired once"
         );
+    }
+
+    // --- dispatch_empty_event: no-payload lifecycle events (P0 session events)
+
+    /// Verifies `dispatch_empty_event` fans a no-payload event (e.g. the
+    /// rpi-specific `BeforeTuiStart` / session lifecycle tags) to every
+    /// subscriber and reports whether any handler was invoked.
+    #[test]
+    fn dispatch_empty_event_fans_out_to_subscribers() {
+        let _guard = HANDLER_TEST_LOCK.lock().unwrap();
+        HANDLER_HITS.store(0, Ordering::SeqCst);
+        let mut reg = crate::registry::ExtensionRegistry::new();
+        reg.register_event_handler(
+            "test-plugin".to_string(),
+            EventTag::SessionStart,
+            counting_handler,
+            std::ptr::null_mut(),
+        );
+        reg.register_event_handler(
+            "test-plugin".to_string(),
+            EventTag::BeforeTuiStart,
+            counting_handler,
+            std::ptr::null_mut(),
+        );
+        let snap = Arc::new(reg.snapshot());
+
+        // No subscriber for SessionShutdown → no handler invoked.
+        assert!(!dispatch_empty_event(&snap, EventTag::SessionShutdown));
+        assert_eq!(HANDLER_HITS.load(Ordering::SeqCst), 0);
+
+        // SessionStart + BeforeTuiStart both have one subscriber each.
+        assert!(dispatch_empty_event(&snap, EventTag::SessionStart));
+        assert!(dispatch_empty_event(&snap, EventTag::BeforeTuiStart));
+        assert_eq!(HANDLER_HITS.load(Ordering::SeqCst), 2);
+
+        // Stale registry (session swapped): dispatch is a silent no-op inside
+        // `dispatch_to_handlers` — no handler is invoked — though the fn still
+        // reports subscribers existed (matches `dispatch_data_event` semantics).
+        reg.invalidate();
+        assert!(dispatch_empty_event(&snap, EventTag::SessionStart));
+        assert!(dispatch_empty_event(&snap, EventTag::BeforeTuiStart));
+        assert_eq!(HANDLER_HITS.load(Ordering::SeqCst), 2);
+    }
+
+    // --- dispatch_lifecycle_event: veto + timeout (P1) ---
+
+    /// A lifecycle handler that vetoes (returns the SDK abort code).
+    extern "C" fn aborting_handler(_ev: StablePluginEvent, _ud: *mut std::ffi::c_void) -> i32 {
+        rpi_plugin_sdk::EVENT_HANDLER_ABORT
+    }
+
+    /// A lifecycle handler that returns success (`0`) — no veto.
+    extern "C" fn continue_handler(_ev: StablePluginEvent, _ud: *mut std::ffi::c_void) -> i32 {
+        rpi_plugin_sdk::EVENT_HANDLER_CONTINUE
+    }
+
+    /// A lifecycle handler that returns a generic handled error — no veto.
+    extern "C" fn error_handler(_ev: StablePluginEvent, _ud: *mut std::ffi::c_void) -> i32 {
+        rpi_plugin_sdk::EVENT_HANDLER_ERROR
+    }
+
+    #[test]
+    fn lifecycle_timeout_budget_matches_spec() {
+        assert_eq!(
+            lifecycle_timeout_for(EventTag::BeforeTuiStart),
+            std::time::Duration::from_secs(5)
+        );
+        assert_eq!(
+            lifecycle_timeout_for(EventTag::SessionShutdown),
+            std::time::Duration::from_secs(15)
+        );
+        assert_eq!(
+            lifecycle_timeout_for(EventTag::SessionStart),
+            std::time::Duration::from_secs(10)
+        );
+    }
+
+    /// A handler returning `EVENT_HANDLER_ABORT` vetoes the phase; the returned
+    /// reason names the owning extension.
+    #[tokio::test]
+    async fn dispatch_lifecycle_event_honors_veto() {
+        let mut reg = crate::registry::ExtensionRegistry::new();
+        reg.register_event_handler(
+            "veto-ext".to_string(),
+            EventTag::BeforeTuiStart,
+            aborting_handler,
+            std::ptr::null_mut(),
+        );
+        let snap = Arc::new(reg.snapshot());
+        let result = dispatch_lifecycle_event(&snap, EventTag::BeforeTuiStart).await;
+        assert_eq!(
+            result.as_deref(),
+            Some("extension `veto-ext` vetoed BeforeTuiStart")
+        );
+    }
+
+    /// A `0` (continue) or generic nonzero (handled error) return does NOT veto;
+    /// the fan-out still visits every handler and returns `None`.
+    #[tokio::test]
+    async fn dispatch_lifecycle_event_continue_and_error_do_not_veto() {
+        let mut reg = crate::registry::ExtensionRegistry::new();
+        reg.register_event_handler(
+            "ok-ext".to_string(),
+            EventTag::SessionStart,
+            continue_handler,
+            std::ptr::null_mut(),
+        );
+        reg.register_event_handler(
+            "err-ext".to_string(),
+            EventTag::SessionStart,
+            error_handler,
+            std::ptr::null_mut(),
+        );
+        let snap = Arc::new(reg.snapshot());
+        assert!(dispatch_lifecycle_event(&snap, EventTag::SessionStart)
+            .await
+            .is_none());
+    }
+
+    /// No subscribers → no veto, no work.
+    #[tokio::test]
+    async fn dispatch_lifecycle_event_no_subscribers_is_none() {
+        let reg = crate::registry::ExtensionRegistry::new();
+        let snap = Arc::new(reg.snapshot());
+        assert!(dispatch_lifecycle_event(&snap, EventTag::BeforeTuiStart)
+            .await
+            .is_none());
+    }
+
+    /// A stale registry (swapped-out session) is a no-op — a veto from a stale
+    /// handler must NOT abort the new session's startup.
+    #[tokio::test]
+    async fn dispatch_lifecycle_event_stale_is_none() {
+        let mut reg = crate::registry::ExtensionRegistry::new();
+        reg.register_event_handler(
+            "veto-ext".to_string(),
+            EventTag::BeforeTuiStart,
+            aborting_handler,
+            std::ptr::null_mut(),
+        );
+        let snap = Arc::new(reg.snapshot());
+        reg.invalidate();
+        assert!(dispatch_lifecycle_event(&snap, EventTag::BeforeTuiStart)
+            .await
+            .is_none());
+    }
+
+    /// The observe fan-out records one JSONL line per handler when the global
+    /// event logger is enabled.
+    #[test]
+    fn dispatch_records_handler_invocation_to_event_log() {
+        let _guard = HANDLER_TEST_LOCK.lock().unwrap();
+        HANDLER_HITS.store(0, Ordering::SeqCst);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("events.jsonl");
+        crate::event_log::set_event_logger_for_test(crate::event_log::EventLogger::open(path.clone()));
+
+        let mut reg = crate::registry::ExtensionRegistry::new();
+        reg.register_event_handler(
+            "log-ext".to_string(),
+            EventTag::MessageEnd,
+            counting_handler,
+            std::ptr::null_mut(),
+        );
+        let snap = Arc::new(reg.snapshot());
+        let event =
+            StablePluginEvent::message(EventTag::MessageEnd, StbString::from_string("m".to_string()));
+        dispatch_to_handlers(&snap, &event);
+
+        // Restore the disabled default so later tests don't write into the
+        // (soon-deleted) temp file.
+        crate::event_log::set_event_logger_for_test(crate::event_log::EventLogger::disabled());
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(r#""event":"MessageEnd""#), "log: {text}");
+        assert!(text.contains(r#""plugin":"log-ext""#), "log: {text}");
+        assert!(text.contains(r#""result":"Continue""#), "log: {text}");
+        assert_eq!(HANDLER_HITS.load(Ordering::SeqCst), 1);
     }
 }
