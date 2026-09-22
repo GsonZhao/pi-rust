@@ -529,12 +529,17 @@ pub enum EventTag {
     /// rpi-specific: dispatched before the interactive TUI initializes (not a
     /// Pi `on()` category). Appended last so existing discriminants are stable.
     BeforeTuiStart = 33,
+    /// Pi `on()` category: dispatched when the TUI shows an interactive prompt
+    /// (selector, dialog, etc.) that blocks agent work.
+    UiPromptStart = 34,
+    /// Pi `on()` category: dispatched when the TUI prompt is dismissed.
+    UiPromptEnd = 35,
 }
 
-/// Number of event categories — `34` (33 Pi `on()` categories + 1 rpi-specific
-/// [`EventTag::BeforeTuiStart`]). A test asserts `EVENT_TAG_COUNT == 34` so a
-/// future edit that adds/removes a tag is caught.
-pub const EVENT_TAG_COUNT: usize = 34;
+/// Number of event categories — `36` (33 Pi `on()` categories + 1 rpi-specific
+/// [`EventTag::BeforeTuiStart`] + 2 UI prompt events). A test asserts
+/// `EVENT_TAG_COUNT == 36` so a future edit that adds/removes a tag is caught.
+pub const EVENT_TAG_COUNT: usize = 36;
 
 /// No-payload marker for events that carry none (e.g. `session_shutdown`).
 /// Carries a dummy byte so the empty-struct isn't flagged FFI-unsafe by
@@ -1473,10 +1478,10 @@ mod tests {
     }
 
     #[test]
-    fn event_tag_count_is_34() {
+    fn event_tag_count_is_36() {
         // Enumerate every tag; a compile-time + runtime guarantee that the
-        // 34-category surface is intact (33 Pi on() categories + the
-        // rpi-specific BeforeTuiStart).
+        // 36-category surface is intact (33 Pi on() categories + the
+        // rpi-specific BeforeTuiStart + 2 UI prompt events).
         let tags = [
             EventTag::ProjectTrust,
             EventTag::ResourcesDiscover,
@@ -1512,13 +1517,15 @@ mod tests {
             EventTag::UserBash,
             EventTag::Input,
             EventTag::BeforeTuiStart,
+            EventTag::UiPromptStart,
+            EventTag::UiPromptEnd,
         ];
         assert_eq!(tags.len(), EVENT_TAG_COUNT);
-        assert_eq!(EVENT_TAG_COUNT, 34);
-        // Distinct discriminants 0..33.
+        assert_eq!(EVENT_TAG_COUNT, 36);
+        // Distinct discriminants 0..35.
         let mut discs: Vec<u32> = tags.iter().map(|t| *t as u32).collect();
         discs.sort();
-        assert_eq!(discs, (0..34).collect::<Vec<u32>>());
+        assert_eq!(discs, (0..36).collect::<Vec<u32>>());
     }
 
     #[test]

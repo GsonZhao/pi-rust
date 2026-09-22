@@ -30,7 +30,7 @@ struct DocPage {
 static DOCS: &[DocPage] = &[
     DocPage {
         topic: "authoring",
-        description: "创建 Pi JS/TS package 与 Rust cdylib 扩展的模板、开发流程、安全边界、测试和发布最佳实践",
+        description: "Rust cdylib 扩展开发最佳实践：ABI v3/v2 入口、工具生命周期、事件处理器、资源发现、rpi dev 开发与发布检查清单",
         content: include_str!("../embedded-docs/extension-authoring.md"),
         aliases: &["package-authoring", "extension-authoring", "create-package", "create-extension"],
     },
@@ -64,6 +64,12 @@ static DOCS: &[DocPage] = &[
         content: include_str!("../embedded-docs/m6-cli-open-questions.md"),
         aliases: &["pi", "parity", "migration"],
     },
+    DocPage {
+        topic: "debugging",
+        description: "Rust cdylib 扩展编写（ABI v3/v2、工具生命周期、事件处理器）与 agent/扩展调试（事件日志、rpi dev-local、常见失败定位）",
+        content: include_str!("../embedded-docs/rust-debugging.md"),
+        aliases: &["rust", "rust-debug", "extension-debug", "troubleshoot", "debug"],
+    },
 ];
 
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -86,7 +92,7 @@ impl DocsTool {
         Self {
             schema: Tool {
                 name: "docs".to_string(),
-                description: "Look up rpi usage documentation. Omit topic (or use topic=list) to list topics; pass a topic such as guide, authoring, extensions, architecture, or compatibility. Add query to find relevant sections. Use this before guessing rpi commands, creating packages/extensions, Pi compatibility, extension APIs, or .rpi configuration.".to_string(),
+                description: "Look up rpi usage documentation. Omit topic (or use topic=list) to list topics; pass a topic such as guide, authoring, extensions, debugging, architecture, or compatibility. Add query to find relevant sections. Use this before guessing rpi commands, creating packages/extensions, Pi compatibility, extension APIs, or .rpi configuration.".to_string(),
                 parameters: rpi_ai::types::Schema::new(
                     serde_json::to_value(params).unwrap_or_default(),
                 ),
@@ -249,6 +255,14 @@ mod tests {
         assert!(output.contains("guide"));
         assert!(output.contains("authoring"));
         assert!(output.contains("extensions"));
+        assert!(output.contains("debugging"));
+    }
+
+    #[tokio::test]
+    async fn returns_rust_debugging_guide() {
+        let output = execute(serde_json::json!({"topic": "debugging", "query": "rpi dev"})).await;
+        assert!(output.contains("rpi dev"));
+        assert!(output.contains("cdylib"));
     }
 
     #[tokio::test]

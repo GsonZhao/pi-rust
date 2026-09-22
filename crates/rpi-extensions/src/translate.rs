@@ -583,7 +583,9 @@ fn free_dispatched_event(event: &StablePluginEvent) {
         | T::ThinkingLevelSelect
         | T::UserBash
         | T::Input
-        | T::BeforeTuiStart => {
+        | T::BeforeTuiStart
+        | T::UiPromptStart
+        | T::UiPromptEnd => {
             // no payload today.
         }
         // The B4 provider-hook observer events carry a generic data payload

@@ -235,8 +235,10 @@ require package discovery.
   variables (`OPENAI_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_API_KEY`). `rpi auth
   login`/`check`/`logout` manage the stored credential.
 - **Tools:** the CLI defaults to Pi's `read`, `write`, `edit`, and `bash`
-  tools. The former rpi-only `grep`, `find`, `ls`, `docs`, and `powershell`
-  implementations remain library code but are not loaded by default.
+  tools plus the read-only `docs` tool. Windows also registers `powershell` by
+  default. A `defaultTools` setting in `.rpi/settings.json` limits the enabled
+  set when no `--tools` override is present. The former rpi-only `grep`, `find`,
+  `ls` implementations remain library code but are not loaded by default.
 - **Extensions:** Rust `cdylib` plugins can be installed with `rpi install` and
   are discovered from project `.rpi/extensions`, legacy `.pi/extensions`,
   global `~/.rpi/agent/extensions`, and `--extensions-dir`.
@@ -254,6 +256,15 @@ require package discovery.
   available for native integrations unless `--no-extensions` is supplied.
 - **Sessions:** JSONL v4 durable backend + in-memory ephemeral; compaction + a
   split-turn two-LLM-call invariant.
+- **Remote mode:** `rpi --server [--port <n>]` runs a headless agent server that
+  prints a token; `rpi --connect <host:port> [--token <t>]` attaches a
+  zero-local-resource terminal client. See [`docs/remote-mode.md`](docs/remote-mode.md).
+- **Extension debugging:** `RPI_EVENT_LOG=1` writes every extension
+  event-handler invocation to a JSONL journal (`~/.rpi/logs/events.jsonl`)
+  inspectable with `rpi events path` / `rpi events tail`.
+  `rpi dev-local` debugs a single extension in isolation.
+  The `docs` tool `debugging` topic covers Rust extension authoring and
+  agent/extension debugging.
 
 ## Configuration
 

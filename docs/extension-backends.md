@@ -27,12 +27,59 @@ Every backend reports an API version and explicit capabilities. Unsupported
 capabilities should be reported as structured `unsupported_capability` errors;
 they must not appear as JavaScript `undefined` failures.
 
+## ABI negotiation (v3 → v2 → v1)
+
 The native loader uses a symbol-based ABI handshake. It prefers
-`rpi_plugin_register_v2` with ABI version 2 and only looks for legacy
-`rpi_plugin_register` with ABI version 1 when the v2 symbol is absent. A chosen
-entrypoint is called once; registration failure never triggers cross-version
-fallback. The frozen v1 action range is `0..=15`, while v2 currently accepts
-`0..=16`; raw numeric ids are validated before host dispatch.
+`rpi_plugin_register_v3` (ABI version 3), then `rpi_plugin_register_v2` (ABI
+version 2), and only falls back to legacy `rpi_plugin_register` (ABI version 1)
+when neither v3 nor v2 symbol is present. A chosen entrypoint is called once;
+registration failure never triggers cross-version fallback.
+
+ABI v3 adds a `PluginApiVt3Ext::declare` hook for declaring a numeric
+`priority` and a supported `platforms` array (e.g. `["linux","windows","macos"]`).
+The v3 `api` vtable is otherwise identical to v2. The frozen v1 action range is
+`0..=15`; v2/v3 currently accept `0..=17` (`GetCliFlag = 16`, `UiDialog = 17`);
+raw numeric ids are validated before host dispatch.
+
+## Lifecycle events and veto (P1)
+
+The host dispatches lifecycle events to extension event handlers. The event
+space covers 36 tags (33 Pi `on()` categories + rpi-specific `BeforeTuiStart` +
+`UiPromptStart`/`UiPromptEnd`), spanning session lifecycle, agent loop, tool
+execution, and model selection.
+
+`BeforeTuiStart` is a veto-capable rpi-specific hook: the first handler to return
+`EVENT_HANDLER_ABORT` aborts startup before the TUI initializes, and the CLI
+exits with code `3`. `SessionStart`/`SessionShutdown` vetoes are advisory —
+headless mode logs a warning, shutdown ignores them. Dispatch is
+`catch_unwind`-wrapped and timeout-bounded so a slow or panicking handler does
+not hang the host.
+
+## Event journal (P3)
+
+Extension event-handler invocations can be recorded to an opt-in JSONL journal:
+
+```bash
+export RPI_EVENT_LOG=1
+rpi            # every handler invocation is logged
+```
+
+The journal defaults to `<root>/logs/events.jsonl` (`<root>` is
+`$RPI_CODING_AGENT_DIR`'s parent, else `~/.rpi`); `RPI_EVENT_LOG_PATH` overrides
+the path. When disabled the logger is a no-op (zero disk writes, zero overhead).
+
+Inspect it with:
+
+```bash
+rpi events path   # print the resolved log path
+rpi events tail   # print + follow new entries (Ctrl+C to stop)
+```
+
+Each line is a JSON object with `ts_ms`, `event` (tag Debug form, e.g.
+`BeforeTuiStart`), `plugin` (extension display name), `result`
+(`Continue`/`Error`/`Abort`/`Timeout`/`Panic`/`JoinFailed`), `duration_ms`, and
+optional `detail`. Use it to answer "why didn't my extension run?" and to audit
+handler behavior after the fact.
 
 ## Compatibility progression
 

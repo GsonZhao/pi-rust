@@ -142,6 +142,10 @@ pub struct Settings {
     /// Maximum number of autocomplete rows shown above the editor.
     #[serde(default)]
     pub autocomplete_max_visible: Option<usize>,
+    /// Automatically copy text to clipboard when selected in fullscreen mode.
+    /// When false, text selection requires explicit copy action.
+    #[serde(default)]
+    pub fullscreen_copy_on_select: Option<bool>,
 }
 
 /// Load `~/.rpi/agent/settings.json`. Missing file ⇒ `Settings::default()`

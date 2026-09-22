@@ -634,6 +634,28 @@ impl CommandRegistry {
     }
 }
 
+/// Dispatch a ui_prompt_start event to extensions.
+fn dispatch_ui_prompt_event(state: &TuiState) {
+    use rpi_plugin_sdk::EventTag;
+    
+    if let Ok(session) = state.extension_session.lock() {
+        if let Some(snapshot) = session.snapshot_arc() {
+            rpi_extensions::dispatch_empty_event(&snapshot, EventTag::UiPromptStart);
+        }
+    }
+}
+
+/// Dispatch a ui_prompt_end event to extensions.
+fn dispatch_ui_prompt_event_end(state: &TuiState) {
+    use rpi_plugin_sdk::EventTag;
+    
+    if let Ok(session) = state.extension_session.lock() {
+        if let Some(snapshot) = session.snapshot_arc() {
+            rpi_extensions::dispatch_empty_event(&snapshot, EventTag::UiPromptEnd);
+        }
+    }
+}
+
 /// Resolve the command for a `/`-prefixed input and run it, or emit the
 /// unknown-command error if nothing matches. Non-slash text never reaches here
 /// — callers route only `/`-prefixed inputs and send plain text directly.
@@ -4257,6 +4279,9 @@ struct TuiState {
     search: Arc<AltScreenSearch>,
     /// Search bar component shown when search is active.
     search_bar: Arc<SearchBar>,
+    /// Fullscreen selection tracking for auto-copy.
+    selection_start: std::sync::Mutex<Option<(u16, u16)>>,
+    selection_end: std::sync::Mutex<Option<(u16, u16)>>,
 }
 
 /// How many submitted messages are kept for ↑ recall (mirrors the TS
@@ -5123,6 +5148,8 @@ pub async fn interactive_tui(
         extension_session: reload_context.extension_session.clone(),
         search: Arc::new(AltScreenSearch::new()),
         search_bar: Arc::new(SearchBar::new()),
+        selection_start: std::sync::Mutex::new(None),
+        selection_end: std::sync::Mutex::new(None),
     });
 
     // Capture the model catalog + cwd for the selector builders + the key loop
@@ -5483,6 +5510,38 @@ pub async fn interactive_tui(
                         if scroll_for_key.scroll_by(delta) != delta {
                             tui_for_key.request_render_reusing_scroll_content();
                         }
+                    }
+                    MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                        // Start selection tracking
+                        *state_for_key.selection_start.lock().unwrap() = Some((m.column, m.row));
+                        *state_for_key.selection_end.lock().unwrap() = None;
+                    }
+                    MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                        // End selection and auto-copy if enabled
+                        if let Some(start) = *state_for_key.selection_start.lock().unwrap() {
+                            *state_for_key.selection_end.lock().unwrap() = Some((m.column, m.row));
+                            
+                            // Check if auto-copy is enabled
+                            let auto_copy = crate::settings::load_settings()
+                                .ok()
+                                .and_then(|s| s.fullscreen_copy_on_select)
+                                .unwrap_or(true);
+                            
+                            if auto_copy {
+                                // Try to extract selected text from chat container
+                                if let Some(selected_text) = extract_selected_text(
+                                    &state_for_key.chat_container,
+                                    start,
+                                    (m.column, m.row),
+                                ) {
+                                    if !selected_text.trim().is_empty() {
+                                        let _ = copy_to_clipboard(&selected_text);
+                                    }
+                                }
+                            }
+                        }
+                        *state_for_key.selection_start.lock().unwrap() = None;
+                        *state_for_key.selection_end.lock().unwrap() = None;
                     }
                     _ => {}
                 }
@@ -6685,6 +6744,46 @@ fn copy_last_assistant(state: &Arc<TuiState>, chat: &Arc<Container>) {
     }
 }
 
+/// Extract text from the chat container within the given screen coordinates.
+/// Returns None if the selection is invalid or empty.
+fn extract_selected_text(
+    chat_container: &Arc<Container>,
+    start: (u16, u16),
+    end: (u16, u16),
+) -> Option<String> {
+    use rpi_tui::Component;
+    
+    // Get the rendered lines from the chat container
+    let lines = chat_container.render(80); // Use a reasonable width
+    if lines.is_empty() {
+        return None;
+    }
+    
+    // Normalize coordinates (ensure start is before end)
+    let (start_row, end_row) = if start.1 <= end.1 {
+        (start.1 as usize, end.1 as usize)
+    } else {
+        (end.1 as usize, start.1 as usize)
+    };
+    
+    // Clamp to valid range
+    let start_row = start_row.min(lines.len().saturating_sub(1));
+    let end_row = end_row.min(lines.len().saturating_sub(1));
+    
+    if start_row > end_row {
+        return None;
+    }
+    
+    // Extract the selected lines
+    let selected_lines: Vec<String> = lines[start_row..=end_row].to_vec();
+    
+    if selected_lines.is_empty() {
+        return None;
+    }
+    
+    Some(selected_lines.join("\n"))
+}
+
 /// Best-effort clipboard write. Enabled only with the `clipboard` feature
 /// (`arboard`); otherwise returns `false` so the caller degrades to a hint.
 #[cfg(feature = "clipboard")]
@@ -7618,6 +7717,9 @@ fn open_selector_with_view<C: Component + 'static>(
     view: Arc<C>,
     kind: SelectorKind,
 ) {
+    // Dispatch ui_prompt_start event
+    dispatch_ui_prompt_event(state);
+    
     // Unfocus the editor so its cursor marker doesn't render behind the list.
     editor.set_focused(false);
     // A selector replaces the editor slot. Drop stale slash/@file
@@ -7640,6 +7742,9 @@ fn close_selector(
     editor: &Arc<Editor>,
     tui: &Arc<TuiAltScreen>,
 ) {
+    // Dispatch ui_prompt_end event
+    dispatch_ui_prompt_event_end(state);
+    
     editor_container.clear();
     editor_container.add_child(editor.clone());
     state.autocomplete_container.clear();

@@ -121,6 +121,7 @@ ANTHROPIC_AUTH_TOKEN=token
 --model <pattern>       模型 ID，支持 provider/model 和 thinking 后缀
 --api-key <key>         本次运行覆盖凭据
 --base-url <url>        覆盖模型 endpoint
+--timeout <seconds>     LLM API 请求超时（默认 600）
 --thinking <level>      off/minimal/low/medium/high/xhigh/max
 --print, -p             单次运行并退出
 --mode text|json|rpc    输出模式
@@ -128,12 +129,25 @@ ANTHROPIC_AUTH_TOKEN=token
 --resume, -r            选择历史会话
 --session <id|path>     指定会话
 --session-dir <dir>     指定会话目录
+--name, -n <name>       设置会话显示名称
 --tools <list>          只允许指定工具
 --exclude-tools <list>  禁用指定工具
 --no-tools              禁用所有工具
+--no-builtin-tools      禁用内置工具（read/bash/edit/write/docs）
+--no-skills             跳过技能发现
+--no-prompt-templates   跳过 prompt-template 发现
+--no-context-files      跳过 AGENTS.md/CLAUDE.md 发现
 --no-extensions         禁用扩展加载
 --enable-pi-packages    启用配置中的 Pi JS/TS package（会启动 Node）
 --extensions-dir <dir>  额外扫描 Rust 扩展目录
+--list-models [search]  列出可用模型（可带模糊搜索）
+--offline               禁用启动时的网络检查
+--export <file>         把 JSONL 会话导出为 HTML
+--tui-mode <mode>       TUI buffer：regular 或 fullscreen
+--system-prompt <text>  替换默认系统提示词
+--append-system-prompt <text>  追加系统提示词（可重复）
+--debug-system-prompt   把解析后的系统提示词各段打印到 stderr
+--verbose               显示启动警告（如被忽略的 flag）
 --server [--port <n>] [--bind <ip>]
                         无头服务端（启动时打印 token）
 --connect <host:port>   远程客户端 TUI（零本地资源）
@@ -144,6 +158,7 @@ ANTHROPIC_AUTH_TOKEN=token
 
 ```text
 rpi auth login|check|logout
+rpi events path|tail    检查扩展事件日志（需 RPI_EVENT_LOG=1）
 rpi package list|add|remove|update
 rpi install <crate>
 rpi install-pi <spec>
@@ -152,6 +167,8 @@ rpi uninstall-pi <spec>
 rpi update                 # 更新 rpi CLI 自身
 rpi package update         # 只更新 Rust 原生扩展
 rpi pi-package update      # 只更新 Pi npm/Git package
+rpi dev [options]          # 开发 Rust 扩展：编译、watch、热重载
+rpi dev-local [options]    # 只调试当前 Rust 扩展（隔离模式）
 ```
 
 ### 远程模式（`--server` / `--connect`）
@@ -167,12 +184,23 @@ export RPI_SERVER_TOKEN=<token>
 rpi --connect 127.0.0.1:9899
 ```
 
-服务端默认开启 token 认证（`--no-token` 可关闭）。完整协议、可用命令与限制见
-[`remote-mode.md`](remote-mode.md)。
+服务端默认开启 token 认证（`--no-token` 可关闭）。客户端支持 `/state`、`/model`、
+`/thinking`、`/tools`、`/abort` 等命令；`/tree`、`/fork`、`/switch`、`/export`、
+`/name`、`/reload` 依赖本地 harness，在远程模式下不可用。完整协议、可用命令与
+限制见 [`remote-mode.md`](remote-mode.md)。
 
 ## 4. 内置工具
 
-默认工具包含 Pi 的 `read`、`bash`、`edit`、`write`，以及 rpi 自带的只读 `docs` 文档查询工具。`docs` 可以查询使用手册、扩展开发、Pi package、架构和兼容性说明；`grep`、`find`、`ls`、`powershell` 仍保留为库实现，但不由 CLI 默认注册。
+默认工具包含 Pi 的 `read`、`bash`、`edit`、`write`，以及 rpi 自带的只读 `docs` 文档查询工具。Windows 上还会默认注册 `powershell`。`docs` 可以查询使用手册、扩展开发、Rust 调试、Pi package、架构和兼容性说明；`grep`、`find`、`ls` 仍保留为库实现，但不由 CLI 默认注册。
+
+可以通过 `.rpi/settings.json` 的 `defaultTools` 字段（或简写 `default_tools`）在未指定
+`--tools` 时限定启动工具集：
+
+```json
+{
+  "defaultTools": ["read", "bash", "edit", "write", "docs"]
+}
+```
 
 需要限制工具范围时，显式列出 Pi 的四个工具：
 
@@ -330,9 +358,10 @@ rpi install my-extension --path ../my-rpi-extension --force
 cd ../my-rpi-extension
 rpi dev
 # 多扩展 workspace：rpi dev --package my-extension
+# 只调试当前扩展：rpi dev-local（隔离模式，不加载全局扩展）
 ```
 
-`rpi dev` 会自动识别 Cargo `cdylib`、首次编译并从 `.rpi/extensions/.dev` 加载版本化产物。源码变化会触发重新编译和热重载；手工执行 `/reload` 也会先重新编译。编译失败时继续保留当前已经加载的版本。完整模板和边界规则见在线扩展作者指南：<https://rpi.laofu.online/extension-authoring.md>。
+`rpi dev` 会自动识别 Cargo `cdylib`、首次编译并从 `.rpi/extensions/.dev` 加载版本化产物。源码变化会触发重新编译和热重载；手工执行 `/reload` 也会先重新编译。编译失败时继续保留当前已经加载的版本。完整模板和边界规则见在线扩展作者指南：<https://rpi.laofu.online/extension-authoring.md>，调试技巧见 `docs` 的 `debugging` 主题。
 
 安装后的动态库位于 `~/.rpi/agent/extensions`（或 `RPI_CODING_AGENT_DIR` 指定的目录），下次启动 rpi 时加载。插件通过稳定 ABI 注册工具、Provider、事件处理器和资源处理器；不要直接依赖 `rpi-cli` 的私有模块。
 
@@ -374,9 +403,27 @@ while let Some(event) = events.recv().await {
 
 确认 Rust 插件是 `cdylib` 并与当前平台匹配；临时使用 `--extensions-dir` 指向生成目录。JS/TS 扩展失败时保留完整错误堆栈，检查扩展是否假设 Pi 独有的 UI 能力或未调用宿主要求的初始化流程。
 
+### 扩展事件处理器没触发或启动被中止
+
+```bash
+export RPI_EVENT_LOG=1
+rpi            # 记录所有扩展事件处理器调用
+rpi events tail   # 跟踪日志；看 result 是 Continue 还是 Error/Abort/Panic/Timeout
+```
+
+日志默认在 `~/.rpi/logs/events.jsonl`（可用 `RPI_EVENT_LOG_PATH` 覆盖）。如果
+`BeforeTuiStart` 阶段有扩展返回 veto（`EVENT_HANDLER_ABORT`），CLI 以退出码 `3`
+中止启动并打印原因。
+
 ### 资源没有出现在欢迎页
 
 确认文件位于 `.rpi`（或兼容的 `.pi`）、全局 `~/.rpi/agent` 或已启用 package 的资源目录。排查 package 资源时，使用 `rpi --enable-pi-packages --debug-system-prompt` 查看最终系统提示词、skills 和资源计数；同名资源优先检查 `.rpi` 是否覆盖了 `.pi`。
+
+### 远程模式连不上
+
+确认服务端已用 `rpi --server --port <port>` 启动且 token 正确（或通过
+`RPI_SERVER_TOKEN` 提供）。客户端是纯显示端，不加载任何本地 provider/工具/扩展；
+会话文件在服务端。
 
 ## 10. 开发、测试和发布
 
@@ -403,7 +450,8 @@ rpi-plugin-sdk → rpi-extensions → rpi-tui → rpi-cli
 - 源码仓库：<https://github.com/bigfish1913/pi-rust>
 - Rust API：<https://docs.rs/rpi-agent>、<https://docs.rs/rpi-plugin-sdk>
 - Pi 参考实现：<https://github.com/earendil-works/pi>
-- 远程模式（`--server` / `--connect` / `--token`）：<docs/remote-mode.md>
 - Package 与扩展作者指南：<https://rpi.laofu.online/extension-authoring.md>
+- 远程模式：<docs/remote-mode.md>
+- Rust 扩展与 agent 调试：`rpi` 内 `docs` 工具的 `debugging` 主题
 
 当在线文档和已安装版本不一致时，以对应版本的 Git tag 和仓库内文档为准。
