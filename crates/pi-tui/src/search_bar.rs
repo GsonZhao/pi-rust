@@ -1,7 +1,7 @@
 //! Search bar component for transcript search.
 
 use std::any::Any;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 use crate::component::Component;
 use crate::theme::theme;

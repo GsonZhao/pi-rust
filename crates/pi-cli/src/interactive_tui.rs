@@ -543,6 +543,10 @@ struct CommandContext {
     /// the main loop via `TuiMessage::ReloadExtensions`, which awaits the shared
     /// `reload_extension_resources` routine on the async runtime).
     reload_context: Arc<crate::session::ReloadContext>,
+    /// The product-layer session (`AgentSession`). Commands that need durable
+    /// reads, export, or usage stats go through this instead of reaching into
+    /// the harness directly, so the product surface is one object.
+    session: Arc<crate::agent_session::AgentSession>,
 }
 
 /// One slash command.
@@ -2442,10 +2446,21 @@ impl SlashCommand for ExportCommand {
         "/export"
     }
     fn description(&self) -> &'static str {
-        "Export session to a markdown file"
+        "Export session (supports: md, html, jsonl)"
     }
-    fn execute(&self, ctx: &CommandContext, _args: &str) {
-        let _ = ctx.tx.send(TuiMessage::ExportSession);
+    fn execute(&self, ctx: &CommandContext, args: &str) {
+        let format = args.trim().to_lowercase();
+        if format.is_empty() || format == "md" || format == "markdown" {
+            let _ = ctx.tx.send(TuiMessage::ExportSession);
+        } else if format == "html" {
+            let _ = ctx.tx.send(TuiMessage::ExportSessionWithFormat(crate::export::ExportFormat::Html));
+        } else if format == "jsonl" {
+            let _ = ctx.tx.send(TuiMessage::ExportSessionWithFormat(crate::export::ExportFormat::Jsonl));
+        } else {
+            // Invalid format, show error
+            add_error_message(&ctx.chat, &format!("Unknown export format: {}. Supported: md, html, jsonl", args.trim()));
+            ctx.tui.request_render(false);
+        }
     }
 }
 
@@ -2728,6 +2743,25 @@ impl SlashCommand for ContextCommand {
     }
     fn execute(&self, ctx: &CommandContext, _args: &str) {
         show_context_panel(&ctx.chat, &ctx.resources);
+        // Live session stats are async, so ask the main loop to append them.
+        let _ = ctx.tx.send(TuiMessage::ShowUsage);
+        ctx.tui.request_render(false);
+    }
+}
+
+/// `/usage` — token/cost/cache totals read through the product-layer
+/// `AgentSession`. This is the same numbers the footer shows, but expanded and
+/// with the cache-hit breakdown that the one-line footer cannot fit.
+struct UsageCommand;
+impl SlashCommand for UsageCommand {
+    fn name(&self) -> &'static str {
+        "/usage"
+    }
+    fn description(&self) -> &'static str {
+        "Show token, cost, and cache totals for this session"
+    }
+    fn execute(&self, ctx: &CommandContext, _args: &str) {
+        let _ = ctx.tx.send(TuiMessage::ShowUsage);
         ctx.tui.request_render(false);
     }
 }
@@ -2783,6 +2817,7 @@ fn build_builtin_registry() -> CommandRegistry {
     r.register(Arc::new(ArminCommand));
     r.register(Arc::new(EarendilCommand));
     r.register(Arc::new(ContextCommand));
+    r.register(Arc::new(UsageCommand));
     // Recognized but inert in v1 (one struct backs them all). The TS builtins
     // out of v1 scope; each carries a description so autocomplete surfaces its
     // existence even though running it reports "not supported".
@@ -2873,6 +2908,10 @@ enum TuiMessage {
     SwitchSession(String),
     /// Export the current session to a markdown file (from `/export`).
     ExportSession,
+    /// Export session with specific format
+    ExportSessionWithFormat(crate::export::ExportFormat),
+    /// Show live usage/context stats (from `/usage` and `/context`).
+    ShowUsage,
     /// Fork the current session into a new one and switch to it (from `/fork`).
     ForkSession,
     /// Rename the current session (from `/name <name>`).
@@ -3588,68 +3627,10 @@ async fn share_session(harness: &AgentHarness, chat: &Arc<Container>) {
     }
 }
 
-/// Export the current session to a markdown transcript file. Writes
-/// `<cwd>/<session-name-or-id>.md` with the user/assistant/tool-call history
-/// (mirrors the TS `/export` intent locally — no remote sharing in v1).
-/// Best-effort: failures surface as a chat note.
-/// Export the current session to a markdown transcript file. Writes
-/// `<cwd>/<session-name-or-id>.md` with the user/assistant/tool-call history
-/// (mirrors the TS `/export` intent locally — no remote sharing in v1).
-/// Best-effort: failures surface as a chat note.
-async fn export_session(harness: &AgentHarness, chat: &Arc<Container>, cwd: &std::path::Path) {
-    let tree = harness.session().view("main");
-    let entries = match tree
-        .find_entries(&EntryQuery {
-            entry_type: None,
-            custom_type: None,
-            // Keep exported entries in the same chronological order shown in
-            // the transcript; the storage default is newest-first.
-            order: Some(EntryOrder::OldestFirst),
-            limit: None,
-            cursor: None,
-        })
-        .await
-    {
-        Ok(e) => e,
-        Err(e) => {
-            add_error_message(chat, &format!("Could not read session: {e}"));
-            return;
-        }
-    };
-    let name = tree.get_name().await.ok().flatten().unwrap_or_default();
-    let id = tree
-        .get_leaf_id()
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "session".to_string());
-    let mut md = String::from("# Session\n\n");
-    for e in entries {
-        let Entry::Message(me) = e else { continue };
-        match &me.message {
-            AgentMessage::User(u) => {
-                md.push_str(&format!("## User\n\n{}\n\n", user_message_text(u)));
-            }
-            AgentMessage::Assistant(a) => {
-                let text = assistant_text(a);
-                if !text.is_empty() {
-                    md.push_str(&format!("## Assistant\n\n{}\n\n", text));
-                }
-            }
-            _ => {}
-        }
-    }
-    let file_name = if name.is_empty() {
-        format!("{id}.md")
-    } else {
-        format!("{name}.md")
-    };
-    let path = cwd.join(&file_name);
-    match std::fs::write(&path, md) {
-        Ok(_) => add_note_message(chat, &format!("Exported session to {}", path.display())),
-        Err(e) => add_error_message(chat, &format!("Could not write export: {e}")),
-    }
-}
+// Session export is driven through the product-layer `AgentSession`
+// (`crate::agent_session`), which owns format selection + default filenames —
+// the TUI loop calls `AgentSession::export*` directly, so there is no separate
+// helper here.
 
 /// Fork the current session into a new JSONL session and switch to it (TS
 /// `/fork` — a copy of the transcript in a fresh file; the fork is a new
@@ -4843,11 +4824,24 @@ pub async fn interactive_tui(
         resolve_tui_startup_settings(&saved_settings, &project_settings, project_trusted);
     let editor_padding_x = tui_settings.editor_padding_x;
     let autocomplete_max_visible = tui_settings.autocomplete_max_visible;
-    let hide_thinking = tui_settings.hide_thinking;
+    let mut hide_thinking = tui_settings.hide_thinking;
     let show_terminal_progress = tui_settings.show_terminal_progress;
     let quiet_startup = tui_settings.quiet_startup;
     let update_checks_enabled =
         !args.offline && std::env::var_os("RPI_DISABLE_UPDATE_CHECK").is_none();
+
+    // Session display preferences (durable, latest-wins) override the
+    // settings-file defaults. These are per-session facts stored as custom
+    // entries (see `rpi_harness::session::values`), so resuming a session with
+    // `-c`/`-r` restores the thinking/tool-output display the user last chose
+    // there — independent of global settings. Absent keys leave the settings
+    // value untouched.
+    let session_values = rpi_harness::session::SessionValues::load(harness.session())
+        .await
+        .unwrap_or_default();
+    if let Some(persisted) = session_values.get_as::<bool>("display.hide_thinking") {
+        hide_thinking = persisted;
+    }
 
     // Resolve the active model once, up front. The full id feeds the TuiState
     // tracking field + the selectors/key loop (which run on a blocking thread
@@ -5112,13 +5106,16 @@ pub async fn interactive_tui(
     }
     let autocomplete_container = Arc::new(Container::new());
 
+    let tool_outputs_expanded = session_values
+        .get_as::<bool>("display.tool_outputs_expanded")
+        .unwrap_or(false);
     let state = Arc::new(TuiState {
         current_assistant: std::sync::Mutex::new(None),
         tool_components: std::sync::Mutex::new(HashMap::new()),
         bash_components: std::sync::Mutex::new(HashMap::new()),
         themes_enabled: !no_themes,
         hide_thinking: std::sync::Mutex::new(hide_thinking),
-        tool_outputs_expanded: std::sync::Mutex::new(false),
+        tool_outputs_expanded: std::sync::Mutex::new(tool_outputs_expanded),
         show_terminal_progress,
         status: std::sync::Mutex::new(RunStatus::Idle),
         js_preparation_cancel: std::sync::Mutex::new(None),
@@ -5208,6 +5205,22 @@ pub async fn interactive_tui(
     // One `CommandContext` is built and cloned for both the submit handler and
     // the key loop (Ctrl+L routes `/model` through the same registry); all
     // fields are `Arc`/cheap, so the clones are free.
+    //
+    // The product-layer `AgentSession` wraps a clone of the harness (the
+    // harness handle is cheap and shares the session/bus), so `/usage`,
+    // `/export`, and future product commands go through one surface.
+    let scoped_models = args
+        .model
+        .as_deref()
+        .map(crate::agent_session::ScopedModel::parse)
+        .into_iter()
+        .collect();
+    let agent_session = Arc::new(crate::agent_session::AgentSession::new(
+        harness.clone(),
+        model_catalog.clone(),
+        scoped_models,
+        cwd.clone(),
+    ));
     let ctx = CommandContext {
         chat: chat_container.clone(),
         tui: tui.clone(),
@@ -5222,6 +5235,7 @@ pub async fn interactive_tui(
         package_resources: package_resources.clone(),
         resources: resources_arc.clone(),
         reload_context: Arc::new(reload_context.clone()),
+        session: agent_session.clone(),
     };
 
     if let Some(js) = &reload_context.js_extension_session {
@@ -5863,7 +5877,17 @@ pub async fn interactive_tui(
                 &key,
                 rpi_tui::keybindings::keys::TOOLS_EXPAND,
             ) {
-                state_for_key.toggle_tool_outputs();
+                let expanded = state_for_key.toggle_tool_outputs();
+                // Persist per-session so a later `-c`/`-r` restores it.
+                let session = ctx_for_key.session.clone();
+                tokio::spawn(async move {
+                    let _ = session
+                        .set_value(
+                            "display.tool_outputs_expanded",
+                            serde_json::json!(expanded),
+                        )
+                        .await;
+                });
                 tui_for_key.request_render(false);
                 continue;
             }
@@ -5874,7 +5898,14 @@ pub async fn interactive_tui(
                 &key,
                 rpi_tui::keybindings::keys::THINKING_TOGGLE,
             ) {
-                state_for_key.toggle_thinking();
+                let hide = state_for_key.toggle_thinking();
+                // Persist per-session so a later `-c`/`-r` restores it.
+                let session = ctx_for_key.session.clone();
+                tokio::spawn(async move {
+                    let _ = session
+                        .set_value("display.hide_thinking", serde_json::json!(hide))
+                        .await;
+                });
                 tui_for_key.request_render(false);
                 continue;
             }
@@ -6335,7 +6366,86 @@ pub async fn interactive_tui(
                 tui.request_render(false);
             }
             Some(TuiMessage::ExportSession) => {
-                export_session(&harness, &chat_container, &cwd).await;
+                let file_name = agent_session
+                    .default_export_file_name(crate::export::ExportFormat::Markdown)
+                    .await;
+                let path = cwd.join(&file_name);
+                match agent_session.export_to_markdown(&path).await {
+                    Ok(_) => add_note_message(
+                        &chat_container,
+                        &format!("Exported session to {}", path.display()),
+                    ),
+                    Err(e) => add_error_message(
+                        &chat_container,
+                        &format!("Could not write export: {e}"),
+                    ),
+                }
+                tui.request_render(false);
+            }
+            Some(TuiMessage::ExportSessionWithFormat(format)) => {
+                let file_name = agent_session.default_export_file_name(format.clone()).await;
+                let path = cwd.join(&file_name);
+                match agent_session.export(format, &path).await {
+                    Ok(_) => add_note_message(
+                        &chat_container,
+                        &format!("Exported session to {}", path.display()),
+                    ),
+                    Err(e) => add_error_message(
+                        &chat_container,
+                        &format!("Could not write export: {e}"),
+                    ),
+                }
+                tui.request_render(false);
+            }
+            Some(TuiMessage::ShowUsage) => {
+                let stats = agent_session.usage_stats().await.ok();
+                let total = agent_session.total_usage().await.ok();
+                let snapshot = agent_session.snapshot().await.ok();
+                match stats {
+                    Some(stats) => {
+                        let mut lines = vec![
+                            "## Usage".to_string(),
+                            String::new(),
+                            format!("- messages: {}", stats.message_count),
+                            format!("- total tokens: {}", stats.total_tokens),
+                            format!("- cached tokens: {}", stats.cached_tokens),
+                            format!("- uncached tokens: {}", stats.uncached_tokens),
+                            format!("- cost: ${:.4}", stats.cost_total),
+                        ];
+                        match stats.cache_hit_ratio() {
+                            Some(ratio) => lines
+                                .push(format!("- cache hit ratio: {:.1}%", ratio * 100.0)),
+                            None => lines.push("- cache hit ratio: n/a (no input yet)".to_string()),
+                        }
+                        if let Some(total) = total {
+                            lines.push(String::new());
+                            lines.push(format!(
+                                "- last cumulative input/output: {} / {}",
+                                total.input, total.output
+                            ));
+                        }
+                        if let Some(snapshot) = snapshot {
+                            lines.push(String::new());
+                            lines.push(format!("- lane: `{}`", snapshot.lane));
+                            lines.push(format!(
+                                "- leaf: `{}`",
+                                snapshot.leaf_id.clone().unwrap_or_else(|| "(empty)".into())
+                            ));
+                            if let Some(active) = &snapshot.active {
+                                lines.push(format!(
+                                    "- active operation: {} (`{}`)",
+                                    active.kind.as_str(),
+                                    active.run_id
+                                ));
+                            }
+                        }
+                        add_note_message(&chat_container, &lines.join("\n"));
+                    }
+                    None => add_error_message(
+                        &chat_container,
+                        "Could not read session usage stats.",
+                    ),
+                }
                 tui.request_render(false);
             }
             Some(TuiMessage::ForkSession) => {
@@ -9659,6 +9769,7 @@ mod tests {
             "/tools",
             "/images",
             "/thinking",
+            "/usage",
             "/armin",
             "/earendil",
         ] {
@@ -9721,6 +9832,10 @@ mod tests {
             extension_session: Arc::new(std::sync::Mutex::new(
                 rpi_extensions::ExtensionSession::none(),
             )),
+            search: Arc::new(AltScreenSearch::new()),
+            search_bar: Arc::new(SearchBar::new()),
+            selection_start: std::sync::Mutex::new(None),
+            selection_end: std::sync::Mutex::new(None),
         });
 
         // The drain handler takes `Arc<TuiAltScreen>`, which needs a real
@@ -10078,6 +10193,10 @@ mod tests {
             extension_session: Arc::new(std::sync::Mutex::new(
                 rpi_extensions::ExtensionSession::none(),
             )),
+            search: Arc::new(AltScreenSearch::new()),
+            search_bar: Arc::new(SearchBar::new()),
+            selection_start: std::sync::Mutex::new(None),
+            selection_end: std::sync::Mutex::new(None),
         });
         {
             let mut combined = CombinedAutocompleteProvider::new();
@@ -10146,6 +10265,10 @@ mod tests {
             extension_session: Arc::new(std::sync::Mutex::new(
                 rpi_extensions::ExtensionSession::none(),
             )),
+            search: Arc::new(AltScreenSearch::new()),
+            search_bar: Arc::new(SearchBar::new()),
+            selection_start: std::sync::Mutex::new(None),
+            selection_end: std::sync::Mutex::new(None),
         });
         let editor_container = Arc::new(Container::new());
         let editor = Arc::new(Editor::simple());
@@ -10217,6 +10340,10 @@ mod tests {
             extension_session: Arc::new(std::sync::Mutex::new(
                 rpi_extensions::ExtensionSession::none(),
             )),
+            search: Arc::new(AltScreenSearch::new()),
+            search_bar: Arc::new(SearchBar::new()),
+            selection_start: std::sync::Mutex::new(None),
+            selection_end: std::sync::Mutex::new(None),
         });
         let editor = Arc::new(Editor::simple());
 
@@ -10291,6 +10418,10 @@ mod tests {
             extension_session: Arc::new(std::sync::Mutex::new(
                 rpi_extensions::ExtensionSession::none(),
             )),
+            search: Arc::new(AltScreenSearch::new()),
+            search_bar: Arc::new(SearchBar::new()),
+            selection_start: std::sync::Mutex::new(None),
+            selection_end: std::sync::Mutex::new(None),
         });
         {
             let mut combined = CombinedAutocompleteProvider::new();

@@ -6,7 +6,7 @@
 
 ### 直接安装 CLI
 
-需要 Rust/Cargo 和 Node.js（只有使用 Pi JavaScript/TypeScript package 时才必须 Node.js）：
+需要 Rust/Cargo：
 
 ```bash
 cargo install rpi-cli
@@ -138,7 +138,6 @@ ANTHROPIC_AUTH_TOKEN=token
 --no-prompt-templates   跳过 prompt-template 发现
 --no-context-files      跳过 AGENTS.md/CLAUDE.md 发现
 --no-extensions         禁用扩展加载
---enable-pi-packages    启用配置中的 Pi JS/TS package（会启动 Node）
 --extensions-dir <dir>  额外扫描 Rust 扩展目录
 --list-models [search]  列出可用模型（可带模糊搜索）
 --offline               禁用启动时的网络检查
@@ -159,14 +158,9 @@ ANTHROPIC_AUTH_TOKEN=token
 ```text
 rpi auth login|check|logout
 rpi events path|tail    检查扩展事件日志（需 RPI_EVENT_LOG=1）
-rpi package list|add|remove|update
 rpi install <crate>
-rpi install-pi <spec>
 rpi uninstall <crate>
-rpi uninstall-pi <spec>
 rpi update                 # 更新 rpi CLI 自身
-rpi package update         # 只更新 Rust 原生扩展
-rpi pi-package update      # 只更新 Pi npm/Git package
 rpi dev [options]          # 开发 Rust 扩展：编译、watch、热重载
 rpi dev-local [options]    # 只调试当前 Rust 扩展（隔离模式）
 ```
@@ -191,7 +185,7 @@ rpi --connect 127.0.0.1:9899
 
 ## 4. 内置工具
 
-默认工具包含 Pi 的 `read`、`bash`、`edit`、`write`，以及 rpi 自带的只读 `docs` 文档查询工具。Windows 上还会默认注册 `powershell`。`docs` 可以查询使用手册、扩展开发、Rust 调试、Pi package、架构和兼容性说明；`grep`、`find`、`ls` 仍保留为库实现，但不由 CLI 默认注册。
+默认工具包含 Pi 的 `read`、`bash`、`edit`、`write`，以及 rpi 自带的只读 `docs` 文档查询工具。Windows 上还会默认注册 `powershell`。`docs` 可以查询使用手册、扩展开发、Agent 项目结构、Rust 调试和架构说明；`grep`、`find`、`ls` 仍保留为库实现，但不由 CLI 默认注册。
 
 可以通过 `.rpi/settings.json` 的 `defaultTools` 字段（或简写 `default_tools`）在未指定
 `--tools` 时限定启动工具集：
@@ -249,87 +243,7 @@ RPI_CODING_AGENT_DIR=/work/rpi-agent rpi
 
 会话默认保存到 agent 配置目录下的 sessions；`--no-session` 可使用临时会话。
 
-## 6. Pi package
-
-> **Beta 功能提示：** Pi package 的 Node/JavaScript/TypeScript 扩展加载，以及
-> TUI 中的原生技能调用渲染，目前属于实验性兼容功能。建议仅用于本地评估和
-> 反馈收集，暂不建议用于生产环境；接口和行为可能在稳定前调整。
-
-### 安装和管理
-
-支持 npm、Git 和本地 package：
-
-```bash
-rpi install-pi npm:@narumitw/pi-btw
-rpi install-pi npm:@scope/package@1.0.0
-rpi install-pi npm:my-alias@npm:@scope/package@^1
-rpi install-pi git:github.com/user/repo@v1
-rpi install-pi ./my-pi-package
-rpi install-pi --global npm:@scope/package
-```
-
-Pi package 不一定会贡献模型工具：有些包只注册斜杠命令、状态栏或消息渲染器。
-例如 `@narumitw/pi-usage` 注册的是 `/usage` 和 `/fast`，应在交互界面的命令补全中查找，
-不会出现在欢迎页的 tools 列表里。rpi 只有在启动时带 `--enable-pi-packages` 才会按
-settings 中的 packages 配置进行注册发现并启用 Node runtime；未带该参数时不会加载 Pi package。
-`--no-extensions` 仍是最终关闭开关。
-
-卸载时，Rust 扩展使用：
-
-```bash
-rpi uninstall <crate>
-```
-
-Pi package 使用：
-
-```bash
-rpi uninstall-pi npm:@scope/package
-rpi uninstall-pi --global npm:@scope/package
-# 等价写法
-rpi uninstall pi npm:@scope/package
-```
-
-卸载 Pi package 会同时移除启用配置。只有位于 `.rpi/packages`、`.pi/packages`
-或全局 agent package store 的安装目录才会被删除；项目源码目录只会被禁用，不会删除。
-
-本地 package 也可以只启用、不下载：
-
-```bash
-rpi package add ../my-pi-package
-rpi package list
-rpi package remove ../my-pi-package
-rpi package update         # 只更新 Rust 原生扩展
-rpi pi-package update      # 只更新 Pi npm/Git package
-```
-
-npm 和 Git 安装使用与原生 Pi 一致的托管布局：项目范围分别写入 `.pi/npm`、`.pi/git`，`--global` 则写入当前 rpi agent 配置目录下的 `npm`、`git`。本地目录只记录到 settings，不会复制，也不会在卸载时删除。旧版 `.rpi/packages`、`.pi/packages` 以及 `~/.pi/agent` 下的原生 Pi 安装仍可发现和迁移。
-
-`npmCommand` 是 argv 数组，不是 shell 字符串；依次选择项目 `.rpi/settings.json`、`.pi/settings.json`、全局 `settings.json`，都未配置时使用 npm。项目资源默认直接加载，不会弹出确认；需要临时禁用时使用 `--no-approve`，或在 TUI 中执行 `/trust no`。rpi 会按识别到的 npm、pnpm 或 bun 生成与原生 Pi 一致的 install/uninstall 参数。无法安全验证的路径、来源或 manifest 会直接拒绝。Node.js 是运行 JS/TS extension 的必要条件。普通 rpi 命令不会加载这些 package，需显式传 `--enable-pi-packages`。
-
-### 静态资源
-
-package 可以提供以下资源：
-
-```text
-skills/
-prompts/
-themes/
-SYSTEM.md
-APPEND_SYSTEM.md
-extensions/
-```
-
-`package.json` 中可使用 `rpi` 对象声明资源路径；为兼容 Pi，也支持 `pi` 对象，二者同时存在时 `rpi` 优先。资源会注入系统提示词、技能列表、prompt template 和主题选择器。
-
-### JS/TS extension
-
-Node host 支持 Pi 风格的 `registerTool`、`registerCommand` 和资源发现。扩展可以使用命令上下文中的 `mode`、`hasUI`、`capabilities`、`model`、`modelRegistry`、`ui.notify`、编辑器文本和 session metadata。
-
-`modelRegistry.getProvider(id)` 在当前 Rust provider 可用时提供 Pi 兼容的 `streamSimple()`/`complete()`；`ctx.ui.custom` 提供终端输入、resize、overlay 和生命周期事件的组件代理。扩展应先检查 `ctx.capabilities`，不要假定每个宿主都启用了所有能力。
-
-扩展和 rpi 运行在同一用户权限下，能够访问当前用户允许的文件和网络。安装不受信任的 package 前，先阅读其源码和 manifest。
-
-## 7. Rust 插件
+## 6. Rust 插件
 
 Rust 原生插件是 `cdylib`，只依赖 `rpi-plugin-sdk`，由 `rpi-extensions` 动态加载：
 
@@ -365,7 +279,7 @@ rpi dev
 
 安装后的动态库位于 `~/.rpi/agent/extensions`（或 `RPI_CODING_AGENT_DIR` 指定的目录），下次启动 rpi 时加载。插件通过稳定 ABI 注册工具、Provider、事件处理器和资源处理器；不要直接依赖 `rpi-cli` 的私有模块。
 
-## 8. SDK 集成
+## 7. SDK 集成
 
 只需要嵌入 Agent 时，依赖 `rpi-agent` 和 `rpi-ai`；需要内置工具时再加入 `rpi-tools`；需要会话、压缩、skills 和上下文文件时加入 `rpi-harness`。
 
@@ -389,19 +303,15 @@ while let Some(event) = events.recv().await {
 
 自定义工具实现 `rpi-agent::AgentTool`；Provider 实现 `rpi-ai::Provider`。使用 `faux provider` 和 `InMemoryExecutionEnv` 可以在没有网络、API key 或真实文件系统的情况下测试 Agent loop。
 
-## 9. 故障排查
+## 8. 故障排查
 
 ### 找不到模型或接口报错
 
 运行 `rpi auth check`，确认 provider、`models.json`、环境变量和 `baseUrl`。使用 `--provider` 和完整的 `provider/model` 避免同名模型歧义。接口错误会保留 provider 返回的诊断文本；先检查 endpoint、认证头和模型 ID。
 
-### `/command` 或 package 命令不存在
-
-运行 `rpi package list`，确认 package 已启用且安装目录存在。重新安装时使用 `rpi install-pi --force ...`。Node extension 需要 Node.js；可以先执行 `node --version`。
-
 ### 扩展加载失败
 
-确认 Rust 插件是 `cdylib` 并与当前平台匹配；临时使用 `--extensions-dir` 指向生成目录。JS/TS 扩展失败时保留完整错误堆栈，检查扩展是否假设 Pi 独有的 UI 能力或未调用宿主要求的初始化流程。
+确认 Rust 插件是 `cdylib` 并与当前平台匹配；临时使用 `--extensions-dir` 指向生成目录。加载失败时保留宿主输出的完整错误信息，检查扩展是否声明了宿主未提供的能力。
 
 ### 扩展事件处理器没触发或启动被中止
 
@@ -417,7 +327,7 @@ rpi events tail   # 跟踪日志；看 result 是 Continue 还是 Error/Abort/Pa
 
 ### 资源没有出现在欢迎页
 
-确认文件位于 `.rpi`（或兼容的 `.pi`）、全局 `~/.rpi/agent` 或已启用 package 的资源目录。排查 package 资源时，使用 `rpi --enable-pi-packages --debug-system-prompt` 查看最终系统提示词、skills 和资源计数；同名资源优先检查 `.rpi` 是否覆盖了 `.pi`。
+确认文件位于 `.rpi`（或兼容的 `.pi`）或全局 `~/.rpi/agent`。使用 `rpi --debug-system-prompt` 查看最终系统提示词、skills 和资源计数；同名资源优先检查 `.rpi` 是否覆盖了 `.pi`。
 
 ### 远程模式连不上
 
@@ -425,7 +335,7 @@ rpi events tail   # 跟踪日志；看 result 是 Continue 还是 Error/Abort/Pa
 `RPI_SERVER_TOKEN` 提供）。客户端是纯显示端，不加载任何本地 provider/工具/扩展；
 会话文件在服务端。
 
-## 10. 开发、测试和发布
+## 9. 开发、测试和发布
 
 运行格式化、检查和测试：
 
@@ -444,7 +354,7 @@ rpi-plugin-sdk → rpi-extensions → rpi-tui → rpi-cli
 
 发布前更新版本号和 `docs/release-vX.Y.Z.md`，确认 README、官网 `website/data/docs.json` 和本手册中的命令一致。官网是静态站点，文档文件提交到仓库后仍需按项目部署流程重新部署。
 
-## 11. 文档查询入口
+## 10. 文档查询入口
 
 - 在线文档：<https://rpi.laofu.online/docs.html>
 - 源码仓库：<https://github.com/bigfish1913/pi-rust>

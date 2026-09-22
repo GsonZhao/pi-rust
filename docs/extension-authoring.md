@@ -2,8 +2,8 @@
 
 本文是 rpi 创建 Rust `cdylib` 扩展的模型可读规范。扩展是 Rust 原生动态库，
 通过稳定 C ABI（`rpi-plugin-sdk`）注册工具、事件处理器、资源发现、Provider
-与渲染器，宿主（`rpi` CLI）负责加载与生命周期。Pi JS/TS package 是另一套
-兼容能力，本指南不覆盖；需要时查询在线文档的 Pi 兼容章节。
+与渲染器，宿主（`rpi` CLI）负责加载与生命周期。创建完整 Agent 项目的默认结构见
+`docs` 的 `agent` 主题；本指南聚焦扩展本身的 ABI 与生命周期。
 
 ## 1. 扩展模型总览
 

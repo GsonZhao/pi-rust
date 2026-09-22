@@ -17,6 +17,7 @@ pub mod session;
 pub mod sqlite;
 pub mod state;
 pub mod types;
+pub mod values;
 
 pub use context::{
     build_context_entries, build_session_context, default_context_entry_transform,
@@ -32,3 +33,4 @@ pub use reducer::{
 pub use session::{DefaultIdGenerator, Session};
 pub use sqlite::{SqliteSessionRepo, SqliteSessionStorage};
 pub use state::{ApplyOutcome, SessionState};
+pub use values::{SessionValueWriter, SessionValues, VALUE_CUSTOM_TYPE};

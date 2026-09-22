@@ -71,14 +71,18 @@ the CLI, keeping the layering and behavior faithful while using idiomatic Rust
 ## How you build an agent
 
 ```rust
-use rpi_agent::{Agent, AgentTool, AgentEvent};
-use rpi_ai::{providers::faux::faux_provider, Model};
+use rpi_agent::{AgentBuilder, AgentEvent};
+use rpi_ai::providers::faux::{FauxProvider, FauxScript};
 
-let model = faux_provider().model("echo");
-let mut agent = Agent::builder(model)
+let provider = std::sync::Arc::new(FauxProvider::new(FauxScript::new().with_text("Hello!")));
+let model = provider.default_model().clone();
+let agent = AgentBuilder::new()
+    .model(model)
     .system_prompt("You are a helpful assistant.")
-    .tool(MyTool)
-    .build();
+    .tools(vec![/* MyTool */])
+    .stream_fn(make_stream_fn(provider))
+    .build()
+    .unwrap();
 
 let mut events = agent.subscribe();
 tokio::spawn(async move {
@@ -90,7 +94,9 @@ tokio::spawn(async move {
 agent.prompt("Hello!").await.unwrap();
 ```
 
-See [docs/architecture.md](docs/architecture.md) for the full design.
+See [docs/architecture.md](docs/architecture.md) for the full design and
+[docs/agent-project.md](docs/agent-project.md) for the recommended project
+structure when you build your own agent.
 
 ## Build a plugin
 
@@ -157,81 +163,7 @@ rpi dev --no-watch
 ```
 
 See [`docs/extension-authoring.md`](docs/extension-authoring.md) for complete
-Rust extension and Pi JS/TS package templates, safety rules, testing, and
-release checklists.
-
-### Load static Pi packages
-
-> **Beta notice:** JavaScript/TypeScript package loading through the Node host
-> and skill-invocation rendering in the TUI are experimental compatibility
-> features. They are suitable for local evaluation and feedback, but are not
-> recommended for production workloads and may change before stabilization.
-
-rpi can load Pi packages, including their static resources and executable
-JavaScript/TypeScript extensions. Install a package with:
-
-```bash
-rpi install-pi npm:@scope/my-package@1.0.0
-rpi install-pi npm:my-alias@npm:@scope/my-package@^1
-rpi install-pi git:github.com/user/my-package@v1
-rpi install-pi ./my-pi-package
-```
-
-卸载已安装的扩展或 Pi package：
-
-```bash
-rpi uninstall rpi-extension-example
-rpi uninstall-pi npm:@scope/my-package
-# 等价写法：rpi uninstall pi npm:@scope/my-package
-```
-
-npm and Git installs use Pi-compatible managed stores: project packages live
-under `.pi/npm` and `.pi/git`, while `--global` uses the configured rpi agent
-directory's `npm` and `git` stores. Local directories are enabled in place and
-are never copied or deleted. Existing legacy `.rpi/packages`, `.pi/packages`,
-and native `~/.pi/agent` installs remain discoverable. Package-manager argv is
-selected from project `.rpi/settings.json`, project `.pi/settings.json`, then
-global `settings.json`; the default is npm. rpi treats the setting as structured
-argv rather than a shell command string, applies hardened encoding to Windows
-`.cmd` shims, and uses the native Pi flags for npm, pnpm, or bun.
-
-Package discovery and loading are disabled by default; start rpi with
-`--enable-pi-packages` to opt in. That startup performs a short one-shot Node.js
-discovery pass. In the interactive TUI, a long-lived Node.js host starts
-immediately before the first submitted prompt (or earlier when a package
-command or tool is used), so an idle TUI does not keep Node resident.
-`registerTool`, `registerCommand`, and `resources_discover` are supported.
-TypeScript uses Node's native type stripping when available, or a package-local
-`jiti` dependency. Pi peer/runtime packages are installed and aliased from
-nested `node_modules` when npm does not hoist them. Node.js is required, and
-extension code has the same filesystem/network permissions as the current user.
-Command handlers receive the core Pi context (`mode`, `hasUI`, `capabilities`,
-`model`, `modelRegistry`, `ui.notify`, editor text access, and session metadata).
-When the active Rust provider is available, `modelRegistry.getProvider(id)`
-supports Pi-compatible `streamSimple()`/`complete()` calls; stream events are
-delivered as an async-iterable snapshot and `result()` resolves to the final
-assistant message. `ctx.ui.custom` fullscreen components are bridged through a
-Node Component proxy with terminal input, resize, overlay, and lifecycle
-events; extensions still need to stay within the Pi component contract.
-The host also exposes the internal `pi.runtimeRequest(action, args)` bridge for
-capabilities that are enabled by rpi; extensions should check
-`ctx.capabilities` before using it.
-
-For a package that is already present locally, enable it without downloading:
-
-```bash
-rpi package add ../my-pi-package
-rpi package list
-rpi package remove ../my-pi-package
-```
-
-The package may provide `skills/`, `prompts/`, `themes/`, `SYSTEM.md`, and
-`APPEND_SYSTEM.md`. An optional `rpi` (or legacy `pi`) object in `package.json`
-can override those resource paths; `rpi` wins when both are present. Package resources are loaded after project and
-global resources, so `.rpi`/`.pi` and `~/.rpi/agent` always win collisions.
-`--theme <name-or-path>` selects a package theme in the interactive TUI when
-startup also includes `--enable-pi-packages`; an explicit JSON path does not
-require package discovery.
+Rust extension templates, safety rules, testing, and release checklists.
 
 ## Status (v1)
 
@@ -252,13 +184,7 @@ require package discovery.
   extensions use `.rpi/` first; the original Pi `.pi/` layout remains a
   compatibility fallback. When both contain the same skill or prompt name,
   `.rpi/` wins. Project `.rpi/settings.json` can add `skillDirs`, `promptDirs`,
-  `extensionDirs`, and `packages` (with `.pi/settings.json` as fallback).
-- **Pi packages:** package specs in `~/.rpi/agent/settings.json` (`packages`
-  array) are loaded only when startup includes `--enable-pi-packages`. Skills,
-  prompt templates, themes, system prompt fragments, and JavaScript/TypeScript
-  extensions are supported through the Node host; without the flag, configured
-  Pi packages are not discovered or executed. Rust `cdylib` extensions remain
-  available for native integrations unless `--no-extensions` is supplied.
+  and `extensionDirs` (with `.pi/settings.json` as fallback).
 - **Sessions:** JSONL v4 durable backend + in-memory ephemeral; compaction + a
   split-turn two-LLM-call invariant.
 - **Remote mode:** `rpi --server` runs the agent headless over TCP, and

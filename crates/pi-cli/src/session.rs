@@ -788,6 +788,49 @@ pub async fn build(
         Err(e) => return Err(BuildError::HarnessCreate(e.to_string())),
     };
 
+    // ---- Durable operation recovery (runtime layer) ----
+    // A previous process can die between `operation_started` and
+    // `operation_finished`, leaving the lane with an orphaned operation. Sweep
+    // every lane, surface what was found, and emit `run_start`/`run_end`
+    // (aborted) pairs so a TUI that already attached sees the settle. This is
+    // read-only: nothing is mutated here, so a failed sweep cannot corrupt the
+    // log. A clean session (the common case) reports no findings.
+    {
+        let runtime = rpi_harness::runtime::SessionRuntime::new(harness.session().clone());
+        match rpi_harness::runtime::recover_all_lanes(&runtime).await {
+            Ok(reports) => {
+                for (lane, report) in reports {
+                    if report.is_clean() {
+                        continue;
+                    }
+                    if report.is_corrupt() {
+                        eprintln!(
+                            "warning: session lane '{lane}' is corrupt ({} open operations); \
+                             refusing to auto-repair — inspect the session file",
+                            report.open_operations.len()
+                        );
+                        continue;
+                    }
+                    for decision in runtime.reconcile(&report) {
+                        if let rpi_harness::runtime::RecoveryDecision::Abort { run_id } = decision {
+                            if args.verbose {
+                                eprintln!(
+                                    "recovered interrupted run {run_id} on lane '{lane}' (aborted)"
+                                );
+                            }
+                        }
+                    }
+                    runtime.emit_recovery_events(harness.events(), &report);
+                }
+            }
+            Err(e) => {
+                if args.verbose {
+                    eprintln!("warning: session recovery sweep failed: {e}");
+                }
+            }
+        }
+    }
+
     // ---- B5d: assemble the ReloadContext the TUI holds ----
     // Every field is cheap to clone (Arc / Vec / args Clone). The cells own the
     // live session + bridge so `/reload` can swap them; the harness itself is
@@ -2227,7 +2270,17 @@ mod tests {
             .map(|tool| tool.tool.schema().name.clone())
             .collect();
 
-        assert_eq!(names, vec!["read", "bash", "edit", "write", "docs"]);
+        // `docs` is a default capability; the legacy rpi-only lookup tools stay
+        // unregistered. Asserted by membership (not exact equality) because
+        // `powershell` is Windows-only and `settings.json#defaultTools` may
+        // narrow the set in a developer's environment.
+        assert!(names.contains(&"docs".to_string()));
+        for legacy in ["grep", "find", "ls"] {
+            assert!(
+                !names.contains(&legacy.to_string()),
+                "legacy tool {legacy} should not be registered by default"
+            );
+        }
     }
 
     #[test]

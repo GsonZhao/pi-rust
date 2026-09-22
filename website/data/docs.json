@@ -11,10 +11,10 @@
           "id": "complete-guide",
           "kicker": "00 / COMPLETE GUIDE",
           "title": "完整使用手册",
-          "summary": "从安装、模型配置、.rpi 资源和 Pi package，到 Beta JS/TS 扩展、Rust 插件、SDK、排错和发布的完整路径。",
+          "summary": "从安装、模型配置、.rpi 资源和 Rust 插件，到 SDK、排错和发布的完整路径。",
           "body": [
-            "官网文档与仓库内 /user-guide.md 保持同步。安装后的 rpi 默认只提供 Pi 的四个核心工具；Node/TS 扩展和原生技能渲染属于 Beta，仅建议本地评估。",
-            "推荐先阅读安装与第一次运行，再按需求进入 Provider、Pi package、扩展或 SDK 集成章节。"
+            "官网文档与仓库内 /user-guide.md 保持同步。安装后的 rpi 默认提供核心工具，并通过 rpi-plugin-sdk 构建的 Rust cdylib 扩展增加工具、Provider 和事件处理。",
+            "推荐先阅读安装与第一次运行，再按需求进入 Provider、Rust 扩展、Agent 项目结构或 SDK 集成章节。"
           ],
           "links": [
             {
@@ -22,8 +22,12 @@
               "url": "https://rpi.laofu.online/user-guide.md"
             },
             {
-              "label": "Package 与扩展作者指南",
+              "label": "Rust 扩展作者指南",
               "url": "https://rpi.laofu.online/extension-authoring.md"
+            },
+            {
+              "label": "Agent 项目结构创建指南",
+              "url": "https://rpi.laofu.online/agent-project.md"
             },
             {
               "label": "Rust 扩展与 agent 调试指引",

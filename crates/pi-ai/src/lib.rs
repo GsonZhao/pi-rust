@@ -16,6 +16,7 @@ pub mod model;
 pub mod provider;
 pub mod providers;
 pub mod schema;
+pub(crate) mod strict_schema;
 pub mod types;
 
 // Flat re-exports — consumers do `use rpi_ai::Message` not `rpi_ai::types::Message`.
