@@ -173,8 +173,19 @@ impl AgentTool for BashTool {
                 st.latest_full_path = new_full_path;
                 st.dirty = true;
                 let elapsed = st.last_flush.elapsed();
-                if elapsed >= Duration::from_millis(BASH_UPDATE_THROTTLE_MS) {
+                let throttle_duration = Duration::from_millis(BASH_UPDATE_THROTTLE_MS);
+                if elapsed >= throttle_duration {
                     flush_now(&mut st, &on_update_for_cb);
+                } else {
+                    // Schedule a delayed flush (mirrors TS setTimeout)
+                    let remaining = throttle_duration - elapsed;
+                    let throttle_clone = throttle_for_cb.clone();
+                    let on_update_clone = on_update_for_cb.clone();
+                    tokio::spawn(async move {
+                        tokio::time::sleep(remaining).await;
+                        let mut st = throttle_clone.lock().await;
+                        flush_now(&mut st, &on_update_clone);
+                    });
                 }
             },
         );
