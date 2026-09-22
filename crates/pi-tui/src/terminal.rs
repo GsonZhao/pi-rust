@@ -225,6 +225,10 @@ impl Terminal for ProcessTerminal {
         }
         self.configure_mouse_tracking();
         self.hide_cursor();
+        // Enable bracketed paste mode so pasted text arrives as a single
+        // Event::Paste instead of individual key events (which would trigger
+        // submit per line for multi-line pastes).
+        self.write("\x1b[?2004h");
         self.update_size();
         self.flush();
     }
@@ -303,6 +307,8 @@ impl Terminal for ProcessTerminal {
 
         self.disable_mouse();
         self.show_cursor();
+        // Disable bracketed paste mode before exiting raw mode.
+        self.write("\x1b[?2004l");
         self.flush();
 
         // Exit raw mode
